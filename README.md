@@ -14,10 +14,6 @@ The SceneDiff Annotator is built on top of [SAM2](https://github.com/facebookres
 - **Review & Refine**: Visualize annotated videos, refine annotations, and verify results
 
 ### Demo
-<<<<<<< HEAD
-
-=======
->>>>>>> 0ebbd5f78b4bd40fae3d35df630d9ef843c203c0
 https://github.com/user-attachments/assets/1779894f-f843-4e9b-a651-3fcb0ae43166
 
 *Watch the video above to see the annotation tool in action.*
@@ -101,16 +97,12 @@ segments = {
     'scenetype': str,                    # Type of scene change
     'video1_objects': {
         'object_id': {
-            'frame_id': {
-                'mask': RLE_Mask         # Run-length encoded mask
-            }
+            'frame_id': RLE_Mask         # Run-length encoded mask
         }
     },
     'video2_objects': {
         'object_id': {
-            'frame_id': {
-                'mask': RLE_Mask
-            }
+            'frame_id': RLE_Mask         # Run-length encoded mask
         }
     },
     'objects': {
