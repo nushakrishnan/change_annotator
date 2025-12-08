@@ -32,15 +32,17 @@ https://github.com/user-attachments/assets/1779894f-f843-4e9b-a651-3fcb0ae43166
    cd scenediff_annotator
    ```
 
-2. **Install SAM2 and dependencies**:
+2. **Create conda environment and install SAM2 and dependencies**:
    ```bash
-   cd sam2
-   pip install -e .
+   conda create -n scenediff_annotator python=3.10 -y
+   conda activate scenediff_annotator
+   pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121 # Install the pytorch fitting your nvcc version    
+   pip install -r requirements.txt
+   cd sam2 && pip install -e .
    ```
 
 3. **Download SAM2 checkpoints**:
    ```bash
-   cd checkpoints
    bash download_ckpts.sh
    cd ../..
    ```
