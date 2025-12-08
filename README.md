@@ -23,6 +23,7 @@ https://github.com/user-attachments/assets/1779894f-f843-4e9b-a651-3fcb0ae43166
 ### Prerequisites
 - Python 3.8+
 - CUDA-capable GPU (recommended for faster processing)
+- ffmpeg
 
 ### Setup Instructions
 
