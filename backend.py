@@ -1406,9 +1406,8 @@ def get_session_data(session_id):
     if 'video1_compressed.mp4' in video_files:
         video1_path = 'video1_compressed.mp4'
     elif 'video1.mp4' in video_files:
-        ffmpeg_path = "/usr/bin/ffmpeg"
         subprocess.run([
-            ffmpeg_path, '-y', '-i', os.path.join(session_path, 'video1.mp4'),
+            'ffmpeg', '-y', '-i', os.path.join(session_path, 'video1.mp4'),
             '-vcodec', 'libx264', '-crf', '28',
             '-preset', 'fast', os.path.join(session_path, 'video1_compressed.mp4')
         ], check=True, stderr=subprocess.PIPE)
@@ -1427,7 +1426,7 @@ def get_session_data(session_id):
         video2_path = 'video2_compressed.mp4'
     elif 'video2.mp4' in video_files:
         subprocess.run([
-            ffmpeg_path, '-y', '-i', os.path.join(session_path, 'video2.mp4'),
+            'ffmpeg', '-y', '-i', os.path.join(session_path, 'video2.mp4'),
             '-vcodec', 'libx264', '-crf', '28',
             '-preset', 'fast', os.path.join(session_path, 'video2_compressed.mp4')
         ], check=True, stderr=subprocess.PIPE)
