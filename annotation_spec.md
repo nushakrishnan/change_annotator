@@ -2,7 +2,7 @@
 
 Source of truth for how we annotate the LaMAria-indoor `changes/` recordings and what
 ground truth the annotation tool in this repo must produce. Read this before touching
-`backend.py` / `propagate_offline.py` / `geom_sam_prototype.py`.
+`gui.py` / `geom_sam_prototype.py`.
 
 This is **not** SceneDiff and **not** PASLCD — it borrows the interface and instance
 semantics of [SceneDiff](https://yuqunw.github.io/SceneDiff) and the pixel-mask tier of
