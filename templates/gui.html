@@ -1,0 +1,466 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>change annotator — {{ scene }}</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; display: flex; height: 100vh; }
+  #left { flex: 1; padding: 12px; overflow: auto; }
+  #right { width: 360px; padding: 12px; border-left: 1px solid #ddd; overflow: auto; background: #fafafa; }
+  h2 { margin: 4px 0 12px; font-size: 16px; }
+  #viewport { max-width: 100%; overflow: hidden; position: relative; border: 1px solid #ccc; line-height: 0; }
+  #view { display: block; width: 100%; transform-origin: top left; cursor: crosshair; }
+  #maskCanvas { position: absolute; top: 0; left: 0; width: 100%; transform-origin: top left; pointer-events: none; }
+  #toolBar { font-size: 13px; }
+  .toolbtn.active { background: #2a7; color: #fff; border-color: #2a7; }
+  .row { margin: 8px 0; }
+  label { font-size: 13px; color: #444; }
+  select, input { font-size: 13px; padding: 3px; }
+  button { font-size: 13px; padding: 5px 10px; cursor: pointer; }
+  button:disabled { opacity: .4; cursor: default; }
+  #slider { width: 100%; }
+  .navrow { display: flex; align-items: center; gap: 8px; }
+  .navrow #slider { flex: 1; }
+  .obj { border: 1px solid #ddd; border-radius: 6px; padding: 8px; margin: 8px 0; background: #fff; }
+  .obj.reviewing { border-color: #2a7; box-shadow: 0 0 0 2px #2a72; }
+  .obj h4 { margin: 0 0 4px; font-size: 14px; }
+  .obj .meta { font-size: 12px; color: #666; }
+  .obj img { max-width: 100%; margin-top: 6px; border: 1px solid #eee; }
+  .status { font-size: 12px; color: #888; }
+  .hint { font-size: 12px; color: #888; margin-top: 6px; }
+  .pill { display:inline-block; font-size:11px; padding:1px 6px; border-radius:10px; background:#eee; color:#555; margin-left:4px; }
+  .reviewbar { background:#eaf7f0; border:1px solid #b9e4cf; border-radius:6px; padding:6px 8px; }
+  code { background: #eee; padding: 1px 4px; border-radius: 3px; }
+</style>
+</head>
+<body>
+<div id="left">
+  <h2>{{ scene }} · rgb</h2>
+
+  <!-- annotate toolbar -->
+  <div class="row" id="annotateBar">
+    <label>state:</label>
+    <label><input type="radio" name="state" value="pre" checked> pre</label>
+    <label><input type="radio" name="state" value="post"> post</label>
+    &nbsp; <button onclick="resetPoints()">reset points</button>
+  </div>
+
+  <!-- review toolbar -->
+  <div class="row reviewbar" id="reviewBar" style="display:none">
+    <button onclick="exitReview()">← back to annotate</button>
+    <b id="reviewName"></b>
+    <span id="editControls" style="display:none">
+      &nbsp;|&nbsp; <span class="status">click the object to re-segment this frame</span>
+      <button onclick="saveEdit()">save mask</button>
+      <button onclick="cancelEdit()">cancel</button>
+    </span>
+    <span id="reviewControls">
+      &nbsp;|&nbsp; <span class="status" id="coverInfo"></span>
+      <button onclick="jumpMasked(-1)" title="previous masked frame">◂ masked</button>
+      <button onclick="jumpMasked(1)" title="next masked frame">masked ▸</button>
+      &nbsp; <button onclick="startEdit()" id="editBtn">re-segment frame</button>
+      <button onclick="deleteMask()" id="delBtn" title="shortcut: d">delete mask (d)</button>
+    </span>
+  </div>
+
+  <!-- shared frame navigation -->
+  <div class="row navrow">
+    <button id="prevBtn" onclick="gotoIdx(idx-1)">◀</button>
+    <input type="range" id="slider" min="0" max="0" value="0">
+    <button id="nextBtn" onclick="gotoIdx(idx+1)">▶</button>
+    <button id="fitBtn" onclick="resetView()" title="reset zoom/pan">fit</button>
+  </div>
+  <canvas id="maskmap" height="8" title="green = frame has a mask · click to jump"
+          style="width:100%; display:none; border:1px solid #ddd; image-rendering:pixelated; cursor:pointer;"></canvas>
+  <div class="status" id="frameLabel"></div>
+
+  <div class="row" id="toolBar">
+    tool:
+    <button class="toolbtn active" data-tool="point" onclick="setTool('point')">point (SAM)</button>
+    <button class="toolbtn" data-tool="brush" onclick="setTool('brush')">brush</button>
+    <button class="toolbtn" data-tool="erase" onclick="setTool('erase')">erase</button>
+    &nbsp; size <input type="range" id="brushSize" min="3" max="250" value="40" style="vertical-align:middle" oninput="brushSize=+this.value">
+  </div>
+  <div id="viewport"><img id="view" src=""><canvas id="maskCanvas"></canvas></div>
+  <div class="hint" id="annotateHint"><b>point</b>: click=positive, shift-click=negative · <b>brush/erase</b>: drag to paint · <b>scroll</b> zoom · <b>middle-drag</b> pan · <b>fit</b> resets · <b>← / →</b> scrub</div>
+  <div class="status" id="clickStatus"></div>
+</div>
+
+<div id="right">
+  <h2>add object</h2>
+  <div class="row"><label>id</label><br><input id="oid" placeholder="bag" style="width:95%"></div>
+  <div class="row"><label>label</label><br><input id="olabel" placeholder="bag_1" style="width:95%"></div>
+  <div class="row"><label>deformability</label>
+    <select id="odeform"><option value="rigid">rigid</option><option value="deformable">deformable</option></select>
+    <div class="hint">change type is derived from pre/post presence (removed / added / moved)</div>
+  </div>
+  <div class="row"><button onclick="addObject()">add object</button></div>
+  <hr>
+  <h2>objects</h2>
+  <div id="objects"></div>
+  <hr>
+  <div class="row"><button onclick="exportSegments()">export segments.json</button> <span class="status" id="exportStatus"></span></div>
+</div>
+
+<script>
+const seedN = {{ seed_n }}, seedMinVis = {{ seed_min_vis }};
+let mode = 'annotate';     // 'annotate' | 'review'
+let frames = [];           // annotate: ['images/cam0/..jpg', ...]  review: [{name,session,px}, ...]
+let idx = 0;
+let reviewObj = null;      // object id under review
+let editing = false;       // review re-segment sub-mode
+let pos = [], neg = [];
+
+const view = document.getElementById('view');
+const slider = document.getElementById('slider');
+const maskCanvas = document.getElementById('maskCanvas');
+const maskCtx = maskCanvas.getContext('2d');
+let tool = 'point', brushSize = 40, reviewState = 'pre', gesture = null, lastPt = null;
+
+function curState(){ return document.querySelector('input[name=state]:checked').value; }
+function frameName(i){ return mode === 'review' ? frames[i].name : frames[i]; }
+function maskEditable(){ return mode === 'annotate' || (mode === 'review' && editing); }
+
+// ───────── annotate: scrub the current state's frames ─────────
+async function loadAnnotateFrames(){
+  exitReview();
+  const r = await fetch('/api/frames?state=' + curState());
+  frames = await r.json();
+  idx = 0;
+  setSliderMax(frames.length);
+  showFrame();
+}
+
+function showFrame(){
+  if(!frames.length){ view.src=''; document.getElementById('frameLabel').textContent='no frames'; return; }
+  pos = []; neg = [];
+  showMask(true);
+  setFrame('/frame?state=' + curState() + '&name=' + encodeURIComponent(frameName(idx)), clearMaskCanvas);
+  document.getElementById('clickStatus').textContent = '';
+  updateLabel();
+}
+function resetPoints(){ if(mode==='annotate'){ pos=[]; neg=[]; clearMaskCanvas(); document.getElementById('clickStatus').textContent=''; } }
+
+// ───────── review: scrub one object's propagated masks ─────────
+async function openReview(oid){
+  const r = await fetch('/api/object_frames?id=' + encodeURIComponent(oid));
+  const d = await r.json();
+  if(d.error){ alert(d.error); return; }
+  if(!d.count){ alert('no frames found for this object\'s session'); return; }
+  mode = 'review'; reviewObj = oid; frames = d.frames; editing = false; reviewState = d.state;
+  const first = frames.findIndex(f => f.has_mask);   // land on the propagated region
+  idx = first >= 0 ? first : 0;
+  document.getElementById('annotateBar').style.display = 'none';
+  document.getElementById('reviewBar').style.display = '';
+  document.getElementById('annotateHint').style.display = 'none';
+  setEditUI(false);
+  setSliderMax(frames.length);
+  renderMaskmap();
+  highlightReviewing();
+  showReview();
+}
+function exitReview(){
+  mode = 'annotate'; reviewObj = null; editing = false;
+  document.getElementById('annotateBar').style.display = '';
+  document.getElementById('reviewBar').style.display = 'none';
+  document.getElementById('annotateHint').style.display = '';
+  document.getElementById('maskmap').style.display = 'none';
+  highlightReviewing();
+}
+function showReview(){
+  if(!frames.length){ exitReview(); loadAnnotateFrames(); return; }
+  pos = []; neg = [];
+  showMask(false); view.onload = null;
+  const f = frames[idx];
+  view.src = '/api/overlay?id=' + encodeURIComponent(reviewObj) +
+             '&name=' + encodeURIComponent(f.name) + '&t=' + Date.now();
+  document.getElementById('clickStatus').textContent = '';
+  document.getElementById('reviewName').textContent = reviewObj;
+  updateLabel();
+  updateCoverInfo();
+  renderMaskmap();
+}
+function jumpMasked(dir){
+  for(let i = idx + dir; i >= 0 && i < frames.length; i += dir)
+    if(frames[i].has_mask){ gotoIdx(i); return; }
+}
+function updateCoverInfo(){
+  const masked = frames.filter(f => f.has_mask).length;
+  document.getElementById('coverInfo').textContent = `${masked}/${frames.length} masked`;
+  const has = frames.length && frames[idx].has_mask;
+  document.getElementById('delBtn').disabled = !has;
+  document.getElementById('editBtn').textContent = has ? 're-segment frame' : 'add mask here';
+}
+function renderMaskmap(){
+  const c = document.getElementById('maskmap');
+  if(mode !== 'review' || !frames.length){ c.style.display = 'none'; return; }
+  c.style.display = 'block';
+  if(c.width !== frames.length) c.width = frames.length;
+  const g = c.getContext('2d');
+  for(let i = 0; i < frames.length; i++){
+    g.fillStyle = frames[i].has_mask ? '#22aa77' : '#e6e6e6';
+    g.fillRect(i, 0, 1, c.height);
+  }
+  g.fillStyle = '#d00';
+  g.fillRect(Math.min(frames.length - 1, idx), 0, 2, c.height);
+}
+
+function startEdit(){
+  editing = true; pos = []; neg = []; setEditUI(true); showMask(true);
+  const f = frames[idx];
+  setFrame('/frame?state=' + reviewState + '&name=' + encodeURIComponent(f.name),
+    () => loadMaskFromUrl('/api/mask_png?id=' + encodeURIComponent(reviewObj) +
+                          '&name=' + encodeURIComponent(f.name) + '&t=' + Date.now()));
+  document.getElementById('clickStatus').textContent = 'SAM-click and/or brush·erase, then save';
+}
+function cancelEdit(){ editing = false; setEditUI(false); showReview(); }
+async function saveEdit(){
+  const f = frames[idx];
+  const r = await fetch('/api/save_edit', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({id: reviewObj, frame: f.name, mask: maskCanvas.toDataURL('image/png')})});
+  const d = await r.json();
+  if(d.error){ alert(d.error); return; }
+  frames[idx].has_mask = d.px > 0; frames[idx].px = d.px;
+  editing = false; setEditUI(false); refreshObjects(); showReview();
+}
+async function deleteMask(skipConfirm){
+  const f = frames[idx];
+  if(!f.has_mask) return;
+  if(!skipConfirm && !confirm('delete mask on this frame?')) return;
+  const r = await fetch('/api/delete_mask', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({id: reviewObj, frame: f.name})});
+  const d = await r.json();
+  if(d.error){ alert(d.error); return; }
+  frames[idx].has_mask = false; frames[idx].px = null;
+  refreshObjects(); showReview();
+}
+function setEditUI(on){
+  document.getElementById('editControls').style.display = on ? '' : 'none';
+  document.getElementById('reviewControls').style.display = on ? 'none' : '';
+}
+
+// ───────── shared navigation ─────────
+function setSliderMax(n){
+  slider.max = Math.max(0, n - 1);
+  slider.value = idx;
+  const none = n === 0;
+  document.getElementById('prevBtn').disabled = none;
+  document.getElementById('nextBtn').disabled = none;
+  slider.disabled = none;
+}
+function gotoIdx(i){
+  if(!frames.length) return;
+  i = Math.max(0, Math.min(frames.length - 1, i));
+  if(i === idx && view.src) {} // allow re-show
+  idx = i; slider.value = i;
+  if(editing){ editing = false; setEditUI(false); }
+  mode === 'review' ? showReview() : showFrame();
+}
+slider.addEventListener('input', () => gotoIdx(parseInt(slider.value)));
+
+function updateLabel(){
+  const total = frames.length;
+  let s = `frame ${total ? idx + 1 : 0}/${total}`;
+  if(total){
+    s += ' · ' + frameName(idx).split('/').pop();
+    if(mode === 'review') s += frames[idx].has_mask ? ` · ${frames[idx].px} px` : ' · no mask';
+  }
+  document.getElementById('frameLabel').textContent = s;
+}
+
+document.addEventListener('keydown', (e) => {
+  const t = document.activeElement.tagName;
+  if(t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT') return;
+  if(e.key === 'ArrowRight'){ e.preventDefault(); gotoIdx(idx + 1); }
+  else if(e.key === 'ArrowLeft'){ e.preventDefault(); gotoIdx(idx - 1); }
+  else if((e.key === 'd' || e.key === 'D') && mode === 'review' && !editing){ e.preventDefault(); deleteMask(true); }
+});
+
+document.getElementById('maskmap').addEventListener('click', (e) => {
+  if(mode !== 'review' || !frames.length) return;
+  const r = e.currentTarget.getBoundingClientRect();
+  gotoIdx(Math.round((e.clientX - r.left) / r.width * (frames.length - 1)));
+});
+
+// ───────────────────────── zoom & pan ─────────────────────────
+const viewport = document.getElementById('viewport');
+let zoom = 1, panX = 0, panY = 0;
+function applyTransform(){
+  const W = viewport.clientWidth, H = viewport.clientHeight;
+  panX = Math.min(0, Math.max(W * (1 - zoom), panX));   // keep image covering the viewport
+  panY = Math.min(0, Math.max(H * (1 - zoom), panY));
+  const t = `translate(${panX}px, ${panY}px) scale(${zoom})`;
+  view.style.transform = t; maskCanvas.style.transform = t;   // mask layer tracks the image
+}
+function resetView(){ zoom = 1; panX = 0; panY = 0; applyTransform(); }
+viewport.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const r = viewport.getBoundingClientRect();
+  const cx = e.clientX - r.left, cy = e.clientY - r.top;     // zoom toward the cursor
+  const nz = Math.min(20, Math.max(1, zoom * (e.deltaY < 0 ? 1.2 : 1 / 1.2)));
+  panX = cx - (cx - panX) * (nz / zoom);
+  panY = cy - (cy - panY) * (nz / zoom);
+  zoom = nz; applyTransform();
+}, {passive: false});
+
+// ───────────────────────── mask canvas (brush / eraser / SAM) ─────────────────────────
+function setTool(t){
+  tool = t;
+  document.querySelectorAll('.toolbtn').forEach(b => b.classList.toggle('active', b.dataset.tool === t));
+  if(t !== 'point'){ pos = []; neg = []; }                  // brushing starts a fresh SAM interaction
+  view.style.cursor = (t === 'point') ? 'crosshair' : 'cell';
+}
+function ensureMaskSize(){
+  if(view.naturalWidth && (maskCanvas.width !== view.naturalWidth || maskCanvas.height !== view.naturalHeight)){
+    maskCanvas.width = view.naturalWidth; maskCanvas.height = view.naturalHeight;
+  }
+}
+function clearMaskCanvas(){ ensureMaskSize(); maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height); }
+function showMask(on){ maskCanvas.style.display = on ? 'block' : 'none'; }
+function loadMaskFromUrl(url){
+  const im = new Image();
+  im.onload = () => { ensureMaskSize(); maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+                      maskCtx.drawImage(im, 0, 0, maskCanvas.width, maskCanvas.height); };
+  im.src = url;
+}
+function setFrame(src, afterLoad){ view.onload = () => { ensureMaskSize(); if(afterLoad) afterLoad(); }; view.src = src; }
+function evToNatural(e){
+  const r = view.getBoundingClientRect();           // reflects zoom/pan -> full-res coords
+  return [(e.clientX - r.left) * (view.naturalWidth / r.width),
+          (e.clientY - r.top) * (view.naturalHeight / r.height)];
+}
+function paintAt(e){
+  const [x, y] = evToNatural(e);
+  if(tool === 'erase'){ maskCtx.globalCompositeOperation = 'destination-out'; maskCtx.fillStyle = maskCtx.strokeStyle = '#000'; }
+  else { maskCtx.globalCompositeOperation = 'source-over'; maskCtx.fillStyle = maskCtx.strokeStyle = 'rgba(255,0,0,0.51)'; }
+  maskCtx.lineCap = 'round';
+  maskCtx.beginPath(); maskCtx.arc(x, y, brushSize, 0, 7); maskCtx.fill();
+  if(lastPt){ maskCtx.lineWidth = 2 * brushSize; maskCtx.beginPath(); maskCtx.moveTo(lastPt[0], lastPt[1]); maskCtx.lineTo(x, y); maskCtx.stroke(); }
+  lastPt = [x, y];
+  maskCtx.globalCompositeOperation = 'source-over';
+}
+
+let down = false, moved = false, sx = 0, sy = 0, spx = 0, spy = 0;
+view.addEventListener('mousedown', (e) => {
+  if(e.button !== 0 && e.button !== 1) return;
+  if(e.button === 0 && tool !== 'point' && maskEditable()){          // brush / erase
+    gesture = 'paint'; down = true; lastPt = null; ensureMaskSize(); paintAt(e);
+  } else {                                                            // middle, or point/pan
+    gesture = (e.button === 0 && tool === 'point' && maskEditable()) ? 'point' : 'pan';
+    down = true; moved = false; sx = e.clientX; sy = e.clientY; spx = panX; spy = panY;
+    if(e.button === 1) e.preventDefault();
+  }
+});
+window.addEventListener('mousemove', (e) => {
+  if(!down) return;
+  if(gesture === 'paint'){ paintAt(e); return; }
+  const dx = e.clientX - sx, dy = e.clientY - sy;
+  if(!moved && Math.hypot(dx, dy) > 4) moved = true;
+  if(moved){ panX = spx + dx; panY = spy + dy; applyTransform(); }
+});
+window.addEventListener('mouseup', (e) => {
+  if(!down) return;
+  down = false;
+  if(gesture === 'point' && !moved) handleClick(e);
+  gesture = null; lastPt = null;
+});
+
+// ───────────────────────── click to segment (SAM) ─────────────────────────
+async function handleClick(e){
+  if(!frames.length) return;
+  if(mode === 'review' && !editing) return;       // review browse = read-only
+  const [x, y] = evToNatural(e);
+  (e.shiftKey ? neg : pos).push([x, y]);
+  if(pos.length === 0) return;
+  const url = (mode === 'review') ? '/api/edit_click' : '/api/click';
+  const body = (mode === 'review')
+    ? {id: reviewObj, frame: frames[idx].name, points: pos, neg: neg}
+    : {state: curState(), frame: frameName(idx), points: pos, neg: neg};
+  const resp = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  const d = await resp.json();
+  if(d.error){ document.getElementById('clickStatus').textContent = d.error; return; }
+  loadMaskFromUrl(d.mask);                          // draw the SAM mask into the editable canvas
+  document.getElementById('clickStatus').textContent = `mask ${d.px} px · score ${d.score.toFixed(3)} · ${pos.length}+ / ${neg.length}-`;
+}
+
+// ───────── objects sidebar ─────────
+async function addObject(){
+  if(mode !== 'annotate'){ alert('switch to annotate (← back to annotate) to add an object'); return; }
+  const id = document.getElementById('oid').value;
+  const body = { id, label: document.getElementById('olabel').value,
+    deformability: document.getElementById('odeform').value,
+    state: curState(), frame: frameName(idx), points: pos,
+    mask: maskCanvas.toDataURL('image/png') };          // SAM + brush/eraser result
+  const r = await fetch('/api/add_object', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  const d = await r.json();
+  if(d.error){ alert(d.error); return; }
+  document.getElementById('oid').value=''; document.getElementById('olabel').value='';
+  if(mode==='annotate') showFrame();
+  refreshObjects();
+}
+
+async function refreshObjects(){
+  const d = await (await fetch('/api/objects')).json();
+  renderObjects(d.objects);
+}
+function renderObjects(objs){
+  const box = document.getElementById('objects'); box.innerHTML='';
+  Object.entries(objs).forEach(([key,o]) => {
+    const div = document.createElement('div'); div.className='obj'; div.dataset.oid = key;
+    const masks = o.n_masks ? `<span class="pill">${o.n_masks} masks</span>` : '';
+    div.innerHTML = `<h4>${o.id} · ${o.state} ${masks}</h4>
+      <div class="meta">${o.label} · ${o.change_type} · ${o.deformability}</div>
+      <button onclick="propagate('${key}')">propagate</button>
+      <button onclick="refine('${key}')" ${o.n_masks ? '' : 'disabled'} title="SAM3 video refine, per visible span">refine (video)</button>
+      <button onclick="openReview('${key}')" ${o.n_masks ? '' : 'disabled'}>review / edit</button>
+      <span class="status" id="st_${key}"></span>
+      <div id="res_${key}"></div>`;
+    box.appendChild(div);
+  });
+  highlightReviewing();
+}
+function highlightReviewing(){
+  document.querySelectorAll('.obj').forEach(el =>
+    el.classList.toggle('reviewing', mode==='review' && el.dataset.oid===reviewObj));
+}
+
+async function propagate(id){
+  const st = document.getElementById('st_'+id);
+  st.textContent = `seeds (geometry, ${seedN > 0 ? '~'+seedN+' frames' : 'all frames'}) + SAM … this can take a minute`;
+  const r = await fetch('/api/propagate', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({id})});
+  const {job_id} = await r.json();
+  const poll = setInterval(async () => {
+    const j = await (await fetch('/api/job/'+job_id)).json();
+    if(j.status==='done'){ clearInterval(poll); st.textContent = `done · ${j.n_masks} masks`;
+      document.getElementById('res_'+id).innerHTML = `<img src="${j.contact}?t=${Date.now()}">`;
+      refreshObjects(); }
+    else if(j.status==='error'){ clearInterval(poll); st.textContent = 'error: ' + j.error; }
+  }, 1500);
+}
+
+async function refine(id){
+  const st = document.getElementById('st_'+id);
+  st.textContent = 'SAM3 video refine (per span) … ~1 min';
+  const r = await fetch('/api/refine', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({id})});
+  const d = await r.json();
+  if(d.error){ st.textContent = 'error: ' + d.error; return; }
+  const poll = setInterval(async () => {
+    const j = await (await fetch('/api/job/'+d.job_id)).json();
+    if(j.status==='done'){ clearInterval(poll); st.textContent = `video-refined · ${j.n_masks} masks`;
+      refreshObjects();
+      if(mode==='review' && reviewObj===id) openReview(id); }   // reload overlays
+    else if(j.status==='error'){ clearInterval(poll); st.textContent = 'error: ' + j.error; }
+  }, 1500);
+}
+
+async function exportSegments(){
+  const d = await (await fetch('/api/export', {method:'POST'})).json();
+  document.getElementById('exportStatus').textContent = `wrote ${d.n} objects → ${d.path}`;
+}
+
+document.querySelectorAll('input[name=state]').forEach(el => el.addEventListener('change', loadAnnotateFrames));
+loadAnnotateFrames();
+refreshObjects();
+</script>
+</body>
+</html>
