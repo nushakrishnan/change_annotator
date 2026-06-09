@@ -6,12 +6,12 @@ A video annotation tool for logging down changes between paired video sequences.
 
 ## Overview
 
-The SceneDiff Annotator is built on top of [SAM2](https://github.com/facebookresearch/sam2) and provides a complete workflow for annotating changes between video pairs:
+The SceneDiff Annotator is built on top of [SAM 3.1](https://github.com/facebookresearch/sam3) and provides a geometry-assisted workflow for annotating changes between a paired "pre" and "post" capture of the same scene:
 
-- **Upload & Configure**: Upload video pairs and specify object attributes (deformability, change type, multiplicity)
-- **Interactive Annotation**: Provide sparse point prompts on selected frames with an intuitive click-based interface
-- **Offline Propagation**: Automatically propagate masks throughout both videos
-- **Review & Refine**: Visualize annotated videos, refine annotations, and verify results
+- **Click to Segment**: Click point prompts on a source frame and get a live SAM 3.1 mask preview; add objects with a label and deformability.
+- **Geometry-Assisted Propagation**: LaMAR poses and per-state mesh depth seed each object across every frame of the camera walk, then SAM 3.1 produces a per-frame mask.
+- **Video Refinement (optional)**: Sharpen the per-frame masks with the SAM 3.1 video tracker over each visible span.
+- **Review & Refine**: Scrub the full walk to catch missed frames, then re-click, brush, erase, or delete masks before exporting.
 
 ### Demo
 https://github.com/user-attachments/assets/1779894f-f843-4e9b-a651-3fcb0ae43166
@@ -21,114 +21,114 @@ https://github.com/user-attachments/assets/1779894f-f843-4e9b-a651-3fcb0ae43166
 ## Installation
 
 ### Prerequisites
-- Python 3.8+
-- CUDA-capable GPU (recommended for faster processing)
-- ffmpeg
+- Python 3.10+
+- CUDA-capable GPU (required — SAM 3.1 loads itself on CUDA)
+- A HuggingFace account with access to [`facebook/sam3.1`](https://huggingface.co/facebook/sam3.1)
+- A capture directory with LaMAR poses + per-state mesh, and a separate Python environment carrying the `scantools` / LaMAR stack (used for the geometry-seeding step; see `LAMAR_PY` under [Usage](#usage))
 
 ### Setup Instructions
 
-1. **Clone the repository** (including SAM2 submodule):
+1. **Clone the repository**:
    ```bash
-   git clone --recursive https://github.com/yuqunw/scenediff_annotator
+   git clone https://github.com/yuqunw/scenediff_annotator
    cd scenediff_annotator
    ```
 
-2. **Create conda environment and install SAM2 and dependencies**:
+2. **Create conda environment and install dependencies**:
    ```bash
    conda create -n scenediff_annotator python=3.10 -y
    conda activate scenediff_annotator
-   pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121 # Install the pytorch fitting your nvcc version    
+   pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
    pip install -r requirements.txt
-   cd sam2 && pip install -e .
    ```
 
-3. **Download SAM2 checkpoints**:
+3. **Install SAM 3.1** from a local checkout (assumes the repo is cloned at `~/repos/refs/sam3`):
    ```bash
-   bash download_ckpts.sh
-   cd ../..
+   pip install -e ~/repos/refs/sam3
    ```
 
-For detailed SAM2 installation instructions, refer to the [official SAM2 repository](https://github.com/facebookresearch/sam2).
+4. **Authenticate with HuggingFace** and accept the model access request for `facebook/sam3.1`:
+   ```bash
+   hf auth login   # or: huggingface-cli login
+   ```
+   The SAM 3.1 checkpoint is downloaded automatically on first run of `gui.py`.
+
+For detailed SAM 3.1 installation instructions, refer to the [official SAM 3 repository](https://github.com/facebookresearch/sam3).
 
 ## Usage
 
 ### Starting the Application
 
-1. **Launch the backend server**:
-   ```bash
-   python backend.py
-   ```
+The GUI runs against a single capture directory holding a `pre` and a `post` session of the same scene (by default the Aria RGB sessions `aria_a_rgb` / `aria_b_rgb`). Launch it in the SAM 3.1 environment:
 
-2. **Open the web interface**:
-   Navigate to `http://localhost:5000` in your web browser.
+```bash
+~/sam3_env/bin/python gui.py --capture /path/to/captures/changes/cnb_e100
+```
+
+Then open `http://127.0.0.1:5000` in your browser. Useful flags:
+
+- `--pre-session` / `--post-session` — session folder names (default `aria_a_rgb` / `aria_b_rgb`)
+- `--pre-ref` / `--post-ref` — reference reconstruction per state (default `navvis_a` / `navvis_b`)
+- `--n` — frames to seed per object (`0` = every frame, the default; `N>0` evenly subsamples N for a quick coarse pass)
+- `--host` / `--port` — bind address (default `127.0.0.1:5000`)
+
+The geometry-seeding step shells out to a separate environment that has the LaMAR / `scantools` stack; point to it with the `LAMAR_PY` and `LAMAR_PYTHONPATH` environment variables (default `~/lamar_env/bin/python` and `~/repos/lamaria-indoor`).
 
 ### Annotation Workflow
 
-1. **Upload Videos**: Upload a pair of videos, fill in the Scene Type, and wait for the initialization.
+1. **Segment an object**: Choose the `pre` or `post` state, scrub to a frame, and click positive (and optional negative) points. SAM 3.1 returns a live mask preview; brush or erase to clean it up.
 
-2. **Configure Object Attributes**: 
-   - Specify the number of changed objects
-   - Specify the name, multiplicity index
-   - Specify the appearance in video 1 and video 2 and number of frames for annotation
-   - Specify the deformabiltiy
+2. **Add the object**: Give it an id, label, and deformability (`rigid` / `deformable`). The same id used in both `pre` and `post` marks a *moved* object; an id in only one state is *added* or *removed* — the change type is derived from presence, not set by hand.
 
-3. **Provide Annotations**:
-   - Select the frame in the video
-   - Click to add point prompts
+3. **Propagate**: Click `Propagate`. Geometry seeds (LaMAR poses + per-state mesh depth) carry the object across every frame of that state's camera walk, and SAM 3.1 produces a per-frame mask. A contact-sheet preview is generated for review.
 
-4. **Run Offline Propagation**:
-   - After all annotation, click `Start Offline Job` to begin mask propagation
-   - SAM2 will propagate objects throughout both videos offline. Could close the page.
+4. **Refine (optional)**: Run `Refine` to sharpen the per-frame masks with the SAM 3.1 video tracker over each visible span.
 
-5. **Review & Refine**:
-   - Navigate to `Review Sessions` to visualize results
-   - Review or refine annotations if needed
+5. **Review & edit**: Scrub the whole walk to spot frames the propagation missed. Re-click, brush/erase, or delete the mask on any frame.
+
+6. **Export**: Click `Export` to write `changes/segments.json` (see [Output Format](#output-format)).
 
 ## Output Format
 
-The uploaded videos and generated outputs are saved at `./uploads` and `./results`. The annotation tool generates two primary output files:
+All outputs are written into the capture directory under `changes/`:
 
-- **`inference_data.pkl`**: Stores initial prompt inputs used for mask propagation
-- **`segments.pkl`**: Contains the final segmentation masks and metadata
+- **`changes/geom_sam_out/<id>__<state>/`** — per-object working data: the source mask (`src_mask.png`), geometry seeds (`seeds.json`), per-frame masks (`masks/`), and an index (`masks_index.json`).
+- **`changes/gui_objects.json`** — the object sources you added; reloaded on the next launch so you can resume.
+- **`changes/segments.json`** — the final export.
 
-### Segments Structure
+### `segments.json` Structure
 
-The `segments.pkl` file follows this hierarchical structure:
-
-```python
-segments = {
-    'scenetype': str,                    # Type of scene change
-    'video1_objects': {
-        'object_id': {
-            'frame_id': RLE_Mask         # Run-length encoded mask
-        }
-    },
-    'video2_objects': {
-        'object_id': {
-            'frame_id': RLE_Mask         # Run-length encoded mask
-        }
-    },
-    'objects': {
-        'object_1': {
-            'label': str,                # Object label/name
-            'in_video1': bool,           # Present in video 1
-            'in_video2': bool,           # Present in video 2
-            'deformability': str         # 'rigid' or 'deformable'
-        }
+```json
+{
+  "scene": "cnb_e100",
+  "tier": "instance",
+  "camera": "cam0",
+  "pre":  {"session": "aria_a_rgb", "ref": "navvis_a"},
+  "post": {"session": "aria_b_rgb", "ref": "navvis_b"},
+  "objects": {
+    "<object_id>": {
+      "label": "chair",
+      "deformability": "rigid",
+      "in_pre": true,
+      "in_post": false,
+      "change_type": "removed",
+      "masks": {
+        "pre": {"images/cam0/<frame>.jpg": "masks/images_cam0_<frame>.jpg"}
+      }
     }
+  }
 }
 ```
 
+`change_type` is derived from presence: `pre` only → `removed`, `post` only → `added`, both states → `moved`. Only the states an object appears in show up under `masks`. Each mask path is relative to that object's `changes/geom_sam_out/<id>__<state>/` directory and points to a binary PNG (white = object).
+
 ### Loading Masks
 
-To convert RLE masks back to tensors:
+The masks are plain PNGs, so decode with any image library:
 
 ```python
-import torch
-from pycocotools import mask as mask_utils
-
-# Load and decode RLE mask
-tensor_mask = torch.tensor(mask_utils.decode(rle_mask))
+import cv2
+mask = cv2.imread("changes/geom_sam_out/chair__pre/masks/images_cam0_0001.jpg", 0) > 127
 ```
 
 <!-- ## Citation
@@ -146,7 +146,7 @@ If you use this annotation tool in your research, please cite the SceneDiff proj
 
 ## Acknowledgements
 
-This project is built upon the excellent [SAM2 repository](https://github.com/facebookresearch/sam2) (Segment Anything Model 2). We gratefully acknowledge their contributions to the computer vision community.
+This project is built upon the excellent [SAM 3 repository](https://github.com/facebookresearch/sam3) (Segment Anything Model 3). We gratefully acknowledge their contributions to the computer vision community.
 
 ## License
 
