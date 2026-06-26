@@ -33,6 +33,7 @@ import numpy as np
 from flask import Flask, jsonify, request, render_template, send_file, Response
 
 import geom_sam_prototype as G
+import change_mask as CM
 
 LAMAR_PY = Path(os.environ.get("LAMAR_PY", Path.home() / "lamar_env/bin/python"))
 LAMAR_PYTHONPATH = os.environ.get("LAMAR_PYTHONPATH", str(Path.home() / "repos/lamaria-indoor"))
@@ -486,6 +487,27 @@ def api_delete_mask():
     return jsonify(ok=True, count=len(mi))
 
 
+@app.route("/api/delete_object", methods=["POST"])
+def api_delete_object():
+    """Remove an erroneous object: drop it from the working set and move its
+    on-disk workspace (seeds + masks) to a .trash folder so it stays recoverable
+    rather than being permanently deleted."""
+    oid = request.get_json()["id"]
+    if oid not in OBJECTS:
+        return jsonify(error="unknown object"), 404
+    OBJECTS.pop(oid)
+    _save_working()
+    od = Path(CFG["capture"]) / G.OUT / oid
+    if od.exists():
+        trash = Path(CFG["capture"]) / G.OUT / ".trash"
+        trash.mkdir(exist_ok=True)
+        dest = trash / oid
+        if dest.exists():
+            dest = trash / f"{oid}__{uuid.uuid4().hex[:8]}"
+        shutil.move(str(od), str(dest))
+    return jsonify(ok=True)
+
+
 # ───────────────────────────── export ─────────────────────────────
 @app.route("/api/export", methods=["POST"])
 def api_export():
@@ -509,9 +531,16 @@ def api_export():
                             "masks": e["masks"]}
     segments = {"scene": CFG["scene"], "tier": CFG.get("tier", "instance"), "camera": "cam0",
                 "pre": CFG["states"]["pre"], "post": CFG["states"]["post"], "objects": objects_out}
+    # per-frame binary change mask = union of object masks (the scored GT, spec §6/§7)
+    try:
+        segments["change_mask"] = CM.build_change_masks(
+            CFG["capture"], geom_out=G.OUT, object_keys=list(OBJECTS.keys()), verbose=False)
+    except Exception as e:
+        print(f"warn: change_mask export failed: {e}", flush=True)
     out = Path(CFG["capture"]) / "changes" / "segments.json"
     json.dump(segments, open(out, "w"), indent=1)
-    return jsonify(ok=True, path=str(out), n=len(objects_out))
+    n_cf = sum(len(v) for v in segments.get("change_mask", {}).values())
+    return jsonify(ok=True, path=str(out), n=len(objects_out), change_frames=n_cf)
 
 
 def main():

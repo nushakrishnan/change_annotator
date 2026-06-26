@@ -29,6 +29,7 @@
   .status { font-size: 12px; color: #888; }
   .hint { font-size: 12px; color: #888; margin-top: 6px; }
   .pill { display:inline-block; font-size:11px; padding:1px 6px; border-radius:10px; background:#eee; color:#555; margin-left:4px; }
+  button.del { color:#b00; border-color:#e3b3b3; }
   .reviewbar { background:#eaf7f0; border:1px solid #b9e4cf; border-radius:6px; padding:6px 8px; }
   code { background: #eee; padding: 1px 4px; border-radius: 3px; }
 </style>
@@ -427,6 +428,7 @@ function renderObjects(objs){
       <button onclick="addSeed('${key}')" title="add the current frame as another seed view (spread-out frames → stronger propagation)">+ seed</button>
       <button onclick="propagate('${key}')">propagate</button>
       <button onclick="openReview('${key}')" ${o.n_masks ? '' : 'disabled'}>review / edit</button>
+      <button onclick="deleteObject('${key}')" class="del" title="remove this object — its seeds/masks are moved to .trash (recoverable on disk)">delete</button>
       <span class="status" id="st_${key}"></span>
       <div id="res_${key}"></div>`;
     box.appendChild(div);
@@ -450,6 +452,14 @@ async function propagate(id){
       refreshObjects(); }
     else if(j.status==='error'){ clearInterval(poll); st.textContent = 'error: ' + j.error; }
   }, 1500);
+}
+
+async function deleteObject(key){
+  if(!confirm(`Delete object "${key}"?\n\nIt is removed from the annotation set and its seeds/masks are moved to .trash (recoverable on disk).`)) return;
+  const r = await fetch('/api/delete_object', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({id:key})});
+  if(!r.ok){ alert('delete failed: ' + (await r.json()).error); return; }
+  if(mode==='review' && reviewObj===key) exitReview();
+  refreshObjects();
 }
 
 async function exportSegments(){
