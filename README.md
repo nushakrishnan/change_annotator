@@ -130,6 +130,13 @@ All outputs are written into the capture directory under `changes/`:
 - **`changes/geom_sam_out/<id>__<state>/`** — per-object working data: the source mask (`src_mask.png`), geometry seeds (`seeds.json`), per-frame masks (`masks/`), and an index (`masks_index.json`).
 - **`changes/gui_objects.json`** — the object sources you added; reloaded on the next launch so you can resume.
 - **`changes/segments.json`** — the final export.
+- **`changes/change_mask/<state>/<frame>.png`** — per-frame binary change mask (255 = changed), the **union of all object masks** on that frame. This is the per-pixel ground truth a method is scored against (`annotation_spec.md` §6/§7), the metric MV3DCD / SceneDiff report. Produced automatically on `Export`, indexed in `changes/change_mask_index.json`, and referenced from `segments.json` under a top-level `change_mask: {state: {frame: relpath}}` block.
+
+To (re)generate change masks for a capture without re-running the GUI:
+
+```bash
+~/lamar_env/bin/python change_mask.py --capture /path/to/captures/changes/cnb_e100
+```
 
 ### `segments.json` Structure
 

@@ -33,7 +33,6 @@ import numpy as np
 from flask import Flask, jsonify, request, render_template, send_file, Response
 
 import geom_sam_prototype as G
-import change_mask as CM
 
 LAMAR_PY = Path(os.environ.get("LAMAR_PY", Path.home() / "lamar_env/bin/python"))
 LAMAR_PYTHONPATH = os.environ.get("LAMAR_PYTHONPATH", str(Path.home() / "repos/lamaria-indoor"))
