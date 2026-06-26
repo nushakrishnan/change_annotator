@@ -7,8 +7,6 @@ Two-stage pipeline across two envs (file handoff):
                           into every frame with a mesh-depth occlusion test
                           -> per-frame seed point(s)+box -> seeds.json
   perframe  [sam3_env]  : SAM3 image predict(points+box) per frame  -> per-frame masks
-  track     [sam3_env]  : SAM3 *video* tracker, per visible span, seeded by the geom
-                          mask -> temporally-consistent masks (refines perframe)
 
 Run (within aria_a_rgb):
   ~/sam3_env/bin/python geom_sam_prototype.py src-mask  --capture C --session aria_a_rgb \
@@ -19,12 +17,16 @@ Run (within aria_a_rgb):
 """
 import argparse
 import json
+import os
 from pathlib import Path
 
 import numpy as np
 import cv2
 
-OUT = "changes/geom_sam_out"
+# Output workspace root (under the capture). Override with GEOM_OUT to run an
+# isolated workspace (e.g. GEOM_OUT=changes/geom_sam_out_test) without touching
+# existing masks. Inherited by the seeds subprocess via the environment.
+OUT = os.environ.get("GEOM_OUT", "changes/geom_sam_out")
 
 
 def out_dir(capture, obj=None):
@@ -214,6 +216,47 @@ def _seeds_for_session(pts3d, sess, renderer, capo, sid, n, min_vis, dbg_root,
     return seeds
 
 
+def _lift_mask(mask, src_name, sess, renderer, compute_rays):
+    """Raycast a 2D `mask` drawn on frame `src_name` onto the mesh held by
+    `renderer` -> (M,3) surface points, with a per-mask outlier trim that drops
+    mask-edge background bleed. Empty array if nothing hits."""
+    src_key = next(k for k in sess.images.key_pairs()
+                   if str(sess.images[k[0], k[1]]) == src_name)
+    ts_s, cam_s = src_key
+    T_src = sess.get_pose(ts_s, cam_s)
+    rows, cols = np.where(mask)
+    if len(cols) == 0:
+        return np.empty((0, 3))
+    if len(cols) > 4000:
+        sel = np.random.RandomState(0).choice(len(cols), 4000, replace=False)
+        rows, cols = rows[sel], cols[sel]
+    p2d = np.stack([cols, rows], 1).astype(np.float32)
+    o, d = compute_rays(T_src, sess.sensors[cam_s], p2d=p2d)
+    pts, _ = renderer.compute_intersections((o, d))
+    pts = np.asarray(pts)
+    if len(pts) == 0:
+        return pts
+    c = np.median(pts, 0)
+    dist = np.linalg.norm(pts - c, axis=1)
+    return pts[dist < np.percentile(dist, 90)]
+
+
+def _load_src_masks(od, fallback_src_name):
+    """Seed masks for the object as a list of (src_name, bool_mask). Prefers the
+    multi-seed index (src_index.json: spread-out frames unioned for a complete 3D
+    object); falls back to the single src_mask.png (one frame)."""
+    idx = od / "src_index.json"
+    if idx.exists():
+        out = []
+        for it in json.load(open(idx)):
+            m = cv2.imread(str(od / it["mask_file"]), 0)
+            if m is not None:
+                out.append((it["src_name"], m > 127))
+        return out
+    m = cv2.imread(str(od / "src_mask.png"), 0)
+    return [(fallback_src_name, m > 127)] if m is not None else []
+
+
 def cmd_seeds(args):
     from scantools.proc.rendering import Renderer, compute_rays
     from scantools.utils.io import read_mesh
@@ -224,28 +267,19 @@ def cmd_seeds(args):
     mesh_path = capo.proc_path(args.ref) / capo.sessions[args.ref].proc.meshes["mesh"]
     renderer = Renderer(read_mesh(mesh_path))
 
-    # locate source key + pose (the frame the mask was drawn on)
-    src_key = next(k for k in sess.images.key_pairs()
-                   if str(sess.images[k[0], k[1]]) == args.src_name)
-    ts_s, cam_s = src_key
-    cam_src = sess.sensors[cam_s]
-    T_src = sess.get_pose(ts_s, cam_s)
-
-    # lift mask -> 3D points on the SOURCE-state mesh
-    mask = cv2.imread(str(od / "src_mask.png"), 0) > 127
-    rows, cols = np.where(mask)
-    if len(cols) > 4000:
-        sel = np.random.RandomState(0).choice(len(cols), 4000, replace=False)
-        rows, cols = rows[sel], cols[sel]
-    p2d = np.stack([cols, rows], 1).astype(np.float32)
-    o, d = compute_rays(T_src, cam_src, p2d=p2d)
-    pts3d, valid = renderer.compute_intersections((o, d))
-    pts3d = np.asarray(pts3d)
-    # robust outlier removal (drop mask-edge background bleed)
-    c = np.median(pts3d, 0)
-    dist = np.linalg.norm(pts3d - c, axis=1)
-    pts3d = pts3d[dist < np.percentile(dist, 90)]
-    print(f"object 3D points: {len(pts3d)} in {args.ref} frame (median center {c.round(2)})")
+    # lift each seed mask (one or several spread-out frames) onto the SOURCE-state
+    # mesh and UNION the 3D points -> a far more complete object than a single view,
+    # so every downstream frame gets a full, accurate seed.
+    src_masks = _load_src_masks(od, args.src_name)
+    if not src_masks:
+        raise SystemExit(f"no source masks under {od} (src_index.json or src_mask.png)")
+    chunks = [c for c in (_lift_mask(m, sn, sess, renderer, compute_rays)
+                          for sn, m in src_masks) if len(c)]
+    if not chunks:
+        raise SystemExit("no seed points hit the mesh")
+    pts3d = np.concatenate(chunks, 0)
+    print(f"object 3D points: {len(pts3d)} from {len(chunks)}/{len(src_masks)} seed "
+          f"frame(s) in {args.ref} frame (center {np.median(pts3d, 0).round(2)})")
 
     dbg_root = od / "seed_dbg"
 
@@ -345,118 +379,10 @@ def cmd_perframe(args):
           + f" -> {od}")
 
 
-# ─────────────── stage: track (sam3_env, SAM3 *video* per-span refine) ───────────────
-def _spans(seeded, split_gap):
-    """Split index-sorted [(global_idx, name), ...] into contiguous visible spans
-    (a new span starts when the frame-index gap exceeds split_gap = out of view)."""
-    spans, cur = [], [seeded[0]]
-    for gi, n in seeded[1:]:
-        if gi - cur[-1][0] <= split_gap:
-            cur.append((gi, n))
-        else:
-            spans.append(cur); cur = [(gi, n)]
-    spans.append(cur)
-    return spans
-
-
-def cmd_track(args):
-    """Refine the per-frame geom masks with the SAM3 video tracker.
-
-    The object is visible in disjoint spans (it leaves and re-enters view), so a
-    single video track across the whole walk would drift through the gaps. Instead
-    each contiguous visible span is tracked as its own mini-video: seed the tracker
-    with the geom mask at the span's strongest frame, propagate fwd+bwd within the
-    span. Gives temporally-consistent masks without painting the out-of-view gaps.
-    Frames a span couldn't cover keep their existing geom mask.
-    """
-    import os
-    import shutil
-    import tempfile
-    from collections import defaultdict
-    import torch
-
-    cap = Path(args.capture)
-    od = out_dir(cap, args.obj)
-    seeds = json.load(open(od / "seeds.json"))
-    mi_path = od / "masks_index.json"
-    mi = json.load(open(mi_path)) if mi_path.exists() else {}
-    masks_dir = od / "masks"
-    masks_dir.mkdir(exist_ok=True)
-
-    from sam3.model_builder import build_sam3_video_model
-    print("loading SAM3 video model ...", flush=True)
-    model = build_sam3_video_model()
-    pred = model.tracker
-    pred.backbone = model.detector.backbone
-
-    by_session = defaultdict(list)
-    for name, s in seeds.items():
-        by_session[s.get("session", args.session)].append(name)
-
-    ctx = torch.autocast("cuda", dtype=torch.bfloat16) if torch.cuda.is_available() else _null()
-    new_mi = dict(mi)  # video masks where we get them, geom masks elsewhere
-    n_video = 0
-    with torch.inference_mode(), ctx:
-        for sid, names in by_session.items():
-            fdir = cap / "sessions" / sid / "raw_data" / "images" / "cam0"
-            allfiles = sorted(fdir.glob("*.jpg"), key=lambda p: int(p.stem))
-            gidx = {f"images/cam0/{p.name}": i for i, p in enumerate(allfiles)}
-            seeded = sorted((gidx[n], n) for n in names if n in gidx)
-            spans = _spans(seeded, args.split_gap)
-            print(f"[{sid}] {len(seeded)} visible frames -> {len(spans)} span(s)", flush=True)
-
-            for si, span in enumerate(spans):
-                # strongest frame in the span = best geom anchor
-                best = max(span, key=lambda gn: seeds[gn[1]].get("n_visible", 0))[1]
-                seed_path = masks_dir / ("images_cam0_" + Path(best).name)
-                seed_mask = (cv2.imread(str(seed_path), 0) > 127) if seed_path.exists() else None
-                if seed_mask is None or seed_mask.sum() < 50:
-                    print(f"  span {si}: no usable seed mask at {Path(best).name}; keeping geom", flush=True)
-                    continue
-
-                tmp = Path(tempfile.mkdtemp(prefix="sam3span_"))
-                try:
-                    for _, n in span:
-                        os.symlink(allfiles[gidx[n]], tmp / Path(n).name)
-                    localsorted = sorted(tmp.glob("*.jpg"), key=lambda p: int(p.stem))
-                    lidx = {f"images/cam0/{p.name}": j for j, p in enumerate(localsorted)}
-                    lf = lidx[best]
-                    st = pred.init_state(video_path=str(tmp))
-                    pred.add_new_mask(st, frame_idx=lf, obj_id=1,
-                                      mask=torch.from_numpy(seed_mask))
-                    pred.propagate_in_video_preflight(st)
-                    local_masks = {}
-                    for reverse in (False, True):
-                        for fi, _, _, vrm, _ in pred.propagate_in_video(
-                                st, start_frame_idx=lf, max_frame_num_to_track=len(localsorted),
-                                reverse=reverse, tqdm_disable=True):
-                            local_masks[int(fi)] = np.asarray(vrm[0].squeeze().cpu()) > 0
-                finally:
-                    shutil.rmtree(tmp, ignore_errors=True)
-
-                kept = 0
-                for _, n in span:
-                    mk = local_masks.get(lidx[n])
-                    if mk is None or not mk.any():
-                        continue
-                    flat = n.replace("/", "_")
-                    cv2.imwrite(str(masks_dir / flat), (mk * 255).astype(np.uint8))
-                    new_mi[n] = {"session": sid, "mask_file": f"masks/{flat}",
-                                 "px": int(mk.sum()), "n_visible": seeds[n].get("n_visible")}
-                    kept += 1
-                n_video += kept
-                print(f"  span {si}: frames {span[0][0]}-{span[-1][0]} "
-                      f"seed={Path(best).stem} -> {kept} video masks", flush=True)
-
-    json.dump(new_mi, open(mi_path, "w"), indent=1)
-    print(f"track: {n_video} frames refined by SAM3 video "
-          f"({len(new_mi)} total masks) -> {mi_path}", flush=True)
-
-
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("src-mask", "seeds", "perframe", "track"):
+    for name in ("src-mask", "seeds", "perframe"):
         p = sub.add_parser(name)
         p.add_argument("--capture", required=True)
         p.add_argument("--session", default="aria_a_rgb")
@@ -490,13 +416,9 @@ def main():
         if name == "perframe":
             p.add_argument("--save-masks", action="store_true",
                            help="persist per-frame binary masks + masks_index.json")
-        if name == "track":
-            p.add_argument("--split-gap", type=int, default=4,
-                           help="frame-index gap above which the object is treated as "
-                                "having left view -> a new span (separate video track)")
     args = ap.parse_args()
-    {"src-mask": cmd_src_mask, "seeds": cmd_seeds, "perframe": cmd_perframe,
-     "track": cmd_track}[args.cmd](args)
+    {"src-mask": cmd_src_mask, "seeds": cmd_seeds,
+     "perframe": cmd_perframe}[args.cmd](args)
 
 
 if __name__ == "__main__":

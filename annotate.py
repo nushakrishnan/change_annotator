@@ -8,8 +8,6 @@ geometry-assisted propagation pipeline across the two envs:
                         reproject within the source walk
                         (mesh-depth occlusion test)        -> per-frame seeds
   perframe  [sam3_env]  SAM3 per-frame masks               -> saved binary masks
-  track     [sam3_env]  SAM3 video tracker per visible span -> refined masks
-                        (skip with "refine": false in the config)
 
 then assembles all objects into one GT record (`changes/segments.json`) following
 `annotation_spec.md` §6. Visual overlays for each object are copied to
@@ -60,10 +58,6 @@ def stage_perframe(cap, obj):
     run([SAM3_PY, GEOM, "perframe", "--capture", cap, "--obj", obj, "--save-masks"])
 
 
-def stage_track(cap, obj, session):
-    run([SAM3_PY, GEOM, "track", "--capture", cap, "--obj", obj, "--session", session])
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
@@ -94,9 +88,6 @@ def main():
                 stage_seeds(cap, session, ref, src["frame"], objdir, n, min_vis)
             if not (args.skip_existing and (od / "masks_index.json").exists()):
                 stage_perframe(cap, objdir)
-            # SAM3 video refinement (per visible span); cfg "refine": false to skip
-            if cfg.get("refine", True):
-                stage_track(cap, objdir, session)
 
             mi = json.load(open(od / "masks_index.json"))
             per_state_masks[st] = {name: m["mask_file"] for name, m in mi.items()}

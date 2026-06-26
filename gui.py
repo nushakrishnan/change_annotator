@@ -6,8 +6,9 @@ live click previews; the propagation step shells out to lamar_env for geometry
 (`seeds`) and finishes the per-frame masks in-process with the same model.
 
   click point(s) on a source frame  -> SAM3 image mask preview (live)
-  add object (label / change_type)   -> saves src_mask.png under geom_sam_out/<id>__<state>/
-  propagate                          -> seeds (lamar_env) + per-frame SAM masks (within-walk)
+  add object (label / change_type)   -> first seed mask under geom_sam_out/<id>__<state>/
+  + seed (on more spread-out frames) -> extra seed masks; unioned in 3D for a complete object
+  propagate                          -> seeds (lamar_env, unions all seeds) + per-frame SAM masks
   export                             -> changes/segments.json   (annotation_spec.md §6)
 
 Run (sam3_env):
@@ -23,7 +24,6 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 import threading
 import uuid
 from pathlib import Path
@@ -61,7 +61,7 @@ def _frame_path(state, name):
 
 
 def _save_working():
-    json.dump(OBJECTS, open(Path(CFG["capture"]) / "changes" / "gui_objects.json", "w"), indent=1)
+    json.dump(OBJECTS, open(G.out_dir(CFG["capture"]) / "gui_objects.json", "w"), indent=1)
 
 
 def _objdir(key):
@@ -109,6 +109,22 @@ def _decode_mask(data_url):
     if arr.ndim == 3:
         return arr[:, :, 2] > 127
     return arr > 127
+
+
+def _add_seed_mask(od, frame, mask, reset=False):
+    """Append (or reset to) a seed mask for `frame` in the object's multi-seed store
+    (src_masks/ + src_index.json), which cmd_seeds unions into one 3D object.
+    Re-seeding the same frame replaces it. Returns the new seed count."""
+    sd = od / "src_masks"
+    sd.mkdir(exist_ok=True)
+    flat = frame.replace("/", "_") + ".png"
+    cv2.imwrite(str(sd / flat), (mask * 255).astype(np.uint8))
+    idxp = od / "src_index.json"
+    items = [] if reset or not idxp.exists() else json.load(open(idxp))
+    items = [it for it in items if it["src_name"] != frame]
+    items.append({"src_name": frame, "mask_file": f"src_masks/{flat}"})
+    json.dump(items, open(idxp, "w"), indent=1)
+    return len(items)
 
 
 # ───────────────────────────── pages / static ─────────────────────────────
@@ -179,13 +195,44 @@ def api_add_object():
         return jsonify(error="mask is empty"), 400
     key = f"{oid}__{state}"  # same id in pre + post = a moved object (linked at export)
     od = G.out_dir(CFG["capture"], key)
-    cv2.imwrite(str(od / "src_mask.png"), (mask * 255).astype(np.uint8))
+    cv2.imwrite(str(od / "src_mask.png"), (mask * 255).astype(np.uint8))  # first seed (viz)
+    _add_seed_mask(od, frame, mask, reset=True)                          # multi-seed store
     OBJECTS[key] = {"id": oid, "label": d.get("label") or oid,
                     "deformability": d.get("deformability", "rigid"),
-                    "state": state, "frame": frame, "points": points}
+                    "state": state, "frame": frame, "points": points,
+                    "seed_frames": [frame]}
     PENDING.clear()
     _save_working()
     return jsonify(ok=True)
+
+
+@app.route("/api/add_seed", methods=["POST"])
+def api_add_seed():
+    """Add another seed frame (a spread-out view) to an existing object. Lifting
+    several masks and unioning their 3D points makes the propagation seed complete
+    (one frame only sees one side of the object)."""
+    d = request.get_json()
+    oid = d["id"]
+    if oid not in OBJECTS:
+        return jsonify(error="add the object first"), 404
+    if d.get("state") and d["state"] != OBJECTS[oid]["state"]:
+        return jsonify(error=f"seed must be from the {OBJECTS[oid]['state']} state"), 400
+    if d.get("mask"):
+        mask, frame = _decode_mask(d["mask"]), d["frame"]
+    elif PENDING.get("mask") is not None:
+        mask, frame = PENDING["mask"], PENDING["frame"]
+    else:
+        return jsonify(error="no mask — click or draw the object first"), 400
+    if not mask.any():
+        return jsonify(error="mask is empty"), 400
+    od = G.out_dir(CFG["capture"], oid)
+    n = _add_seed_mask(od, frame, mask)
+    sf = OBJECTS[oid].setdefault("seed_frames", [OBJECTS[oid].get("frame")])
+    if frame not in sf:
+        sf.append(frame)
+    PENDING.clear()
+    _save_working()
+    return jsonify(ok=True, n_seeds=n)
 
 
 # ───────────────────────────── propagate (job) ─────────────────────────────
@@ -268,39 +315,6 @@ def _perframe_inproc(objdir, default_session):
     return len(mask_index)
 
 
-# ───────────────────────── refine: SAM3 video per-span ─────────────────────────
-@app.route("/api/refine", methods=["POST"])
-def api_refine():
-    """Refine an object's geom masks with the SAM3 video tracker (per visible span)."""
-    oid = request.get_json()["id"]
-    if oid not in OBJECTS:
-        return jsonify(error="unknown object"), 404
-    if not (G.out_dir(CFG["capture"], _objdir(oid)) / "masks_index.json").exists():
-        return jsonify(error="propagate first"), 400
-    job_id = uuid.uuid4().hex[:8]
-    JOBS[job_id] = {"status": "running", "obj": oid}
-    threading.Thread(target=_refine_job, args=(job_id, oid), daemon=True).start()
-    return jsonify(job_id=job_id)
-
-
-def _refine_job(job_id, oid):
-    try:
-        objdir = _objdir(oid)
-        sess = CFG["states"][OBJECTS[oid]["state"]]["session"]
-        # separate process so the SAM3 *video* model's VRAM is released on exit
-        # (the GUI process already holds the SAM3 *image* model for live clicks)
-        subprocess.run([sys.executable, str(G.__file__), "track",
-                        "--capture", CFG["capture"], "--obj", objdir,
-                        "--session", sess], check=True)
-        mi = G.out_dir(CFG["capture"], objdir) / "masks_index.json"
-        n = len(json.load(open(mi))) if mi.exists() else 0
-        JOBS[job_id].update(status="done", n_masks=n)
-    except subprocess.CalledProcessError as e:
-        JOBS[job_id].update(status="error", error=f"video refine failed (rc={e.returncode})")
-    except Exception as e:
-        JOBS[job_id].update(status="error", error=str(e))
-
-
 # ───────────────────────── review / edit propagated masks ─────────────────────────
 @app.route("/api/objects")
 def api_objects():
@@ -317,9 +331,14 @@ def api_objects():
                 n = len(json.load(open(mi)))
             except Exception:
                 n = 0
+        idxp = G.out_dir(CFG["capture"], key) / "src_index.json"
+        try:
+            n_seeds = len(json.load(open(idxp))) if idxp.exists() else 1
+        except Exception:
+            n_seeds = 1
         sts = states_by_id[o["id"]]            # change type reflects the id across both states
         in_pre, in_post = "pre" in sts, "post" in sts
-        out[key] = {**o, "n_masks": n, "in_pre": in_pre, "in_post": in_post,
+        out[key] = {**o, "n_masks": n, "n_seeds": n_seeds, "in_pre": in_pre, "in_post": in_post,
                     "change_type": _change_type(in_pre, in_post)}
     return jsonify(objects=out)
 
@@ -518,7 +537,10 @@ def main():
                        "post": {"session": args.post_session, "ref": args.post_ref}},
                seed={"n": args.n, "min_vis": args.min_vis})
 
-    gobj = Path(args.capture) / "changes" / "gui_objects.json"
+    gobj = G.out_dir(args.capture) / "gui_objects.json"           # workspace-scoped (GEOM_OUT)
+    legacy = Path(args.capture) / "changes" / "gui_objects.json"
+    if not gobj.exists() and G.OUT == "changes/geom_sam_out" and legacy.exists():
+        gobj = legacy                                             # migrate the default workspace
     if gobj.exists():
         try:
             for k, o in json.load(open(gobj)).items():
