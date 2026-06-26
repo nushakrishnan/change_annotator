@@ -20,40 +20,75 @@ https://github.com/user-attachments/assets/1779894f-f843-4e9b-a651-3fcb0ae43166
 
 ## Installation
 
+The annotator runs inside a single Python environment that carries SAM 3.1 and
+the Flask GUI. Throughout this repo and the docs that environment is referred to
+as `sam3_env` and is expected to live at `~/sam3_env` (the `gui.py` /
+`geom_sam_prototype.py` commands default to `~/sam3_env/bin/python`). The steps
+below recreate it from scratch.
+
+> **Note on the geometry-seeding step.** Propagation shells out to a *second*,
+> separate environment that holds the LaMAR / `scantools` stack — it is **not**
+> part of `sam3_env`. You only need it to run `Propagate`; point to it with the
+> `LAMAR_PY` / `LAMAR_PYTHONPATH` variables (see [Usage](#usage)). Installing
+> that stack is out of scope for this README.
+
 ### Prerequisites
-- Python 3.10+
-- CUDA-capable GPU (required — SAM 3.1 loads itself on CUDA)
+- Python 3.12 or higher
+- A CUDA-capable GPU with CUDA 12.6+ (required — SAM 3.1 loads itself on CUDA)
 - A HuggingFace account with access to [`facebook/sam3.1`](https://huggingface.co/facebook/sam3.1)
-- A capture directory with LaMAR poses + per-state mesh, and a separate Python environment carrying the `scantools` / LaMAR stack (used for the geometry-seeding step; see `LAMAR_PY` under [Usage](#usage))
+- A local checkout of the [SAM 3 repository](https://github.com/facebookresearch/sam3) (these instructions assume it is cloned at `~/repos/refs/sam3`)
 
 ### Setup Instructions
 
-1. **Clone the repository**:
+1. **Clone this repository**:
    ```bash
    git clone https://github.com/yuqunw/scenediff_annotator
    cd scenediff_annotator
    ```
 
-2. **Create conda environment and install dependencies**:
+2. **Clone SAM 3.1** (skip if you already have it at `~/repos/refs/sam3`):
    ```bash
-   conda create -n scenediff_annotator python=3.10 -y
-   conda activate scenediff_annotator
-   pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+   git clone git@github.com:facebookresearch/sam3.git ~/repos/refs/sam3
+   ```
+
+3. **Create the `sam3_env` virtual environment** (Python 3.12):
+   ```bash
+   python3.12 -m venv ~/sam3_env
+   source ~/sam3_env/bin/activate
+   pip install --upgrade pip
+   ```
+
+4. **Install PyTorch with CUDA 12.8 support** (matches the version SAM 3.1 is built against):
+   ```bash
+   pip install torch==2.10.0 torchvision --index-url https://download.pytorch.org/whl/cu128
+   ```
+
+5. **Install SAM 3.1** from the local checkout, including the `notebooks` extras
+   (these pull in `opencv-python`, `matplotlib`, `decord`, `scikit-image`,
+   `einops`, etc. that the annotator relies on):
+   ```bash
+   pip install -e "$HOME/repos/refs/sam3[notebooks]"
+   ```
+
+6. **Install this repo's GUI dependencies**:
+   ```bash
    pip install -r requirements.txt
    ```
 
-3. **Install SAM 3.1** from a local checkout (assumes the repo is cloned at `~/repos/refs/sam3`):
-   ```bash
-   pip install -e ~/repos/refs/sam3
-   ```
-
-4. **Authenticate with HuggingFace** and accept the model access request for `facebook/sam3.1`:
+7. **Authenticate with HuggingFace** and accept the model access request for `facebook/sam3.1`:
    ```bash
    hf auth login   # or: huggingface-cli login
    ```
    The SAM 3.1 checkpoint is downloaded automatically on first run of `gui.py`.
 
-For detailed SAM 3.1 installation instructions, refer to the [official SAM 3 repository](https://github.com/facebookresearch/sam3).
+8. **Verify the install**:
+   ```bash
+   ~/sam3_env/bin/python -c "import torch, flask; from sam3 import build_sam3_image_model; print('cuda:', torch.cuda.is_available())"
+   ```
+   This should print `cuda: True` with no import errors.
+
+For detailed SAM 3.1 installation instructions (including optional Flash
+Attention 3 support), refer to the [official SAM 3 repository](https://github.com/facebookresearch/sam3).
 
 ## Usage
 

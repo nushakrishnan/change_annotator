@@ -1,6 +1,7 @@
-opencv-python
-pandas
-requests
-psutil
+# GUI / annotator dependencies layered on top of the SAM 3.1 install.
+#
+# Install SAM 3.1 FIRST (see README "Installation"):
+#   pip install -e "$HOME/repos/refs/sam3[notebooks]"
+# That brings in torch, numpy, opencv-python, pillow, matplotlib, scikit-image,
+# decord, einops, etc. The only thing the SceneDiff GUI adds on top is Flask.
 flask
-matplotlib
