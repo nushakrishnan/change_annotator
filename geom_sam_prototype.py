@@ -1,19 +1,22 @@
 """Geometry-assisted annotation prototype (1 object, end-to-end).
 
-Two-stage pipeline across two envs (file handoff):
+Three-stage pipeline, all in ONE env (file handoff between stages):
 
-  src-mask  [sam3_env]  : click on source frame -> SAM3 image mask  -> src_mask.png
-  seeds     [lamar_env] : lift mask onto mesh (raycast), reproject the 3D object
-                          into every frame with a mesh-depth occlusion test
-                          -> per-frame seed point(s)+box -> seeds.json
-  perframe  [sam3_env]  : SAM3 image predict(points+box) per frame  -> per-frame masks
+  src-mask  : click on source frame -> SAM3 image mask  -> src_mask.png
+  seeds     : lift mask onto mesh (raycast), reproject the 3D object
+              into every frame with a mesh-depth occlusion test
+              -> per-frame seed point(s)+box -> seeds.json   (needs scantools)
+  perframe  : SAM3 image predict(points+box) per frame  -> per-frame masks
 
-Run (within aria_a_rgb):
-  ~/sam3_env/bin/python geom_sam_prototype.py src-mask  --capture C --session aria_a_rgb \
-        --src-name images/cam0/16700526188301.jpg --click 300 180
-  PYTHONPATH=~/repos/lamaria-indoor ~/lamar_env/bin/python geom_sam_prototype.py seeds \
+Imports are lazy per stage (sam3 in src-mask/perframe; scantools in seeds) so a
+stage only pays for what it uses. The `seeds` stage needs scantools on
+PYTHONPATH (lamaria-indoor). Run with the single env from setup.sh:
+  PY=~/annotator_env/bin/python; PP=~/repos/lamaria-indoor
+  $PY geom_sam_prototype.py src-mask  --capture C --session aria_a_rgb \
+        --src-name images/cam0/16700526188301.jpg --points 300 180
+  PYTHONPATH=$PP $PY geom_sam_prototype.py seeds \
         --capture C --session aria_a_rgb --ref navvis_a --src-name images/cam0/16700526188301.jpg --n 40
-  ~/sam3_env/bin/python geom_sam_prototype.py perframe --capture C --session aria_a_rgb
+  $PY geom_sam_prototype.py perframe --capture C --session aria_a_rgb
 """
 import argparse
 import json
@@ -72,7 +75,7 @@ def _segment(model, processor, img_rgb, points=None, labels=None, box=None, mult
     return np.asarray(masks), np.asarray(scores)
 
 
-# ───────────────────────── stage: src-mask (sam3_env) ─────────────────────────
+# ───────────────────────────── stage: src-mask ──────────────────────────────
 def cmd_src_mask(args):
     cap = Path(args.capture)
     rgb_path = cap / "sessions" / args.session / "raw_data" / args.src_name
@@ -102,7 +105,7 @@ def cmd_src_mask(args):
           f"({len(pos)} pos, {len(neg)} neg) -> {d/'src_mask_overlay.png'}")
 
 
-# ───────────────────────── stage: seeds (lamar_env) ─────────────────────────
+# ─────────────────── stage: seeds (needs scantools on PYTHONPATH) ───────────────────
 def _session(cap, sid, ref):
     from scantools.capture import Capture
     from scantools.capture.timed_reconstruction import TimedReconstruction
@@ -319,7 +322,7 @@ def cmd_seeds(args):
           f"-> {od/'seeds.json'}")
 
 
-# ───────────────────────── stage: perframe (sam3_env) ─────────────────────────
+# ───────────────────────────── stage: perframe ──────────────────────────────
 def cmd_perframe(args):
     cap = Path(args.capture)
     od = out_dir(cap, args.obj)
