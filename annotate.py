@@ -3,37 +3,47 @@
 Reads a per-scene annotation config (JSON) and, for each declared object, runs the
 geometry-assisted propagation pipeline across the two envs:
 
-  src-mask  [sam3_env]  click(s) on a source frame        -> SAM3 mask
-  seeds     [lamar_env] lift onto the source-state mesh,
-                        reproject within the source walk
-                        (mesh-depth occlusion test)        -> per-frame seeds
-  perframe  [sam3_env]  SAM3 per-frame masks               -> saved binary masks
+  src-mask  click(s) on a source frame        -> SAM3 mask
+  seeds     lift onto the source-state mesh,
+            reproject within the source walk
+            (mesh-depth occlusion test)        -> per-frame seeds
+  perframe  SAM3 per-frame masks               -> saved binary masks
+
+All three stages run in ONE env (see setup.sh) — `seeds` only needs scantools on
+PYTHONPATH (lamaria-indoor), which is pure-python; SAM3 and the geometry stack
+coexist in the same interpreter.
 
 then assembles all objects into one GT record (`changes/segments.json`) following
 `annotation_spec.md` §6. Visual overlays for each object are copied to
-`/media/lamaria_indoor/annotation_exploration/<scene>/` for review.
+`changes/geom_sam_out/_review/<id>__<state>/` (under the workspace) for review.
 
 v1 propagates WITHIN each object's source state (one click -> all cam0 frames of that
 walk). Cross-sequence vacated/arrival footprints (change_mask in the *other* clip) are a
 documented phase-2 — see annotation_spec.md §5. `change_type`/`in_pre`/`in_post` come from
 the config (annotator-declared), not inferred.
 
-Run (any env; it only shells out to the two stage envs):
-  ~/lamar_env/bin/python annotate.py --config configs/cnb_e100.json [--skip-existing]
+Run (single env from setup.sh; scantools on PYTHONPATH for the seeds stage):
+  PYTHONPATH=~/repos/lamaria-indoor ~/annotator_env/bin/python annotate.py \
+      --config configs/cnb_e100.json [--skip-existing]
 """
 import argparse
 import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 GEOM = HERE / "geom_sam_prototype.py"
-SAM3_PY = Path(os.environ.get("SAM3_PY", Path.home() / "sam3_env/bin/python"))
-LAMAR_PY = Path(os.environ.get("LAMAR_PY", Path.home() / "lamar_env/bin/python"))
-LAMAR_PYTHONPATH = os.environ.get("LAMAR_PYTHONPATH", str(Path.home() / "repos/lamaria-indoor"))
-VIZ_ROOT = Path(os.environ.get("VIZ_ROOT", "/media/lamaria_indoor/annotation_exploration"))
+# One interpreter for every stage. Defaults to the interpreter running this
+# script, so launching from the single env (setup.sh) just works with no paths
+# to set. Override with ANNOTATOR_PY only to point at a different env.
+ANNOTATOR_PY = Path(os.environ.get("ANNOTATOR_PY", sys.executable))
+# scantools lives in lamaria-indoor and is used via PYTHONPATH (not installed).
+LAMARIA_PYTHONPATH = os.environ.get(
+    "LAMARIA_INDOOR",
+    os.environ.get("LAMAR_PYTHONPATH", str(Path.home() / "repos/lamaria-indoor")))
 
 
 def run(cmd, env=None):
@@ -43,19 +53,19 @@ def run(cmd, env=None):
 
 def stage_src_mask(cap, session, src_name, clicks, obj):
     pts = [str(v) for xy in clicks for v in xy]
-    run([SAM3_PY, GEOM, "src-mask", "--capture", cap, "--session", session,
+    run([ANNOTATOR_PY, GEOM, "src-mask", "--capture", cap, "--session", session,
          "--src-name", src_name, "--obj", obj, "--points", *pts])
 
 
 def stage_seeds(cap, session, ref, src_name, obj, n, min_vis):
-    env = dict(os.environ, PYTHONPATH=LAMAR_PYTHONPATH)
-    run([LAMAR_PY, GEOM, "seeds", "--capture", cap, "--session", session, "--ref", ref,
+    env = dict(os.environ, PYTHONPATH=LAMARIA_PYTHONPATH)  # scantools on path
+    run([ANNOTATOR_PY, GEOM, "seeds", "--capture", cap, "--session", session, "--ref", ref,
          "--src-name", src_name, "--obj", obj, "--n", str(n), "--min-vis", str(min_vis),
          "--no-cross"], env=env)  # v1: within-source propagation only
 
 
 def stage_perframe(cap, obj):
-    run([SAM3_PY, GEOM, "perframe", "--capture", cap, "--obj", obj, "--save-masks"])
+    run([ANNOTATOR_PY, GEOM, "perframe", "--capture", cap, "--obj", obj, "--save-masks"])
 
 
 def main():
@@ -93,8 +103,8 @@ def main():
             per_state_masks[st] = {name: m["mask_file"] for name, m in mi.items()}
             present.add(st)
 
-            # collect review visualizations
-            viz = VIZ_ROOT / cfg["scene"] / objdir
+            # collect review visualizations (under the workspace, no external dir)
+            viz = geom_out / "_review" / objdir
             viz.mkdir(parents=True, exist_ok=True)
             for f in ("src_mask_overlay.png", "result_contact.png", "result.mp4"):
                 if (od / f).exists():
@@ -129,7 +139,7 @@ def main():
     out = Path(cap) / "changes" / "segments.json"
     json.dump(segments, open(out, "w"), indent=1)
     print(f"\nwrote {out}  ({len(objects_out)} objects)")
-    print(f"viz -> {VIZ_ROOT / cfg['scene']}")
+    print(f"viz -> {geom_out / '_review'}")
 
 
 if __name__ == "__main__":
