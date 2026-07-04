@@ -423,10 +423,11 @@ function renderObjects(objs){
     const div = document.createElement('div'); div.className='obj'; div.dataset.oid = key;
     const masks = o.n_masks ? `<span class="pill">${o.n_masks} masks</span>` : '';
     const seeds = o.n_seeds > 1 ? `<span class="pill">${o.n_seeds} seeds</span>` : '';
-    div.innerHTML = `<h4>${o.id} · ${o.state} ${seeds} ${masks}</h4>
-      <div class="meta">${o.label} · ${o.change_type} · ${o.deformability}</div>
+    const seedProp = o.ghost ? '' : `
       <button onclick="addSeed('${key}')" title="add the current frame as another seed view (spread-out frames → stronger propagation)">+ seed</button>
-      <button onclick="propagate('${key}')">propagate</button>
+      <button onclick="propagate('${key}')">propagate</button>`;
+    div.innerHTML = `<h4>${o.ghost ? '👻 ' : ''}${o.id} · ${o.state} ${seeds} ${masks}</h4>
+      <div class="meta">${o.label} · ${o.change_type} · ${o.deformability}</div>${seedProp}
       <button onclick="openReview('${key}')" ${o.n_masks ? '' : 'disabled'}>review / edit</button>
       <button onclick="deleteObject('${key}')" class="del" title="remove this object — its seeds/masks are moved to .trash (recoverable on disk)">delete</button>
       <span class="status" id="st_${key}"></span>

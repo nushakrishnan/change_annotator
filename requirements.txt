@@ -1,7 +1,23 @@
-# GUI / annotator dependencies layered on top of the SAM 3.1 install.
+# Single-env dependencies for the SceneDiff annotator.
 #
-# Install SAM 3.1 FIRST (see README "Installation"):
-#   pip install -e "$HOME/repos/refs/sam3[notebooks]"
-# That brings in torch, numpy, opencv-python, pillow, matplotlib, scikit-image,
-# decord, einops, etc. The only thing the SceneDiff GUI adds on top is Flask.
+# Prefer `bash setup.sh` — it builds the whole env in the right order (torch
+# first, then the editable/source-built pieces) and validates the imports. This
+# file lists only the plain-PyPI layer, for reference or to top up an env that
+# already has the source-built pieces below.
+#
+# NOT in this file (installed by setup.sh from source / pinned index):
+#   torch==2.10.0+cu128, torchvision==0.25.0+cu128   (--index-url .../cu128)
+#   sam3                  -e ~/repos/refs/sam3[notebooks]   (brings opencv, einops,
+#                                                            decord, scikit-image, …)
+#   raybender             -e ~/repos/geom/raybender   (needs embree_DIR; bundles embree)
+#   scantools             via PYTHONPATH=~/repos/lamaria-indoor  (not installed)
+
+# Geometry stack used by the `seeds` propagation stage (scantools' runtime deps):
+open3d==0.19.0
+pycolmap==4.1.0
+plyfile==1.1.3
+rawpy
+scipy==1.15.3
+
+# GUI server:
 flask

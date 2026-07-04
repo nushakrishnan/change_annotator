@@ -1,18 +1,20 @@
 """Minimal click-to-propagate annotation GUI (RGB, single-camera).
 
 A thin Flask front-end on top of the geometry-assisted propagation pipeline
-(`geom_sam_prototype.py`). Runs in sam3_env and holds one SAM3 *image* model for
-live click previews; the propagation step shells out to lamar_env for geometry
-(`seeds`) and finishes the per-frame masks in-process with the same model.
+(`geom_sam_prototype.py`). Runs in the single env (setup.sh) and holds one SAM3
+*image* model for live click previews; the propagation step runs the geometry
+`seeds` stage as a subprocess of the SAME interpreter (scantools on PYTHONPATH)
+and finishes the per-frame masks in-process with the same model.
 
   click point(s) on a source frame  -> SAM3 image mask preview (live)
   add object (label / change_type)   -> first seed mask under geom_sam_out/<id>__<state>/
   + seed (on more spread-out frames) -> extra seed masks; unioned in 3D for a complete object
-  propagate                          -> seeds (lamar_env, unions all seeds) + per-frame SAM masks
+  propagate                          -> seeds (geometry, unions all seeds) + per-frame SAM masks
   export                             -> changes/segments.json   (annotation_spec.md §6)
 
-Run (sam3_env):
-  ~/sam3_env/bin/python gui.py --capture /media/lamaria_indoor/captures/changes/cnb_e100
+Run (single env; scantools on PYTHONPATH for the seeds stage):
+  PYTHONPATH=~/repos/lamaria-indoor ~/annotator_env/bin/python gui.py \
+      --capture /media/lamaria_indoor/captures/changes/cnb_e100
   # open http://127.0.0.1:5000
 
 Single-user by design (one shared model + a lock). Pinhole RGB sessions
@@ -24,6 +26,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import threading
 import uuid
 from pathlib import Path
@@ -32,11 +35,17 @@ import cv2
 import numpy as np
 from flask import Flask, jsonify, request, render_template, send_file, Response
 
+import change_mask as CM
 import geom_sam_prototype as G
 
-LAMAR_PY = Path(os.environ.get("LAMAR_PY", Path.home() / "lamar_env/bin/python"))
-LAMAR_PYTHONPATH = os.environ.get("LAMAR_PYTHONPATH", str(Path.home() / "repos/lamaria-indoor"))
-VIZ_ROOT = Path(os.environ.get("VIZ_ROOT", "/media/lamaria_indoor/annotation_exploration"))
+# One interpreter for every stage (defaults to the one running the GUI, i.e. the
+# single env from setup.sh). The seeds stage is shelled out only to keep its
+# heavy geometry imports out of the long-lived GUI process; it uses this same
+# interpreter, with scantools (lamaria-indoor) on PYTHONPATH.
+ANNOTATOR_PY = Path(os.environ.get("ANNOTATOR_PY", sys.executable))
+LAMARIA_PYTHONPATH = os.environ.get(
+    "LAMARIA_INDOOR",
+    os.environ.get("LAMAR_PYTHONPATH", str(Path.home() / "repos/lamaria-indoor")))
 
 app = Flask(__name__)
 
@@ -61,7 +70,12 @@ def _frame_path(state, name):
 
 
 def _save_working():
-    json.dump(OBJECTS, open(G.out_dir(CFG["capture"]) / "gui_objects.json", "w"), indent=1)
+    """Atomic write via rename: the shared workspace file may be owned by another
+    annotator (group-writable dir, not the file) -- os.replace only needs dir write."""
+    p = G.out_dir(CFG["capture"]) / "gui_objects.json"
+    tmp = p.with_name(f".{p.name}.{os.getpid()}.tmp")
+    json.dump(OBJECTS, open(tmp, "w"), indent=1)
+    os.replace(tmp, p)
 
 
 def _objdir(key):
@@ -215,6 +229,8 @@ def api_add_seed():
     oid = d["id"]
     if oid not in OBJECTS:
         return jsonify(error="add the object first"), 404
+    if OBJECTS[oid].get("ghost"):
+        return jsonify(error="ghosts take no seeds -- edit their masks in review mode"), 400
     if d.get("state") and d["state"] != OBJECTS[oid]["state"]:
         return jsonify(error=f"seed must be from the {OBJECTS[oid]['state']} state"), 400
     if d.get("mask"):
@@ -241,6 +257,9 @@ def api_propagate():
     oid = request.get_json()["id"]
     if oid not in OBJECTS:
         return jsonify(error="unknown object"), 404
+    if OBJECTS[oid].get("ghost"):
+        return jsonify(error="ghost masks are derived -- regenerate with "
+                             "point_ghost_prototype.py ghosts"), 400
     job_id = uuid.uuid4().hex[:8]
     JOBS[job_id] = {"status": "running", "obj": oid}
     threading.Thread(target=_propagate_job, args=(job_id, oid), daemon=True).start()
@@ -258,18 +277,18 @@ def _propagate_job(job_id, oid):
         state = o["state"]
         objdir = oid  # OBJECTS is keyed by '<id>__<state>' = the objdir
         st = CFG["states"][state]
-        # 1) geometry seeds (lamar_env subprocess; within-source walk only)
-        env = dict(os.environ, PYTHONPATH=LAMAR_PYTHONPATH)
-        subprocess.run([str(LAMAR_PY), str(G.__file__), "seeds",
+        # 1) geometry seeds (subprocess of the same env; within-source walk only)
+        env = dict(os.environ, PYTHONPATH=LAMARIA_PYTHONPATH)  # scantools on path
+        subprocess.run([str(ANNOTATOR_PY), str(G.__file__), "seeds",
                         "--capture", CFG["capture"], "--session", st["session"],
                         "--ref", st["ref"], "--src-name", o["frame"], "--obj", objdir,
                         "--n", str(CFG["seed"]["n"]), "--min-vis", str(CFG["seed"]["min_vis"]),
                         "--no-cross"], check=True, env=env)
         # 2) per-frame SAM masks (in-process, shared model)
         n = _perframe_inproc(objdir, st["session"])
-        # 3) collect viz for review
+        # 3) collect viz for review (under the workspace, no external dir)
         od = G.out_dir(CFG["capture"], objdir)
-        viz = VIZ_ROOT / CFG["scene"] / objdir
+        viz = G.out_dir(CFG["capture"]) / "_review" / objdir
         viz.mkdir(parents=True, exist_ok=True)
         if (od / "result_contact.png").exists():
             shutil.copy(od / "result_contact.png", viz / "result_contact.png")
@@ -339,7 +358,7 @@ def api_objects():
         sts = states_by_id[o["id"]]            # change type reflects the id across both states
         in_pre, in_post = "pre" in sts, "post" in sts
         out[key] = {**o, "n_masks": n, "n_seeds": n_seeds, "in_pre": in_pre, "in_post": in_post,
-                    "change_type": _change_type(in_pre, in_post)}
+                    "change_type": "ghost" if o.get("ghost") else _change_type(in_pre, in_post)}
     return jsonify(objects=out)
 
 
@@ -510,9 +529,13 @@ def api_delete_object():
 # ───────────────────────────── export ─────────────────────────────
 @app.route("/api/export", methods=["POST"])
 def api_export():
-    # merge the per-state entries of each object id (pre + post = a moved object)
+    # merge the per-state entries of each object id (pre + post = a moved object).
+    # ghost pseudo-objects (point_ghost_prototype.py ghosts) are derived output,
+    # not annotations -- they never enter segments.json or the native change mask.
     by_id = {}
     for key, o in OBJECTS.items():
+        if o.get("ghost"):
+            continue
         mi_path = G.out_dir(CFG["capture"], key) / "masks_index.json"
         state_masks = ({name: m["mask_file"] for name, m in json.load(open(mi_path)).items()}
                        if mi_path.exists() else {})
@@ -533,7 +556,8 @@ def api_export():
     # per-frame binary change mask = union of object masks (the scored GT, spec §6/§7)
     try:
         segments["change_mask"] = CM.build_change_masks(
-            CFG["capture"], geom_out=G.OUT, object_keys=list(OBJECTS.keys()), verbose=False)
+            CFG["capture"], geom_out=G.OUT, verbose=False,
+            object_keys=[k for k, o in OBJECTS.items() if not o.get("ghost")])
     except Exception as e:
         print(f"warn: change_mask export failed: {e}", flush=True)
     out = Path(CFG["capture"]) / "changes" / "segments.json"

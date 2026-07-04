@@ -20,23 +20,26 @@ https://github.com/user-attachments/assets/1779894f-f843-4e9b-a651-3fcb0ae43166
 
 ## Installation
 
-The annotator runs inside a single Python environment that carries SAM 3.1 and
-the Flask GUI. Throughout this repo and the docs that environment is referred to
-as `sam3_env` and is expected to live at `~/sam3_env` (the `gui.py` /
-`geom_sam_prototype.py` commands default to `~/sam3_env/bin/python`). The steps
-below recreate it from scratch.
+The annotator runs inside a **single** Python 3.10 environment that carries the
+whole pipeline — SAM 3.1, the Flask GUI, **and** the LaMAR geometry stack
+(`scantools` / `raybender` / `pycolmap` / `open3d`) used by the propagation
+(`seeds`) step. `setup.sh` builds it from scratch; by default it lives at
+`~/annotator_env`. (Earlier versions split this across a `sam3_env` on 3.12 and a
+separate `lamar_env` on 3.10 — that is no longer needed.)
 
-> **Note on the geometry-seeding step.** Propagation shells out to a *second*,
-> separate environment that holds the LaMAR / `scantools` stack — it is **not**
-> part of `sam3_env`. You only need it to run `Propagate`; point to it with the
-> `LAMAR_PY` / `LAMAR_PYTHONPATH` variables (see [Usage](#usage)). Installing
-> that stack is out of scope for this README.
+The only codebase dependency kept *outside* the env is lamaria-indoor's
+`scantools`, which is pure-python and used via `PYTHONPATH` (no install). Clone
+it once and point `LAMARIA_INDOOR` at it.
 
 ### Prerequisites
-- Python 3.12 or higher
-- A CUDA-capable GPU with CUDA 12.6+ (required — SAM 3.1 loads itself on CUDA)
+- **Python 3.10** (the common denominator: SAM 3.1 supports 3.8–3.12, but the geometry stack is built for 3.10 here)
+- A CUDA-capable GPU with CUDA 12.8 (required — SAM 3.1 loads itself on CUDA)
 - A HuggingFace account with access to [`facebook/sam3.1`](https://huggingface.co/facebook/sam3.1)
-- A local checkout of the [SAM 3 repository](https://github.com/facebookresearch/sam3) (these instructions assume it is cloned at `~/repos/refs/sam3`)
+- Local checkouts of the source-built dependencies (the install script expects these paths, override via env vars):
+  - SAM 3.1 — `~/repos/refs/sam3` (`SAM3_SRC`)
+  - `raybender` (custom C++ raycaster, bundles embree) — `~/repos/geom/raybender` (`RAYBENDER_SRC`)
+  - `lamaria-indoor` (provides `scantools`) — `~/repos/lamaria-indoor` (`LAMARIA_INDOOR`)
+  - `colmap` source — `~/repos/refs/colmap` (`COLMAP_SRC`) — only needed if the prebuilt `pycolmap` wheel is unavailable
 
 ### Setup Instructions
 
@@ -46,44 +49,33 @@ below recreate it from scratch.
    cd scenediff_annotator
    ```
 
-2. **Clone SAM 3.1** (skip if you already have it at `~/repos/refs/sam3`):
+2. **Clone the source dependencies** (skip any you already have):
    ```bash
    git clone git@github.com:facebookresearch/sam3.git ~/repos/refs/sam3
+   git clone <lamaria-indoor-url>                      ~/repos/lamaria-indoor
+   git clone <raybender-url>                           ~/repos/geom/raybender
    ```
 
-3. **Create the `sam3_env` virtual environment** (Python 3.12):
+3. **Build the single environment**:
    ```bash
-   python3.12 -m venv ~/sam3_env
-   source ~/sam3_env/bin/activate
-   pip install --upgrade pip
+   bash setup.sh
    ```
+   This creates `~/annotator_env` (Python 3.10), installs torch 2.10/cu128,
+   SAM 3.1 (editable, with the `notebooks` extras), the geometry stack
+   (`open3d`, `pycolmap`, `plyfile`, `rawpy`, `scipy`, `raybender`), and Flask,
+   then validates that every stage's imports resolve in the one interpreter.
+   Override locations with env vars, e.g. `ENV_DIR=~/foo SAM3_SRC=... bash setup.sh`.
 
-4. **Install PyTorch with CUDA 12.8 support** (matches the version SAM 3.1 is built against):
-   ```bash
-   pip install torch==2.10.0 torchvision --index-url https://download.pytorch.org/whl/cu128
-   ```
-
-5. **Install SAM 3.1** from the local checkout, including the `notebooks` extras
-   (these pull in `opencv-python`, `matplotlib`, `decord`, `scikit-image`,
-   `einops`, etc. that the annotator relies on):
-   ```bash
-   pip install -e "$HOME/repos/refs/sam3[notebooks]"
-   ```
-
-6. **Install this repo's GUI dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-7. **Authenticate with HuggingFace** and accept the model access request for `facebook/sam3.1`:
+4. **Authenticate with HuggingFace** and accept the model access request for `facebook/sam3.1`:
    ```bash
    hf auth login   # or: huggingface-cli login
    ```
    The SAM 3.1 checkpoint is downloaded automatically on first run of `gui.py`.
 
-8. **Verify the install**:
+5. **Verify the install** (also done automatically at the end of `setup.sh`):
    ```bash
-   ~/sam3_env/bin/python -c "import torch, flask; from sam3 import build_sam3_image_model; print('cuda:', torch.cuda.is_available())"
+   PYTHONPATH=~/repos/lamaria-indoor ~/annotator_env/bin/python -c \
+     "import torch, flask, scantools.proc.rendering; from sam3 import build_sam3_image_model; print('cuda:', torch.cuda.is_available())"
    ```
    This should print `cuda: True` with no import errors.
 
@@ -94,10 +86,11 @@ Attention 3 support), refer to the [official SAM 3 repository](https://github.co
 
 ### Starting the Application
 
-The GUI runs against a single capture directory holding a `pre` and a `post` session of the same scene (by default the Aria RGB sessions `aria_a_rgb` / `aria_b_rgb`). Launch it in the SAM 3.1 environment:
+The GUI runs against a single capture directory holding a `pre` and a `post` session of the same scene (by default the Aria RGB sessions `aria_a_rgb` / `aria_b_rgb`). Launch it with the one env, putting `scantools` (lamaria-indoor) on `PYTHONPATH` so the `Propagate` step can run:
 
 ```bash
-~/sam3_env/bin/python gui.py --capture /path/to/captures/changes/cnb_e100
+PYTHONPATH=~/repos/lamaria-indoor ~/annotator_env/bin/python gui.py \
+    --capture /path/to/captures/changes/cnb_e100
 ```
 
 Then open `http://127.0.0.1:5000` in your browser. Useful flags:
@@ -123,6 +116,99 @@ The geometry-seeding step shells out to a separate environment that has the LaMA
 
 6. **Export**: Click `Export` to write `changes/segments.json` (see [Output Format](#output-format)).
 
+## End-to-End: a Fresh Sequence to Symmetric GT
+
+The recipe for a capture that has **no masks at all yet** — neither per-sequence
+object masks nor ghost masks on the inference frames. Only step 2 involves a
+human; everything after is generated from those masks plus the scan geometry.
+
+### 0. What the capture must already contain
+
+```
+<capture>/                                  e.g. /media/lamaria_indoor/captures/changes/<scene>
+├── sessions/
+│   ├── aria_a_rgb/                         "pre" walk
+│   │   ├── raw_data/images/cam0/*.jpg      the frames
+│   │   └── proc/navvis_a/colmap_model_aligned/   aligned poses
+│   ├── aria_b_rgb/                         "post" walk (same layout, ref navvis_b)
+│   ├── navvis_a/
+│   │   ├── raw_data/pointcloud.ply         RAW lidar scan (keeps the changed objects!)
+│   │   └── proc/.../mesh                   NavVis mesh (occlusion testing)
+│   └── navvis_b/                           same layout
+└── changes/navvis_b_to_navvis_a/T_navvis_a_from_navvis_b.txt   rigid NavVis↔NavVis bridge
+```
+
+Different session/ref names? Every command below accepts
+`--pre-session/--pre-ref/--post-session/--post-ref` (defaults shown above).
+
+### 1. Environments
+
+| env | used by | contents |
+|---|---|---|
+| `~/annotator_env` | `gui.py` (steps 2 and 5) | SAM 3.1 + Flask + geometry stack (`setup.sh`) |
+| `~/lamar_env` | `point_ghost_prototype.py`, `change_mask.py --symmetric` | scantools/raybender/open3d, no GPU needed |
+
+Both need lamaria-indoor's `scantools` on `PYTHONPATH` (shown inline below).
+
+### 2. Annotate the per-sequence masks (manual, the only annotation step)
+
+```bash
+PYTHONPATH=~/repos/lamaria-indoor ~/annotator_env/bin/python gui.py \
+    --capture /media/lamaria_indoor/captures/changes/<scene>
+```
+
+For every changed object, **in each state where it is physically visible**
+(a moved chair gets `chair` in *pre* AND `chair` in *post*; an added bottle only
+in *post*): click → add object → `+ seed` from 1-3 spread-out views →
+`Propagate` → review/edit (brush, erase, `d` to drop a bad frame) → next object.
+Finish with `Export`. This writes the verified per-object masks
+(`changes/geom_sam_out/<id>__<state>/masks_index.json`), `segments.json`, and
+the native `change_mask/` GT. Do NOT annotate where an object is absent — the
+ghost there is generated in step 3.
+
+### 3. Generate the symmetric GT (automatic ghosts on the inference frames)
+
+```bash
+CAP=/media/lamaria_indoor/captures/changes/<scene>
+# per-object 3D meshes from the RAW lidar cloud + the step-2 masks (~minutes/object)
+PYTHONPATH=~/repos/lamaria-indoor:. ~/lamar_env/bin/python point_ghost_prototype.py objects   --capture $CAP
+# render each mesh into the OTHER state's frames, occlusion-tested -> the symmetric GT
+PYTHONPATH=~/repos/lamaria-indoor:. ~/lamar_env/bin/python point_ghost_prototype.py symmetric --capture $CAP --viz
+```
+
+Output: `changes/change_mask_symmetric_points/<state>/*.png` (+ `_index.json`,
+`<state>_viz/` panels with native = green, ghost = red). Sanity-check the
+`objects` stage per object in `changes/point_ghost/<id>__<state>/`
+(`mesh.ply`, `points.ply`, `stats.json`) — a degenerate object (too few lidar
+points) is logged and simply has no ghost.
+
+### 4. (Optional) benchmark against the voted-faces baseline
+
+```bash
+PYTHONPATH=~/repos/lamaria-indoor ~/lamar_env/bin/python change_mask.py --capture $CAP --symmetric --viz
+PYTHONPATH=~/repos/lamaria-indoor:. ~/lamar_env/bin/python point_ghost_prototype.py compare --capture $CAP
+```
+
+Writes `[RGB | old | new]` panels + a source-frame IoU table under
+`changes/point_ghost_compare/`.
+
+### 5. (Optional) hand-correct the generated ghosts in the GUI
+
+```bash
+# each object's ghost as a GUI-editable 👻 pseudo-object (<id>_ghost__<state>)
+PYTHONPATH=~/repos/lamaria-indoor:. ~/lamar_env/bin/python point_ghost_prototype.py ghosts --capture $CAP
+# restart gui.py (step 2 command) -> 👻 objects appear in the sidebar:
+#   review/edit -> brush/erase the ghost region (SAM clicks can't help: nothing
+#   visible to segment where an object *used to be*), `d` drops a frame
+# then rebuild the symmetric GT from the corrected masks:
+PYTHONPATH=~/repos/lamaria-indoor:. ~/lamar_env/bin/python point_ghost_prototype.py merge --capture $CAP --viz
+```
+
+Ghost pseudo-objects are derived data: they never enter `segments.json` or the
+native `change_mask/`, and `propagate`/`+ seed` are disabled for them. Re-running
+`ghosts` regenerates them (overwriting hand edits — correct AFTER the geometry
+is final).
+
 ## Output Format
 
 All outputs are written into the capture directory under `changes/`:
@@ -132,11 +218,24 @@ All outputs are written into the capture directory under `changes/`:
 - **`changes/segments.json`** — the final export.
 - **`changes/change_mask/<state>/<frame>.png`** — per-frame binary change mask (255 = changed), the **union of all object masks** on that frame. This is the per-pixel ground truth a method is scored against (`annotation_spec.md` §6/§7), the metric MV3DCD / SceneDiff report. Produced automatically on `Export`, indexed in `changes/change_mask_index.json`, and referenced from `segments.json` under a top-level `change_mask: {state: {frame: relpath}}` block.
 
+- **`changes/change_mask_symmetric/<state>/<frame>.png`** — the **MV3DCD-suited symmetric** change mask (`--symmetric`). Each frame carries changes from **both** directions: the native object masks **plus** the cross-projected footprint of the other state's changes (where an object *was* / *will be*). This matches what a multi-view 3D detector outputs — every changed region, both directions, in every image. The cross-projection is mesh-anchored and multi-view-consistent: each object's verified masks are **voted onto the NavVis mesh faces**, carried across the rigid NavVis→NavVis bridge, and the labeled sub-mesh is **rendered** into the other sequence with the target mesh providing occlusion (no per-frame 2D warp, no SAM). Indexed in `change_mask_symmetric_index.json`. Native per-sequence masks stay the authoritative human-verified GT; this is a derived view.
+
 To (re)generate change masks for a capture without re-running the GUI:
 
 ```bash
+# native (pure cv2, any env)
 ~/lamar_env/bin/python change_mask.py --capture /path/to/captures/changes/cnb_e100
+
+# + symmetric MV3DCD GT (needs lamar_env: scantools/raybender/open3d)
+PYTHONPATH=~/repos/lamaria-indoor ~/lamar_env/bin/python change_mask.py \
+    --capture /path/to/captures/changes/cnb_e100 --symmetric --render-scale 1.0
 ```
+
+Useful `--symmetric` knobs: `--ratio` (min inside/seen vote per face, raise to reject stray faces), `--min-views` (min source views to keep a face), `--vote-scale` / `--render-scale` (speed vs. crispness), `--occ-tol` (target-mesh occlusion tolerance, metres).
+
+The NavVis meshing step drops most changed objects, so the voted-face footprint can come out holey or empty. Two prototypes rebuild the missing geometry: `lidar_tsdf_prototype.py` (DA3 mono depth anchored to the raw lidar, TSDF-fused per state, output in `change_mask_symmetric_tsdf/`) and `point_ghost_prototype.py` (no mono depth: per object, the verified masks select the object's own points from the **raw lidar cloud** — z-buffered multi-view point voting — which are alpha-shape meshed, mask-exterior trimmed, and rendered as the ghost; output in `change_mask_symmetric_points/`). `point_ghost_prototype.py compare` writes `[RGB | old | new]` panels and a source-frame IoU table under `changes/point_ghost_compare/` to judge the variants against each other.
+
+The generated ghosts can be **hand-corrected in the GUI**: `point_ghost_prototype.py ghosts` renders each object's ghost separately into the other state's frames and registers it as a 👻 pseudo-object (`<id>_ghost__<state>` in `geom_sam_out/`, flagged `ghost` in `gui_objects.json`). Restart `gui.py` and the ghosts appear in the sidebar — review/edit them with the brush/eraser (SAM clicks won't help: there is nothing visible to segment where an object *used to be*), delete bad frames, then run `point_ghost_prototype.py merge --viz` to rebuild `change_mask_symmetric_points/` from the corrected masks. Ghost pseudo-objects never enter `segments.json` or the native `change_mask/` export.
 
 ### `segments.json` Structure
 
