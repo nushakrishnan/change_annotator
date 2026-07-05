@@ -83,7 +83,7 @@
     &nbsp; size <input type="range" id="brushSize" min="3" max="250" value="40" style="vertical-align:middle" oninput="brushSize=+this.value">
   </div>
   <div id="viewport"><img id="view" src=""><canvas id="maskCanvas"></canvas></div>
-  <div class="hint" id="annotateHint"><b>point</b>: click=positive, shift-click=negative · <b>brush/erase</b>: drag to paint · <b>scroll</b> zoom · <b>middle-drag</b> pan · <b>fit</b> resets · <b>← / →</b> scrub</div>
+  <div class="hint" id="annotateHint"><b>point</b>: click=positive, shift-click=negative · <b>brush/erase</b>: drag to paint · <b>ctrl-z</b> undo · <b>scroll</b> zoom · <b>middle-drag</b> pan · <b>fit</b> resets · <b>← / →</b> scrub</div>
   <div class="status" id="clickStatus"></div>
 </div>
 
@@ -117,6 +117,7 @@ const slider = document.getElementById('slider');
 const maskCanvas = document.getElementById('maskCanvas');
 const maskCtx = maskCanvas.getContext('2d');
 let tool = 'point', brushSize = 40, reviewState = 'pre', gesture = null, lastPt = null;
+let undoStack = [];        // canvas snapshots for ctrl-z (one per brush stroke / SAM apply)
 
 function curState(){ return document.querySelector('input[name=state]:checked').value; }
 function frameName(i){ return mode === 'review' ? frames[i].name : frames[i]; }
@@ -207,7 +208,7 @@ function renderMaskmap(){
 }
 
 function startEdit(){
-  editing = true; pos = []; neg = []; setEditUI(true); showMask(true);
+  editing = true; pos = []; neg = []; setEditUI(true); showMask(true); resetUndo();
   const f = frames[idx];
   setFrame('/frame?state=' + reviewState + '&name=' + encodeURIComponent(f.name),
     () => loadMaskFromUrl('/api/mask_png?id=' + encodeURIComponent(reviewObj) +
@@ -272,7 +273,8 @@ function updateLabel(){
 document.addEventListener('keydown', (e) => {
   const t = document.activeElement.tagName;
   if(t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT') return;
-  if(e.key === 'ArrowRight'){ e.preventDefault(); gotoIdx(idx + 1); }
+  if((e.key === 'z' || e.key === 'Z') && (e.ctrlKey || e.metaKey) && !e.shiftKey){ e.preventDefault(); undoMask(); }
+  else if(e.key === 'ArrowRight'){ e.preventDefault(); gotoIdx(idx + 1); }
   else if(e.key === 'ArrowLeft'){ e.preventDefault(); gotoIdx(idx - 1); }
   else if((e.key === 'd' || e.key === 'D') && mode === 'review' && !editing){ e.preventDefault(); deleteMask(true); }
   else if((e.key === 'a' || e.key === 'A') && mode === 'annotate'){ e.preventDefault(); addObject(); }
@@ -318,7 +320,22 @@ function ensureMaskSize(){
     maskCanvas.width = view.naturalWidth; maskCanvas.height = view.naturalHeight;
   }
 }
-function clearMaskCanvas(){ ensureMaskSize(); maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height); }
+function clearMaskCanvas(){ ensureMaskSize(); maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height); resetUndo(); }
+// ── undo history (ctrl-z): snapshot the mask canvas before each mutating move ──
+function resetUndo(){ undoStack = []; }
+function pushUndo(){
+  ensureMaskSize();
+  try { undoStack.push(maskCtx.getImageData(0, 0, maskCanvas.width, maskCanvas.height)); }
+  catch(err){ return; }                                   // e.g. canvas not yet sized
+  if(undoStack.length > 20) undoStack.shift();            // cap memory (full-res snapshots)
+}
+function undoMask(){
+  if(!maskEditable() || !undoStack.length) return;
+  const s = undoStack.pop();
+  ensureMaskSize();
+  if(s.width !== maskCanvas.width || s.height !== maskCanvas.height) return;   // frame changed
+  maskCtx.putImageData(s, 0, 0);
+}
 function showMask(on){ maskCanvas.style.display = on ? 'block' : 'none'; }
 function loadMaskFromUrl(url){
   const im = new Image();
@@ -347,7 +364,7 @@ let down = false, moved = false, sx = 0, sy = 0, spx = 0, spy = 0;
 view.addEventListener('mousedown', (e) => {
   if(e.button !== 0 && e.button !== 1) return;
   if(e.button === 0 && tool !== 'point' && maskEditable()){          // brush / erase
-    gesture = 'paint'; down = true; lastPt = null; ensureMaskSize(); paintAt(e);
+    gesture = 'paint'; down = true; lastPt = null; ensureMaskSize(); pushUndo(); paintAt(e);
   } else {                                                            // middle, or point/pan
     gesture = (e.button === 0 && tool === 'point' && maskEditable()) ? 'point' : 'pan';
     down = true; moved = false; sx = e.clientX; sy = e.clientY; spx = panX; spy = panY;
@@ -382,6 +399,7 @@ async function handleClick(e){
   const resp = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
   const d = await resp.json();
   if(d.error){ document.getElementById('clickStatus').textContent = d.error; return; }
+  pushUndo();                                       // let ctrl-z revert to the pre-SAM mask
   loadMaskFromUrl(d.mask);                          // draw the SAM mask into the editable canvas
   document.getElementById('clickStatus').textContent = `mask ${d.px} px · score ${d.score.toFixed(3)} · ${pos.length}+ / ${neg.length}-`;
 }
