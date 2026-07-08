@@ -75,6 +75,64 @@ def _segment(model, processor, img_rgb, points=None, labels=None, box=None, mult
     return np.asarray(masks), np.asarray(scores)
 
 
+def _segment_concept(model, processor, img_rgb, phrase):
+    """SAM3 CONCEPT (text) segmentation: return every instance matching `phrase`
+    as (masks bool[N,H,W], boxes xyxy-pixel[N,4], scores[N]). Unlike the point+box
+    `_segment`, this segments by learned object identity, so it pulls in thin
+    structure (chair legs/base, table legs) a single interior click drops. Empty
+    arrays if nothing matches. Caller disambiguates instances by box overlap."""
+    import torch
+    from PIL import Image as PILImage
+    H, W = img_rgb.shape[:2]
+    ctx = torch.autocast("cuda", dtype=torch.bfloat16) if torch.cuda.is_available() else _null()
+    with torch.inference_mode(), ctx:
+        state = processor.set_image(PILImage.fromarray(img_rgb))
+        state = processor.set_text_prompt(prompt=phrase, state=state)
+    boxes = state.get("boxes")
+    if boxes is None or len(boxes) == 0:
+        return np.zeros((0, H, W), bool), np.zeros((0, 4)), np.zeros((0,))
+    # cast to float32 first: under autocast these are bfloat16, which numpy can't convert
+    boxes = boxes.detach().float().cpu().numpy()
+    m = state["masks"].detach().float().cpu().numpy()
+    if m.ndim == 4:                      # (N,1,H,W) -> (N,H,W)
+        m = m[:, 0]
+    masks = m > 0
+    scores = (state["scores"].detach().float().cpu().numpy()
+              if state.get("scores") is not None else np.ones(len(boxes)))
+    return masks, boxes, scores
+
+
+def _box_iou(a, b):
+    ix0, iy0 = max(a[0], b[0]), max(a[1], b[1])
+    ix1, iy1 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0, ix1 - ix0) * max(0, iy1 - iy0)
+    ua = (a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter
+    return inter / ua if ua > 0 else 0.0
+
+
+def pick_concept_instance(masks, boxes, scores, geom_box,
+                          iou_thr=0.3, score_thr=0.5, contain_thr=0.7, pad_frac=0.3):
+    """From concept-path detections, return the mask matching `geom_box` (=[x0,y0,x1,y1]
+    from the object's geometry seed), or None to fall back. Three gates, all general:
+      - box IoU with geom_box >= iou_thr           (right instance)
+      - detection score >= score_thr               (confident)
+      - >= contain_thr of the mask lies within geom_box dilated by pad_frac
+        (rejects motion-blur floor-spills and whole-frame blobs, while allowing
+         legs to poke a bit past the lidar-derived box)."""
+    if len(boxes) == 0:
+        return None
+    ious = [_box_iou(boxes[k], geom_box) for k in range(len(boxes))]
+    b = int(np.argmax(ious))
+    if ious[b] < iou_thr or float(scores[b]) < score_thr or not masks[b].any():
+        return None
+    x0, y0, x1, y1 = geom_box
+    pad = pad_frac * max(x1 - x0, y1 - y0)
+    ys, xs = np.where(masks[b])
+    inside = ((xs >= x0 - pad) & (xs <= x1 + pad) &
+              (ys >= y0 - pad) & (ys <= y1 + pad)).mean()
+    return masks[b] if inside >= contain_thr else None
+
+
 # ───────────────────────────── stage: src-mask ──────────────────────────────
 def cmd_src_mask(args):
     cap = Path(args.capture)

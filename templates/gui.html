@@ -454,8 +454,13 @@ function renderObjects(objs){
     const seedProp = (o.ghost || o.source === 'cloud_diff') ? '' : `
       <button onclick="addSeed('${key}')" title="add the current frame as another seed view (spread-out frames → stronger propagation)">+ seed</button>
       <button onclick="propagate('${key}')">propagate</button>`;
+    const remaskUI = o.ghost ? '' : `
+      <div class="row">
+        <input id="lbl_${key}" value="${(o.label || '').replace(/"/g, '&quot;')}" placeholder="label e.g. chair" style="width:108px">
+        <button onclick="remask('${key}')" title="re-segment by concept from the label — pulls in thin legs/base the click-mask drops; keeps the current mask on frames it can't match">label → remask</button>
+      </div>`;
     div.innerHTML = `<h4>${o.ghost ? '👻 ' : ''}${o.id} · ${o.state} ${cd} ${seeds} ${masks}</h4>
-      <div class="meta">${o.label} · ${o.change_type} · ${o.deformability}</div>${seedProp}
+      <div class="meta">${o.change_type} · ${o.deformability}</div>${remaskUI}${seedProp}
       <button onclick="openReview('${key}')" ${o.n_masks ? '' : 'disabled'}>review / edit</button>
       <button onclick="deleteObject('${key}')" class="del" title="remove this object — its seeds/masks are moved to .trash (recoverable on disk)">delete</button>
       <span class="status" id="st_${key}"></span>
@@ -480,6 +485,25 @@ async function propagate(id){
       document.getElementById('res_'+id).innerHTML = `<img src="${j.contact}?t=${Date.now()}">`;
       refreshObjects(); }
     else if(j.status==='error'){ clearInterval(poll); st.textContent = 'error: ' + j.error; }
+  }, 1500);
+}
+
+async function remask(key){
+  const lbl = document.getElementById('lbl_' + key).value.trim();
+  if(!lbl){ alert('type a label first (e.g. chair, table)'); return; }
+  const st = document.getElementById('st_' + key);
+  st.textContent = `remasking as "${lbl}" … concept segmentation, ~1–2 min`;
+  const r = await fetch('/api/remask', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({id: key, label: lbl})});
+  const d = await r.json();
+  if(d.error){ st.textContent = 'error: ' + d.error; return; }
+  const poll = setInterval(async () => {
+    const j = await (await fetch('/api/job/' + d.job_id)).json();
+    if(j.status === 'running'){ st.textContent = j.msg || 'working …'; }
+    else if(j.status === 'done'){ clearInterval(poll);
+      st.textContent = `done · ${j.accepted} improved, ${j.kept} kept · ${j.n_masks} masks`;
+      document.getElementById('res_' + key).innerHTML = `<img src="${j.contact}?t=${Date.now()}">`;
+      refreshObjects(); }
+    else if(j.status === 'error'){ clearInterval(poll); st.textContent = 'error: ' + j.error; }
   }, 1500);
 }
 

@@ -318,6 +318,72 @@ def _cloud_diff_job(job_id, opts):
         JOBS[job_id].update(status="error", error=str(e))
 
 
+# ─────────────────── label -> concept remask (job) ───────────────────
+@app.route("/api/remask", methods=["POST"])
+def api_remask():
+    """Re-segment an object with SAM3's CONCEPT path from its (human-typed) label,
+    to capture thin structure (legs/base) the point+box mask drops. Background job."""
+    d = request.get_json()
+    oid, label = d["id"], (d.get("label") or "").strip()
+    if oid not in OBJECTS:
+        return jsonify(error="unknown object"), 404
+    if not label:
+        return jsonify(error="type a label first (e.g. chair, table)"), 400
+    if not (G.out_dir(CFG["capture"], oid) / "seeds.json").exists():
+        return jsonify(error="no seeds for this object — propagate/detect it first"), 400
+    OBJECTS[oid]["label"] = label
+    _save_working()
+    job_id = uuid.uuid4().hex[:8]
+    JOBS[job_id] = {"status": "running", "obj": oid, "msg": "starting …"}
+    threading.Thread(target=_remask_job, args=(job_id, oid, label), daemon=True).start()
+    return jsonify(job_id=job_id)
+
+
+def _remask_job(job_id, oid, label):
+    try:
+        cap = Path(CFG["capture"])
+        od = G.out_dir(CFG["capture"], oid)
+        seeds = json.load(open(od / "seeds.json"))
+        mi_path = od / "masks_index.json"
+        mi = json.load(open(mi_path)) if mi_path.exists() else {}
+        (od / "masks").mkdir(exist_ok=True)
+        names = list(seeds.keys())
+        tiles, accepted, kept = [], 0, 0
+        for i, name in enumerate(names, 1):
+            s = seeds[name]
+            sid, gb = s.get("session"), s["box"]
+            bgr = cv2.imread(str(cap / "sessions" / sid / "raw_data" / name))
+            img = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            with LOCK:
+                masks, boxes, scores = G._segment_concept(MODEL, PROC, img, label)
+            chosen = G.pick_concept_instance(masks, boxes, scores, gb)
+            flat = name.replace("/", "_")
+            if chosen is not None and chosen.any():          # concept matched -> improve
+                cv2.imwrite(str(od / "masks" / flat), (chosen * 255).astype(np.uint8))
+                mi[name] = {"session": sid, "mask_file": f"masks/{flat}", "px": int(chosen.sum())}
+                m = chosen
+                accepted += 1
+            else:                                            # fallback: keep existing mask
+                kept += 1
+                m = (cv2.imread(str(od / mi[name]["mask_file"]), 0) > 127) if name in mi else None
+            ov = bgr.copy()
+            if m is not None:
+                ov[m] = (0.45 * ov[m] + 0.55 * np.array([0, 0, 255])).astype(np.uint8)
+            tiles.append(cv2.resize(ov, (242, 242)))
+            if i % 20 == 0:
+                JOBS[job_id].update(msg=f"remasking {i}/{len(names)} · {accepted} improved")
+        json.dump(mi, open(mi_path, "w"), indent=1)
+        if tiles:
+            while len(tiles) % 4:
+                tiles.append(np.zeros((242, 242, 3), np.uint8))
+            rows = [np.concatenate(tiles[j:j + 4], 1) for j in range(0, len(tiles), 4)]
+            cv2.imwrite(str(od / "result_contact.png"), np.concatenate(rows, 0))
+        JOBS[job_id].update(status="done", accepted=accepted, kept=kept, n_masks=len(mi),
+                            contact=f"/results/{oid}/result_contact.png")
+    except Exception as e:
+        JOBS[job_id].update(status="error", error=str(e))
+
+
 @app.route("/api/job/<job_id>")
 def api_job(job_id):
     return jsonify(JOBS.get(job_id, {"status": "unknown"}))
