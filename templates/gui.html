@@ -97,6 +97,15 @@
   </div>
   <div class="row"><button onclick="addObject()" title="shortcut: a">add object (a)</button></div>
   <hr>
+  <div class="row">
+    <button onclick="cloudDiff()" id="cdBtn"
+      title="diff the two NavVis clouds, keep changes the Aria glasses looked at, and add them as reviewable objects">🔍 detect changes (cloud diff)</button>
+    &nbsp;min frames <input id="cdMinFrames" type="number" value="5" min="1" style="width:52px"
+      title="lower = more proposals incl. small objects (chair/table); raise to keep only the most-looked-at">
+    <span class="status" id="cdStatus"></span>
+    <div class="hint">per-cluster proposals — give a moved object's pre &amp; post the same id to link them</div>
+  </div>
+  <hr>
   <h2>objects</h2>
   <div id="objects"></div>
   <hr>
@@ -441,10 +450,11 @@ function renderObjects(objs){
     const div = document.createElement('div'); div.className='obj'; div.dataset.oid = key;
     const masks = o.n_masks ? `<span class="pill">${o.n_masks} masks</span>` : '';
     const seeds = o.n_seeds > 1 ? `<span class="pill">${o.n_seeds} seeds</span>` : '';
-    const seedProp = o.ghost ? '' : `
+    const cd = o.source === 'cloud_diff' ? '<span class="pill">cloud-diff</span>' : '';
+    const seedProp = (o.ghost || o.source === 'cloud_diff') ? '' : `
       <button onclick="addSeed('${key}')" title="add the current frame as another seed view (spread-out frames → stronger propagation)">+ seed</button>
       <button onclick="propagate('${key}')">propagate</button>`;
-    div.innerHTML = `<h4>${o.ghost ? '👻 ' : ''}${o.id} · ${o.state} ${seeds} ${masks}</h4>
+    div.innerHTML = `<h4>${o.ghost ? '👻 ' : ''}${o.id} · ${o.state} ${cd} ${seeds} ${masks}</h4>
       <div class="meta">${o.label} · ${o.change_type} · ${o.deformability}</div>${seedProp}
       <button onclick="openReview('${key}')" ${o.n_masks ? '' : 'disabled'}>review / edit</button>
       <button onclick="deleteObject('${key}')" class="del" title="remove this object — its seeds/masks are moved to .trash (recoverable on disk)">delete</button>
@@ -470,6 +480,22 @@ async function propagate(id){
       document.getElementById('res_'+id).innerHTML = `<img src="${j.contact}?t=${Date.now()}">`;
       refreshObjects(); }
     else if(j.status==='error'){ clearInterval(poll); st.textContent = 'error: ' + j.error; }
+  }, 1500);
+}
+
+async function cloudDiff(){
+  const btn = document.getElementById('cdBtn'), st = document.getElementById('cdStatus');
+  if(!confirm('Run cloud-diff change detection?\n\nDiffs the two NavVis point clouds, keeps only changes the Aria glasses actually looked at, and adds each as a reviewable object. Takes a few minutes.')) return;
+  btn.disabled = true; st.textContent = 'starting …';
+  const minFrames = parseInt(document.getElementById('cdMinFrames').value) || 5;
+  const r = await fetch('/api/cloud_diff', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({min_frames: minFrames})});
+  const {job_id} = await r.json();
+  const poll = setInterval(async () => {
+    const j = await (await fetch('/api/job/'+job_id)).json();
+    if(j.status==='running'){ st.textContent = j.msg || 'working …'; }
+    else if(j.status==='done'){ clearInterval(poll); btn.disabled=false;
+      st.textContent = `done · ${j.n_proposals} proposals added`; refreshObjects(); }
+    else if(j.status==='error'){ clearInterval(poll); btn.disabled=false; st.textContent = 'error: ' + j.error; }
   }, 1500);
 }
 

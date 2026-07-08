@@ -36,6 +36,7 @@ import numpy as np
 from flask import Flask, jsonify, request, render_template, send_file, Response
 
 import change_mask as CM
+import cloud_diff_prototype as CD
 import geom_sam_prototype as G
 
 # One interpreter for every stage (defaults to the one running the GUI, i.e. the
@@ -231,6 +232,8 @@ def api_add_seed():
         return jsonify(error="add the object first"), 404
     if OBJECTS[oid].get("ghost"):
         return jsonify(error="ghosts take no seeds -- edit their masks in review mode"), 400
+    if OBJECTS[oid].get("source") == "cloud_diff":
+        return jsonify(error="cloud-diff proposal -- edit its masks in review mode"), 400
     if d.get("state") and d["state"] != OBJECTS[oid]["state"]:
         return jsonify(error=f"seed must be from the {OBJECTS[oid]['state']} state"), 400
     if d.get("mask"):
@@ -260,10 +263,59 @@ def api_propagate():
     if OBJECTS[oid].get("ghost"):
         return jsonify(error="ghost masks are derived -- regenerate with "
                              "point_ghost_prototype.py ghosts"), 400
+    if OBJECTS[oid].get("source") == "cloud_diff":
+        return jsonify(error="cloud-diff proposal already has seeds -- review/edit its masks"), 400
     job_id = uuid.uuid4().hex[:8]
     JOBS[job_id] = {"status": "running", "obj": oid}
     threading.Thread(target=_propagate_job, args=(job_id, oid), daemon=True).start()
     return jsonify(job_id=job_id)
+
+
+# ─────────────────────── cloud-diff proposer (job) ───────────────────────
+@app.route("/api/cloud_diff", methods=["POST"])
+def api_cloud_diff():
+    """Kick off the cloud-diff change proposer: diff the two states' NavVis clouds,
+    gate candidates by Aria visibility, and drop each survivor in as a reviewable
+    object (per-cluster; link moved pairs by giving them a shared id). Background
+    job — poll /api/job/<id>."""
+    d = request.get_json() or {}
+    job_id = uuid.uuid4().hex[:8]
+    JOBS[job_id] = {"status": "running", "msg": "starting …"}
+    threading.Thread(target=_cloud_diff_job, args=(job_id, d), daemon=True).start()
+    return jsonify(job_id=job_id)
+
+
+def _cloud_diff_job(job_id, opts):
+    try:
+        cap = CFG["capture"]
+        states = CFG["states"]                       # {'pre':{session,ref}, 'post':{...}}
+        pre_ref, post_ref = states["pre"]["ref"], states["post"]["ref"]
+        bridge = (Path(cap) / "changes" / f"{post_ref}_to_{pre_ref}"
+                  / f"T_{pre_ref}_from_{post_ref}.txt")
+        if not bridge.exists():
+            raise FileNotFoundError(f"bridge not found: {bridge}")
+        cb = lambda s: JOBS[job_id].update(msg=s)
+        proposals = CD.propose(
+            cap, states, str(bridge),
+            tau=float(opts.get("tau", 0.10)),
+            min_cluster=int(opts.get("min_cluster", 500)),
+            # min_frames counts visibility on a ~150-frame SUBSAMPLE, so keep it
+            # low (~5) or small objects (chair/coffee table, seen in tens of
+            # frames) get excluded. Ranking surfaces the most-looked-at first;
+            # the UI field lets the annotator raise it to trim the list.
+            min_frames=int(opts.get("min_frames", 5)),
+            progress=cb, verbose=True)
+        # register each survivor, then fill its per-frame SAM masks (shared model)
+        for i, (key, session, entry, n_frames) in enumerate(proposals, 1):
+            OBJECTS[key] = entry
+            JOBS[job_id].update(msg=f"segmenting proposal {i}/{len(proposals)}: "
+                                    f"{key} ({n_frames} frames) …")
+            _perframe_inproc(key, session)
+        _save_working()
+        JOBS[job_id].update(status="done", n_proposals=len(proposals),
+                            keys=[k for k, *_ in proposals])
+    except Exception as e:
+        JOBS[job_id].update(status="error", error=str(e))
 
 
 @app.route("/api/job/<job_id>")

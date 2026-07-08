@@ -152,7 +152,7 @@ def _scaled_camera(cam, s):
 
 
 def _seeds_for_session(pts3d, sess, renderer, capo, sid, n, min_vis, dbg_root,
-                       skip_name=None, occ_tol=0.10, occ_scale=0.35):
+                       skip_name=None, occ_tol=0.10, occ_scale=0.35, write_dbg=True):
     """Reproject `pts3d` (already expressed in `sess`'s world frame) into cam0
     frames of `sess`, occlusion-tested against `renderer` (which must hold
     `sess`'s OWN state mesh). Returns {image_name: seed} and writes debug
@@ -180,7 +180,8 @@ def _seeds_for_session(pts3d, sess, renderer, capo, sid, n, min_vis, dbg_root,
         targets = keys  # thorough: every frame
 
     dbg = dbg_root / sid
-    dbg.mkdir(parents=True, exist_ok=True)
+    if write_dbg:
+        dbg.mkdir(parents=True, exist_ok=True)
     occ_cams = {}  # cam_t -> (downscaled camera, sx, sy), built once per sensor
     seeds = {}
     for j, (ts_t, cam_t) in enumerate(targets):
@@ -211,11 +212,12 @@ def _seeds_for_session(pts3d, sess, renderer, capo, sid, n, min_vis, dbg_root,
                        "points": [[float(cen[0]), float(cen[1])]], "labels": [1],
                        "box": [float(x0), float(y0), float(x1), float(y1)],
                        "n_visible": int(len(pv))}
-        im = cv2.imread(str(capo.data_path(sid) / name))
-        if im is not None:
-            cv2.rectangle(im, (int(x0), int(y0)), (int(x1), int(y1)), (0, 255, 0), 2)
-            cv2.circle(im, (int(cen[0]), int(cen[1])), 5, (0, 0, 255), -1)
-            cv2.imwrite(str(dbg / Path(name).name), im)
+        if write_dbg:
+            im = cv2.imread(str(capo.data_path(sid) / name))
+            if im is not None:
+                cv2.rectangle(im, (int(x0), int(y0)), (int(x1), int(y1)), (0, 255, 0), 2)
+                cv2.circle(im, (int(cen[0]), int(cen[1])), 5, (0, 0, 255), -1)
+                cv2.imwrite(str(dbg / Path(name).name), im)
     return seeds
 
 
