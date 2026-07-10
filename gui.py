@@ -699,6 +699,10 @@ def main():
     ap.add_argument("--min-vis", type=int, default=10)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=5000)
+    ap.add_argument("--workspace", default=None,
+                    help="workspace dir relative to the capture (e.g. "
+                         "changes/geom_sam_out_p00). Default: GEOM_OUT env if "
+                         "set, else derived from the pair session names.")
     args = ap.parse_args()
 
     CFG.update(capture=args.capture, tier=args.tier,
@@ -706,6 +710,11 @@ def main():
                states={"pre": {"session": args.pre_session, "ref": args.pre_ref},
                        "post": {"session": args.post_session, "ref": args.post_ref}},
                seed={"n": args.n, "min_vis": args.min_vis})
+
+    ws = args.workspace or G.workspace_for(args.capture, args.pre_session,
+                                           args.post_session)
+    G.set_out(ws)                                                 # per-pair workspace (see geom_sam_prototype)
+    print(f"workspace: {ws}  (pair {args.pre_session} -> {args.post_session})", flush=True)
 
     gobj = G.out_dir(args.capture) / "gui_objects.json"           # workspace-scoped (GEOM_OUT)
     legacy = Path(args.capture) / "changes" / "gui_objects.json"

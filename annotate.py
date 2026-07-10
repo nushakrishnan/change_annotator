@@ -73,6 +73,10 @@ def main():
     ap.add_argument("--config", required=True)
     ap.add_argument("--skip-existing", action="store_true",
                     help="skip a stage whose output already exists (resume / re-assemble)")
+    ap.add_argument("--workspace", default=None,
+                    help="workspace dir relative to the capture. Default: the "
+                         "config's 'workspace' field, else GEOM_OUT env, else "
+                         "changes/geom_sam_out.")
     args = ap.parse_args()
 
     cfg = json.load(open(args.config))
@@ -80,7 +84,10 @@ def main():
     states = {"pre": cfg["pre"], "post": cfg["post"]}
     n = cfg.get("seeds", {}).get("n", 60)
     min_vis = cfg.get("seeds", {}).get("min_vis", 10)
-    geom_out = Path(cap) / "changes" / "geom_sam_out"
+    ws = (args.workspace or cfg.get("workspace")
+          or os.environ.get("GEOM_OUT", "changes/geom_sam_out"))
+    os.environ["GEOM_OUT"] = ws          # the geom stages resolve OUT from this
+    geom_out = Path(cap) / ws
 
     objects_out = {}
     for obj in cfg["objects"]:

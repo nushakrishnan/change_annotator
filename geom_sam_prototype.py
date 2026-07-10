@@ -26,10 +26,61 @@ from pathlib import Path
 import numpy as np
 import cv2
 
-# Output workspace root (under the capture). Override with GEOM_OUT to run an
-# isolated workspace (e.g. GEOM_OUT=changes/geom_sam_out_test) without touching
-# existing masks. Inherited by the seeds subprocess via the environment.
-OUT = os.environ.get("GEOM_OUT", "changes/geom_sam_out")
+# Output workspace root (under the capture). Each annotated *session pair* gets
+# its own workspace so e.g. the 1->2 and 2->3 pairs never overwrite each other's
+# pre/post masks. The name is derived from the pair (changes/geom_sam_out_1_2);
+# resolve it with workspace_for() and install it with set_out().
+#   - GEOM_OUT env always wins (per-person isolation, tests, one-off runs).
+#   - a legacy unsuffixed changes/geom_sam_out is kept in place for whichever
+#     pair's masks already live there (back-compat, no rename).
+DEFAULT_OUT = "changes/geom_sam_out"
+OUT = os.environ.get("GEOM_OUT", DEFAULT_OUT)
+
+
+def _pair_tag(pre_session, post_session):
+    """Short '<a>_<b>' tag from the differing token(s) of two session names,
+    e.g. dlab_open_space_1_rgb / dlab_open_space_2_rgb -> '1_2'."""
+    a, b = pre_session.split("_"), post_session.split("_")
+    da = "".join([x for x, y in zip(a, b) if x != y] + a[len(b):])
+    db = "".join([y for x, y in zip(a, b) if x != y] + b[len(a):])
+    return f"{da}_{db}" if (da or db) else ""
+
+
+def _sessions_in(root):
+    """Sessions recorded across a workspace's per-object masks_index.json files."""
+    s = set()
+    for mi in Path(root).glob("*/masks_index.json"):
+        try:
+            s.update(m["session"] for m in json.load(open(mi)).values() if m.get("session"))
+        except Exception:
+            pass
+    return s
+
+
+def workspace_for(capture, pre_session, post_session):
+    """Per-pair workspace root, relative to the capture. GEOM_OUT overrides all.
+    Otherwise changes/geom_sam_out_<tag>, except a legacy unsuffixed workspace is
+    reused in place when it already holds this pair's masks."""
+    if "GEOM_OUT" in os.environ:
+        return os.environ["GEOM_OUT"]
+    tag = _pair_tag(pre_session, post_session)
+    if not tag:
+        return DEFAULT_OUT
+    suffixed = f"{DEFAULT_OUT}_{tag}"
+    cap = Path(capture)
+    if (cap / suffixed).exists():
+        return suffixed
+    legacy = cap / DEFAULT_OUT
+    if legacy.exists() and (_sessions_in(legacy) & {pre_session, post_session}):
+        return DEFAULT_OUT                       # this pair's data already lives here
+    return suffixed
+
+
+def set_out(out):
+    """Install the resolved workspace so out_dir() and the seeds subprocess use it."""
+    global OUT
+    OUT = out
+    os.environ["GEOM_OUT"] = out                 # inherited by the seeds subprocess
 
 
 def out_dir(capture, obj=None):
