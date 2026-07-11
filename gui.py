@@ -36,6 +36,7 @@ import numpy as np
 from flask import Flask, jsonify, request, render_template, send_file, Response
 
 import change_mask as CM
+import cloud_diff_prototype as CD
 import geom_sam_prototype as G
 
 # One interpreter for every stage (defaults to the one running the GUI, i.e. the
@@ -231,6 +232,8 @@ def api_add_seed():
         return jsonify(error="add the object first"), 404
     if OBJECTS[oid].get("ghost"):
         return jsonify(error="ghosts take no seeds -- edit their masks in review mode"), 400
+    if OBJECTS[oid].get("source") == "cloud_diff":
+        return jsonify(error="cloud-diff proposal -- edit its masks in review mode"), 400
     if d.get("state") and d["state"] != OBJECTS[oid]["state"]:
         return jsonify(error=f"seed must be from the {OBJECTS[oid]['state']} state"), 400
     if d.get("mask"):
@@ -260,10 +263,129 @@ def api_propagate():
     if OBJECTS[oid].get("ghost"):
         return jsonify(error="ghost masks are derived -- regenerate with "
                              "point_ghost_prototype.py ghosts"), 400
+    if OBJECTS[oid].get("source") == "cloud_diff":
+        return jsonify(error="cloud-diff proposal already has seeds -- review/edit its masks"), 400
     job_id = uuid.uuid4().hex[:8]
     JOBS[job_id] = {"status": "running", "obj": oid}
     threading.Thread(target=_propagate_job, args=(job_id, oid), daemon=True).start()
     return jsonify(job_id=job_id)
+
+
+# ─────────────────────── cloud-diff proposer (job) ───────────────────────
+@app.route("/api/cloud_diff", methods=["POST"])
+def api_cloud_diff():
+    """Kick off the cloud-diff change proposer: diff the two states' NavVis clouds,
+    gate candidates by Aria visibility, and drop each survivor in as a reviewable
+    object (per-cluster; link moved pairs by giving them a shared id). Background
+    job — poll /api/job/<id>."""
+    d = request.get_json() or {}
+    job_id = uuid.uuid4().hex[:8]
+    JOBS[job_id] = {"status": "running", "msg": "starting …"}
+    threading.Thread(target=_cloud_diff_job, args=(job_id, d), daemon=True).start()
+    return jsonify(job_id=job_id)
+
+
+def _cloud_diff_job(job_id, opts):
+    try:
+        cap = CFG["capture"]
+        states = CFG["states"]                       # {'pre':{session,ref}, 'post':{...}}
+        pre_ref, post_ref = states["pre"]["ref"], states["post"]["ref"]
+        bridge = (Path(cap) / "changes" / f"{post_ref}_to_{pre_ref}"
+                  / f"T_{pre_ref}_from_{post_ref}.txt")
+        if not bridge.exists():
+            raise FileNotFoundError(f"bridge not found: {bridge}")
+        cb = lambda s: JOBS[job_id].update(msg=s)
+        mc = int(opts.get("min_cluster", 500))
+        proposals = CD.propose(
+            cap, states, str(bridge),
+            tau=float(opts.get("tau", 0.10)),
+            voxel=float(opts.get("voxel", 0.02)),
+            eps=float(opts.get("eps", 0.10)),
+            min_cluster=mc,
+            # DBSCAN core density scales with cluster size so small objects (few
+            # points) still form a cluster instead of being read as noise.
+            min_points=max(4, min(10, mc // 10)),
+            # min_frames counts visibility on a ~150-frame SUBSAMPLE, so keep it
+            # low (~5) or small objects (seen in tens of frames) get excluded.
+            min_frames=int(opts.get("min_frames", 5)),
+            progress=cb, verbose=True)
+        # register each survivor, then fill its per-frame SAM masks (shared model)
+        for i, (key, session, entry, n_frames) in enumerate(proposals, 1):
+            OBJECTS[key] = entry
+            JOBS[job_id].update(msg=f"segmenting proposal {i}/{len(proposals)}: "
+                                    f"{key} ({n_frames} frames) …")
+            _perframe_inproc(key, session)
+        _save_working()
+        JOBS[job_id].update(status="done", n_proposals=len(proposals),
+                            keys=[k for k, *_ in proposals])
+    except Exception as e:
+        JOBS[job_id].update(status="error", error=str(e))
+
+
+# ─────────────────── label -> concept remask (job) ───────────────────
+@app.route("/api/remask", methods=["POST"])
+def api_remask():
+    """Re-segment an object with SAM3's CONCEPT path from its (human-typed) label,
+    to capture thin structure (legs/base) the point+box mask drops. Background job."""
+    d = request.get_json()
+    oid, label = d["id"], (d.get("label") or "").strip()
+    if oid not in OBJECTS:
+        return jsonify(error="unknown object"), 404
+    if not label:
+        return jsonify(error="type a label first (e.g. chair, table)"), 400
+    if not (G.out_dir(CFG["capture"], oid) / "seeds.json").exists():
+        return jsonify(error="no seeds for this object — propagate/detect it first"), 400
+    OBJECTS[oid]["label"] = label
+    _save_working()
+    job_id = uuid.uuid4().hex[:8]
+    JOBS[job_id] = {"status": "running", "obj": oid, "msg": "starting …"}
+    threading.Thread(target=_remask_job, args=(job_id, oid, label), daemon=True).start()
+    return jsonify(job_id=job_id)
+
+
+def _remask_job(job_id, oid, label):
+    try:
+        cap = Path(CFG["capture"])
+        od = G.out_dir(CFG["capture"], oid)
+        seeds = json.load(open(od / "seeds.json"))
+        mi_path = od / "masks_index.json"
+        mi = json.load(open(mi_path)) if mi_path.exists() else {}
+        (od / "masks").mkdir(exist_ok=True)
+        names = list(seeds.keys())
+        tiles, accepted, kept = [], 0, 0
+        for i, name in enumerate(names, 1):
+            s = seeds[name]
+            sid, gb = s.get("session"), s["box"]
+            bgr = cv2.imread(str(cap / "sessions" / sid / "raw_data" / name))
+            img = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            with LOCK:
+                masks, boxes, scores = G._segment_concept(MODEL, PROC, img, label)
+            chosen = G.pick_concept_instance(masks, boxes, scores, gb)
+            flat = name.replace("/", "_")
+            if chosen is not None and chosen.any():          # concept matched -> improve
+                cv2.imwrite(str(od / "masks" / flat), (chosen * 255).astype(np.uint8))
+                mi[name] = {"session": sid, "mask_file": f"masks/{flat}", "px": int(chosen.sum())}
+                m = chosen
+                accepted += 1
+            else:                                            # fallback: keep existing mask
+                kept += 1
+                m = (cv2.imread(str(od / mi[name]["mask_file"]), 0) > 127) if name in mi else None
+            ov = bgr.copy()
+            if m is not None:
+                ov[m] = (0.45 * ov[m] + 0.55 * np.array([0, 0, 255])).astype(np.uint8)
+            tiles.append(cv2.resize(ov, (242, 242)))
+            if i % 20 == 0:
+                JOBS[job_id].update(msg=f"remasking {i}/{len(names)} · {accepted} improved")
+        json.dump(mi, open(mi_path, "w"), indent=1)
+        if tiles:
+            while len(tiles) % 4:
+                tiles.append(np.zeros((242, 242, 3), np.uint8))
+            rows = [np.concatenate(tiles[j:j + 4], 1) for j in range(0, len(tiles), 4)]
+            cv2.imwrite(str(od / "result_contact.png"), np.concatenate(rows, 0))
+        JOBS[job_id].update(status="done", accepted=accepted, kept=kept, n_masks=len(mi),
+                            contact=f"/results/{oid}/result_contact.png")
+    except Exception as e:
+        JOBS[job_id].update(status="error", error=str(e))
 
 
 @app.route("/api/job/<job_id>")
@@ -340,7 +462,7 @@ def api_objects():
     """All objects + how many propagated frames each has (drives the sidebar list)."""
     states_by_id = {}
     for o in OBJECTS.values():
-        states_by_id.setdefault(o["id"], set()).add(o["state"])
+        states_by_id.setdefault(o.get("instance", o["id"]), set()).add(o["state"])
     out = {}
     for key, o in OBJECTS.items():
         mi = G.out_dir(CFG["capture"], key) / "masks_index.json"
@@ -355,7 +477,7 @@ def api_objects():
             n_seeds = len(json.load(open(idxp))) if idxp.exists() else 1
         except Exception:
             n_seeds = 1
-        sts = states_by_id[o["id"]]            # change type reflects the id across both states
+        sts = states_by_id[o.get("instance", o["id"])]   # change type reflects the shared instance id
         in_pre, in_post = "pre" in sts, "post" in sts
         out[key] = {**o, "n_masks": n, "n_seeds": n_seeds, "in_pre": in_pre, "in_post": in_post,
                     "change_type": "ghost" if o.get("ghost") else _change_type(in_pre, in_post)}
@@ -526,6 +648,26 @@ def api_delete_object():
     return jsonify(ok=True)
 
 
+@app.route("/api/set_meta", methods=["POST"])
+def api_set_meta():
+    """Edit an object's id/label/deformability. The 'instance' id is what links a
+    moved object: give a moved pair's pre & post the SAME instance id and they export
+    as one 'moved' object. The on-disk dir/key is NEVER renamed (only this editable
+    instance id changes), so mask paths stay valid."""
+    d = request.get_json()
+    key = d["id"]
+    if key not in OBJECTS:
+        return jsonify(error="unknown object"), 404
+    if "instance" in d:
+        OBJECTS[key]["instance"] = (d.get("instance") or "").strip() or OBJECTS[key]["id"]
+    if "label" in d:
+        OBJECTS[key]["label"] = (d.get("label") or "").strip()
+    if d.get("deformability") in ("rigid", "deformable"):
+        OBJECTS[key]["deformability"] = d["deformability"]
+    _save_working()
+    return jsonify(ok=True, instance=OBJECTS[key].get("instance"))
+
+
 # ───────────────────────────── export ─────────────────────────────
 @app.route("/api/export", methods=["POST"])
 def api_export():
@@ -539,9 +681,11 @@ def api_export():
         mi_path = G.out_dir(CFG["capture"], key) / "masks_index.json"
         state_masks = ({name: m["mask_file"] for name, m in json.load(open(mi_path)).items()}
                        if mi_path.exists() else {})
-        e = by_id.setdefault(o["id"], {"label": o["label"],
-                                       "deformability": o["deformability"], "masks": {}})
-        e["label"], e["deformability"] = o["label"], o["deformability"]
+        iid = o.get("instance", o["id"])       # moved pair = shared instance id
+        e = by_id.setdefault(iid, {"label": o["label"],
+                                   "deformability": o["deformability"], "masks": {}})
+        e["label"] = o.get("label") or e["label"]          # keep a non-empty label
+        e["deformability"] = o.get("deformability", e["deformability"])
         if state_masks:
             e["masks"][o["state"]] = state_masks
     objects_out = {}
@@ -598,6 +742,7 @@ def main():
             for k, o in json.load(open(gobj)).items():
                 o.pop("change_type", None)        # derived now, not stored (spec §4a)
                 o.setdefault("id", k.split("__")[0])  # migrate old bare-id keys
+                o.setdefault("instance", o["id"])     # editable link id (shared => moved)
                 OBJECTS[f"{o['id']}__{o['state']}"] = o  # key by '<id>__<state>'
             print(f"loaded {len(OBJECTS)} object source(s) from {gobj.name}", flush=True)
         except Exception as e:
