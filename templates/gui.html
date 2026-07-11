@@ -123,6 +123,8 @@
       title="DBSCAN cluster radius (m). SMALLER keeps nearby objects from merging into one cluster.">
     min-frames <input id="cdMinFrames" type="number" value="5" min="1" style="width:46px"
       title="keep only candidates the Aria glasses saw in at least this many frames (of a ~150-frame sample). LOWER surfaces small/briefly-seen objects; RAISE to keep only the most-looked-at.">
+    &nbsp;<label title="Remove the floor plane before clustering so objects float free — kills bogus floor-patch proposals and tightens boxes. Turn off for objects lying flat on the ground."><input type="checkbox" id="cdRemoveFloor" checked> remove floor</label>
+    &nbsp;<label title="Strict depth-based occlusion: only log a change where Aria had clear line of sight. Drops changes hidden behind walls/geometry that the glasses never actually saw."><input type="checkbox" id="cdStrictOcc" checked> strict occlusion</label>
   </div>
   <div class="hint">
     presets — <b>330 ml can</b>: voxel 0.01, min-cluster 40 · <b>bag/box</b>: 0.015, 150 · <b>furniture</b>: 0.02, 500.
@@ -313,7 +315,23 @@ document.addEventListener('keydown', (e) => {
   else if((e.key === 'd' || e.key === 'D') && mode === 'review' && !editing){ e.preventDefault(); deleteMask(true); }
   else if((e.key === 'a' || e.key === 'A') && mode === 'annotate'){ e.preventDefault(); addObject(); }
   else if((e.key === 'x' || e.key === 'X') && mode === 'review' && !editing){ e.preventDefault(); startEdit(); }
+  else if((e.key === 'q' || e.key === 'Q') && !e.repeat){ e.preventDefault(); peek(true); }   // hold q = peek original
 });
+document.addEventListener('keyup', (e) => { if(e.key === 'q' || e.key === 'Q') peek(false); });
+
+// hold-to-peek: transiently hide the mask so you see the original image underneath
+let peeking = false, peekSrc = null;
+function peek(on){
+  if(on === peeking) return;
+  peeking = on;
+  if(mode === 'review' && !editing){          // browse mode: mask is baked into /api/overlay
+    if(on){ peekSrc = view.src; view.src = '/frame?state=' + reviewState +
+              '&name=' + encodeURIComponent(frames[idx].name); }
+    else if(peekSrc){ view.src = peekSrc; peekSrc = null; }
+  } else {                                     // annotate/edit: mask is on the canvas
+    maskCanvas.style.visibility = on ? 'hidden' : 'visible';
+  }
+}
 
 document.getElementById('maskmap').addEventListener('click', (e) => {
   if(mode !== 'review' || !frames.length) return;
@@ -571,6 +589,8 @@ async function cloudDiff(){
     min_cluster: parseInt(document.getElementById('cdMinCluster').value)   || 500,
     eps:         parseFloat(document.getElementById('cdEps').value)        || 0.10,
     min_frames:  parseInt(document.getElementById('cdMinFrames').value)    || 5,
+    remove_floor: document.getElementById('cdRemoveFloor').checked,
+    strict_occ: document.getElementById('cdStrictOcc').checked,
   };
   const r = await fetch('/api/cloud_diff', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
   const {job_id} = await r.json();

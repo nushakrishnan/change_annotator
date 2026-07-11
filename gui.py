@@ -301,6 +301,13 @@ def _cloud_diff_job(job_id, opts):
             tau=float(opts.get("tau", 0.10)),
             voxel=float(opts.get("voxel", 0.02)),
             eps=float(opts.get("eps", 0.10)),
+            remove_floor=bool(opts.get("remove_floor", True)),
+            # strict depth-based occlusion: crisper depth, tighter tolerance, and a
+            # min visible-fraction so changes hidden behind geometry (a wall) aren't
+            # logged. Off => the old lenient test.
+            occ_scale=0.5 if opts.get("strict_occ", True) else 0.35,
+            occ_tol=0.05 if opts.get("strict_occ", True) else 0.10,
+            min_frac=0.3 if opts.get("strict_occ", True) else 0.0,
             min_cluster=mc,
             # DBSCAN core density scales with cluster size so small objects (few
             # points) still form a cluster instead of being read as noise.

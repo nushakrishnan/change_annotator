@@ -210,7 +210,8 @@ def _scaled_camera(cam, s):
 
 
 def _seeds_for_session(pts3d, sess, renderer, capo, sid, n, min_vis, dbg_root,
-                       skip_name=None, occ_tol=0.10, occ_scale=0.35, write_dbg=True):
+                       skip_name=None, occ_tol=0.10, occ_scale=0.35, min_frac=0.0,
+                       write_dbg=True):
     """Reproject `pts3d` (already expressed in `sess`'s world frame) into cam0
     frames of `sess`, occlusion-tested against `renderer` (which must hold
     `sess`'s OWN state mesh). Returns {image_name: seed} and writes debug
@@ -261,7 +262,11 @@ def _seeds_for_session(pts3d, sess, renderer, capo, sid, n, min_vis, dbg_root,
         occ_z, occ_valid = sample_depth(p2d_t[vis] * np.array([sx, sy]), mesh_depth)
         visible = occ_valid & (z_t[vis] <= occ_z + occ_tol)
         pv = p2d_t[vis][visible]
-        if len(pv) < min_vis:
+        # strict occlusion: keep the frame only if a MIN COUNT and a MIN FRACTION of
+        # the object's in-frustum points are unoccluded. The fraction rejects frames
+        # where the object is mostly hidden (e.g. behind a wall) but a few points leak
+        # past the mesh -- the "change behind a wall" case that must not be logged.
+        if len(pv) < min_vis or (min_frac > 0 and len(pv) < min_frac * int(vis.sum())):
             continue
         cen = pv.mean(0)
         x0, y0 = pv.min(0)

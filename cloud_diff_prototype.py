@@ -87,14 +87,51 @@ def _signature(pts):
 
 
 # ───────────────────────────── detect ─────────────────────────────
+def _floor_plane(P, tol, verbose, tag):
+    """RANSAC the dominant near-horizontal floor plane (clouds are gravity-aligned).
+    Returns the normalized plane [a,b,c,d] (a x+b y+c z+d=0) or None if none is
+    horizontal. Used to DROP floor points from the changed set (see detect) -- NOT
+    to pre-filter the clouds, which would break the nearest-neighbour diff."""
+    import open3d as o3d
+    if len(P) < 500:
+        return None
+    rem = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(P))
+    for _ in range(4):
+        pl, inl = rem.segment_plane(tol, 3, 300)
+        n = np.asarray(pl[:3], float); nn = np.linalg.norm(n) + 1e-12
+        if abs(n[2] / nn) >= 0.9:                             # horizontal => floor
+            if verbose:
+                print(f"    [{tag}] floor plane z≈{-pl[3] / n[2]:.2f} m")
+            return np.asarray(pl, float) / nn
+        rem = rem.select_by_index(inl, invert=True)           # skip a wall, refit
+        if len(rem.points) < 500:
+            break
+    if verbose:
+        print(f"    [{tag}] no horizontal floor plane found")
+    return None
+
+
+def _drop_floor(pts, plane, tol):
+    """Drop points within `tol` of the floor plane (objects float free of the ground;
+    legs above the plane survive). No-op if plane is None."""
+    if plane is None or len(pts) == 0:
+        return pts
+    return pts[np.abs(pts @ plane[:3] + plane[3]) > tol]
+
+
 def detect(capture, pre_ref, post_ref, bridge_path, *, tau=0.10, voxel=0.02,
-           eps=0.10, min_points=10, min_cluster=500, overlap_margin=0.0, verbose=True):
+           eps=0.10, min_points=10, min_cluster=500, overlap_margin=0.0,
+           remove_floor=True, floor_tol=0.04, verbose=True):
     """Two-way cloud diff -> {'old_clusters','new_clusters'} (each cluster's points
     in its NATIVE state's world frame: old in pre/ref, new in post/ref)."""
     from scipy.spatial import cKDTree
 
     P1 = _load_cloud(capture, pre_ref, voxel, verbose)        # pre (ref) frame
     P2 = _load_cloud(capture, post_ref, voxel, verbose)       # post (ref) frame
+    # fit (do NOT remove) each state's floor plane; we drop floor from the CHANGED
+    # set after the diff -- removing it before would orphan the ground and blow up NN.
+    plane1 = _floor_plane(P1, floor_tol, verbose, pre_ref) if remove_floor else None
+    plane2 = _floor_plane(P2, floor_tol, verbose, post_ref) if remove_floor else None
     T = G._load_T(bridge_path)                                # T_pre_from_post
     P2in1 = G._apply_T(T, P2)                                 # post cloud in pre frame
 
@@ -108,6 +145,13 @@ def detect(capture, pre_ref, post_ref, bridge_path, *, tau=0.10, voxel=0.02,
     d_new = cKDTree(P1o).query(P2o, workers=-1)[0]
     old = P1o[d_old > tau]                                    # old location, pre frame
     new = G._apply_T(T.inverse(), P2o[d_new > tau])           # new location -> post frame
+    if remove_floor:                                          # float objects free of the ground
+        n0o, n0n = len(old), len(new)
+        old = _drop_floor(old, plane1, floor_tol)             # old in pre frame  -> plane1
+        new = _drop_floor(new, plane2, floor_tol)             # new in post frame -> plane2
+        if verbose:
+            print(f"  floor dropped from changed set: old {n0o:,}->{len(old):,}  "
+                  f"new {n0n:,}->{len(new):,}")
     if verbose:
         print(f"  changed points  old(pre)={len(old):,}  new(post)={len(new):,} (tau={tau} m)")
     return {"old_clusters": _cluster(old, eps, min_points, min_cluster, verbose, "old/pre"),
@@ -145,21 +189,24 @@ def _ctx_for_states(capture, states, cands):
     return ctx
 
 
-def _seed(cands, states, ctx, n, min_vis, occ_scale, dbg_root):
+def _seed(cands, states, ctx, n, min_vis, occ_scale, dbg_root, occ_tol=0.10, min_frac=0.0):
     """For each candidate, reproject its cluster into its native state's Aria
     frames (n=0 = all, N>0 subsample). Sets c['seeds'] (per-frame point+box) and
-    c['n_frames'] (the Aria-attention score)."""
+    c['n_frames'] (the Aria-attention score). occ_tol/min_frac tighten the
+    depth-based occlusion test so changes hidden behind geometry aren't logged."""
     for c in cands:
         capo, sess, renderer = ctx[c["state"]]
         seeds = G._seeds_for_session(c["pts"], sess, renderer, capo,
                                      states[c["state"]]["session"], n, min_vis,
-                                     dbg_root, occ_scale=occ_scale, write_dbg=False)
+                                     dbg_root, occ_tol=occ_tol, occ_scale=occ_scale,
+                                     min_frac=min_frac, write_dbg=False)
         c["seeds"], c["n_frames"] = seeds, len(seeds)
 
 
 # ───────────────────────────── propose ─────────────────────────────
 def propose(capture, states, bridge_path, *, tau=0.10, voxel=0.02, eps=0.10,
-            min_points=10, min_cluster=500, gate_n=150, min_vis=5, occ_scale=0.35,
+            min_points=10, min_cluster=500, remove_floor=True, floor_tol=0.04,
+            gate_n=150, min_vis=5, occ_scale=0.5, occ_tol=0.05, min_frac=0.3,
             min_frames=3, prefix="cd", progress=None, verbose=True):
     """Full proposer up to (not including) SAM: diff -> per-cluster candidates ->
     Aria-attention gate (cheap subsample) -> full-frame seeds on survivors ->
@@ -172,18 +219,21 @@ def propose(capture, states, bridge_path, *, tau=0.10, voxel=0.02, eps=0.10,
     say("differencing point clouds …")
     res = detect(capture, states["pre"]["ref"], states["post"]["ref"], bridge_path,
                  tau=tau, voxel=voxel, eps=eps, min_points=min_points,
-                 min_cluster=min_cluster, verbose=verbose)
+                 min_cluster=min_cluster, remove_floor=remove_floor,
+                 floor_tol=floor_tol, verbose=verbose)
     cands = _candidates_from_diff(res, prefix)
     say(f"{len(cands)} raw candidates; building geometry contexts …")
     ctx = _ctx_for_states(capture, states, cands)
 
     say(f"gating {len(cands)} candidates by Aria visibility (~{gate_n} frames) …")
-    _seed(cands, states, ctx, gate_n, min_vis, occ_scale, dbg_root)
+    _seed(cands, states, ctx, gate_n, min_vis, occ_scale, dbg_root,
+          occ_tol=occ_tol, min_frac=min_frac)
     survivors = sorted((c for c in cands if c["n_frames"] >= min_frames),
                        key=lambda c: -c["n_frames"])
     say(f"{len(survivors)}/{len(cands)} candidates seen by Aria "
         f"(>= {min_frames} frames); seeding all frames on survivors …")
-    _seed(survivors, states, ctx, 0, min_vis, occ_scale, dbg_root)
+    _seed(survivors, states, ctx, 0, min_vis, occ_scale, dbg_root,
+          occ_tol=occ_tol, min_frac=min_frac)
 
     out = []
     for c in survivors:
@@ -215,7 +265,7 @@ def cmd_diff(a):
     res = detect(a.capture, a.pre_ref, a.post_ref,
                  _bridge(a.capture, a.pre_ref, a.post_ref, a.bridge),
                  tau=a.tau, voxel=a.voxel, eps=a.eps, min_points=a.min_points,
-                 min_cluster=a.min_cluster)
+                 min_cluster=a.min_cluster, remove_floor=not a.keep_floor, floor_tol=a.floor_tol)
     cands = _candidates_from_diff(res, a.prefix)
     root = Path(a.capture) / "changes" / "cloud_diff"
     root.mkdir(parents=True, exist_ok=True)
@@ -232,11 +282,12 @@ def cmd_attention(a):
     res = detect(a.capture, a.pre_ref, a.post_ref,
                  _bridge(a.capture, a.pre_ref, a.post_ref, a.bridge),
                  tau=a.tau, voxel=a.voxel, eps=a.eps, min_points=a.min_points,
-                 min_cluster=a.min_cluster)
+                 min_cluster=a.min_cluster, remove_floor=not a.keep_floor, floor_tol=a.floor_tol)
     cands = _candidates_from_diff(res, a.prefix)
     ctx = _ctx_for_states(a.capture, _states(a), cands)
     _seed(cands, _states(a), ctx, a.n, a.min_vis, a.occ_scale,
-          Path(a.capture) / "changes" / "cloud_diff" / "seed_dbg")
+          Path(a.capture) / "changes" / "cloud_diff" / "seed_dbg",
+          occ_tol=a.occ_tol, min_frac=a.min_frac)
     print(f"\n  Aria attention (visible frames{'' if a.n == 0 else f', ~{a.n} sampled'}):")
     for c in sorted(cands, key=lambda c: -c["n_frames"]):
         print(f"    {c['id']:12s} [{c['change_type']:7s}] {c['n_frames']:4d}f  "
@@ -281,15 +332,23 @@ def main():
         p.add_argument("--eps", type=float, default=0.10)
         p.add_argument("--min-points", type=int, default=10)
         p.add_argument("--min-cluster", type=int, default=500)
+        p.add_argument("--keep-floor", action="store_true",
+                       help="do NOT remove the floor plane before clustering (default: remove it)")
+        p.add_argument("--floor-tol", type=float, default=0.04,
+                       help="floor-plane slab thickness removed (m)")
         p.add_argument("--prefix", default="cd")
         if name == "attention":
             p.add_argument("--n", type=int, default=0)
             p.add_argument("--min-vis", type=int, default=5)
-            p.add_argument("--occ-scale", type=float, default=0.35)
+            p.add_argument("--occ-scale", type=float, default=0.5)
+            p.add_argument("--occ-tol", type=float, default=0.05,
+                           help="depth tolerance (m) for occlusion; lower = stricter")
+            p.add_argument("--min-frac", type=float, default=0.3,
+                           help="min fraction of in-frustum object points unoccluded to keep a frame")
         if name == "propose":
             p.add_argument("--gate-n", type=int, default=150)
             p.add_argument("--min-vis", type=int, default=5)
-            p.add_argument("--occ-scale", type=float, default=0.35)
+            p.add_argument("--occ-scale", type=float, default=0.5)
             p.add_argument("--min-frames", type=int, default=3)
     a = ap.parse_args()
     {"diff": cmd_diff, "attention": cmd_attention, "propose": cmd_propose}[a.cmd](a)
