@@ -102,6 +102,27 @@ def _segment_concept(model, processor, img_rgb, phrase):
     return masks, boxes, scores
 
 
+def _segment_refine(model, processor, img_rgb, points, labels, box, prior_mask, mask_res=288):
+    """Interactive refine (the GUI 'smart brush'): seed SAM from the CURRENT mask
+    (`prior_mask` as a low-res logit mask_input) plus pos/neg scribble points, so a
+    rough dab pulls a missed part in / a rough stroke removes bleed while SAM snaps
+    to the object edge. `mask_res` = 4x the model's image-embed grid (72 -> 288 at
+    the 1008 processing resolution); change it if the backbone/resolution changes."""
+    import torch
+    from PIL import Image as PILImage
+    mlow = cv2.resize(prior_mask.astype(np.uint8), (mask_res, mask_res),
+                      interpolation=cv2.INTER_NEAREST)
+    mask_input = np.where(mlow > 0, 12.0, -12.0).astype(np.float32)[None]
+    ctx = torch.autocast("cuda", dtype=torch.bfloat16) if torch.cuda.is_available() else _null()
+    with torch.inference_mode(), ctx:
+        state = processor.set_image(PILImage.fromarray(img_rgb))
+        masks, _scores, _ = model.predict_inst(
+            state, point_coords=np.asarray(points, np.float32),
+            point_labels=np.asarray(labels, np.int32), box=np.asarray(box, np.float32),
+            mask_input=mask_input, multimask_output=False)
+    return np.asarray(masks)[0].astype(bool)
+
+
 def _box_iou(a, b):
     ix0, iy0 = max(a[0], b[0]), max(a[1], b[1])
     ix1, iy1 = min(a[2], b[2]), min(a[3], b[3])

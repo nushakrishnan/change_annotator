@@ -32,6 +32,9 @@
   .obj img { max-width: 100%; margin-top: 6px; border: 1px solid #eee; }
   .status { font-size: 12px; color: #888; }
   .hint { font-size: 12px; color: #888; margin-top: 6px; }
+  .tip { cursor: help; border-bottom: 1px dotted #999; color: #667; }
+  #brushCursor { position: absolute; border: 2px solid rgba(0,200,255,.9); border-radius: 50%;
+                 pointer-events: none; display: none; transform: translate(-50%,-50%); z-index: 5; }
   .pill { display:inline-block; font-size:11px; padding:1px 6px; border-radius:10px; background:#eee; color:#555; margin-left:4px; }
   button.del { color:#b00; border-color:#e3b3b3; }
   .reviewbar { background:#eaf7f0; border:1px solid #b9e4cf; border-radius:6px; padding:6px 8px; }
@@ -84,9 +87,11 @@
     <button class="toolbtn active" data-tool="point" onclick="setTool('point')">point (SAM)</button>
     <button class="toolbtn" data-tool="brush" onclick="setTool('brush')">brush</button>
     <button class="toolbtn" data-tool="erase" onclick="setTool('erase')">erase</button>
+    <button class="toolbtn" data-tool="smart" onclick="setTool('smart')" title="smart brush: rough scribble to INCLUDE (shift-drag to EXCLUDE); SAM refines the mask to the object edge on release">smart brush</button>
+    <button class="toolbtn" data-tool="line" onclick="setTool('line')" title="line: click the start then end of a thin part (leg/cable) to fill a straight stroke at brush width; keep clicking to chain a polyline; Esc/Enter finishes">line</button>
     &nbsp; size <input type="range" id="brushSize" min="3" max="250" value="40" style="vertical-align:middle" oninput="brushSize=+this.value">
   </div>
-  <div id="viewport"><img id="view" src=""><canvas id="maskCanvas"></canvas></div>
+  <div id="viewport"><img id="view" src=""><canvas id="maskCanvas"></canvas><div id="brushCursor"></div></div>
   <div class="hint" id="annotateHint"><b>point</b>: click=positive, shift-click=negative · <b>brush/erase</b>: drag to paint · <b>ctrl-z</b> undo · <b>scroll</b> zoom · <b>middle-drag</b> pan · <b>fit</b> resets · <b>← / →</b> scrub</div>
   <div class="status" id="clickStatus"></div>
 </div>
@@ -126,12 +131,7 @@
     &nbsp;<label title="Remove the floor plane before clustering so objects float free — kills bogus floor-patch proposals and tightens boxes. Turn off for objects lying flat on the ground."><input type="checkbox" id="cdRemoveFloor" checked> remove floor</label>
     &nbsp;<label title="Strict depth-based occlusion: only log a change where Aria had clear line of sight. Drops changes hidden behind walls/geometry that the glasses never actually saw."><input type="checkbox" id="cdStrictOcc" checked> strict occlusion</label>
   </div>
-  <div class="hint">
-    presets — <b>330 ml can</b>: voxel 0.01, min-cluster 40 · <b>bag/box</b>: 0.015, 150 · <b>furniture</b>: 0.02, 500.
-    Smaller voxel + min-cluster → smaller objects but more noise to triage.
-    ⚠️ translucent items (Nalgene bottles, glass) are barely seen by lidar and may not appear at all — those need manual annotation.
-    Per-cluster proposals: give a moved object's pre &amp; post the same id to link them.
-  </div>
+  <div class="hint"><span class="tip" title="PRESETS&#10;  330 ml can:  voxel 0.01, min-cluster 40&#10;  bag / box:   voxel 0.015, min-cluster 150&#10;  furniture:   voxel 0.02, min-cluster 500&#10;&#10;Smaller voxel + min-cluster → smaller objects, but more noise to triage.&#10;&#10;⚠ Translucent items (Nalgene bottles, glass) are barely seen by lidar and may not appear at all — annotate those manually.&#10;&#10;Per-cluster proposals: give a moved object's pre & post the same id to link them.">ⓘ presets &amp; tips</span></div>
   <hr>
   <h2>objects</h2>
   <div id="objects"></div>
@@ -153,6 +153,8 @@ const slider = document.getElementById('slider');
 const maskCanvas = document.getElementById('maskCanvas');
 const maskCtx = maskCanvas.getContext('2d');
 let tool = 'point', brushSize = 40, reviewState = 'pre', gesture = null, lastPt = null;
+let smartPos = [], smartNeg = [], smartNegStroke = false;   // smart-brush scribble points
+let lineStart = null;                                       // line tool: previous clicked point
 let undoStack = [];        // canvas snapshots for ctrl-z (one per brush stroke / SAM apply)
 
 function curState(){ return document.querySelector('input[name=state]:checked').value; }
@@ -292,6 +294,7 @@ function gotoIdx(i){
   if(i === idx && view.src) {} // allow re-show
   idx = i; slider.value = i;
   if(editing){ editing = false; setEditUI(false); }
+  endLine();                                    // a new frame starts a fresh line
   mode === 'review' ? showReview() : showFrame();
 }
 slider.addEventListener('input', () => gotoIdx(parseInt(slider.value)));
@@ -315,6 +318,7 @@ document.addEventListener('keydown', (e) => {
   else if((e.key === 'd' || e.key === 'D') && mode === 'review' && !editing){ e.preventDefault(); deleteMask(true); }
   else if((e.key === 'a' || e.key === 'A') && mode === 'annotate'){ e.preventDefault(); addObject(); }
   else if((e.key === 'x' || e.key === 'X') && mode === 'review' && !editing){ e.preventDefault(); startEdit(); }
+  else if((e.key === 'Escape' || e.key === 'Enter') && tool === 'line'){ e.preventDefault(); endLine(); document.getElementById('clickStatus').textContent = 'line finished'; }
   else if((e.key === 'q' || e.key === 'Q') && !e.repeat){ e.preventDefault(); peek(true); }   // hold q = peek original
 });
 document.addEventListener('keyup', (e) => { if(e.key === 'q' || e.key === 'Q') peek(false); });
@@ -360,11 +364,28 @@ viewport.addEventListener('wheel', (e) => {
   zoom = nz; applyTransform();
 }, {passive: false});
 
+// brush-size cursor preview (shows where/how big you'll paint before you click)
+viewport.addEventListener('mousemove', (e) => {
+  const c = document.getElementById('brushCursor');
+  const painty = (tool === 'brush' || tool === 'erase' || tool === 'smart' || tool === 'line');
+  if(!maskEditable() || !painty){ c.style.display = 'none'; return; }
+  const vr = viewport.getBoundingClientRect(), r = view.getBoundingClientRect();
+  const scale = r.width / (view.naturalWidth || r.width);
+  const d = (tool === 'smart') ? 16 : 2 * brushSize * scale;   // smart = small pointer dot
+  c.style.width = d + 'px'; c.style.height = d + 'px';
+  c.style.left = (e.clientX - vr.left) + 'px'; c.style.top = (e.clientY - vr.top) + 'px';
+  c.style.borderColor = (tool === 'erase' || (tool === 'smart' && e.shiftKey))
+      ? 'rgba(255,80,80,.9)' : 'rgba(0,200,255,.9)';   // red = removing/exclude, cyan = adding
+  c.style.display = 'block';
+});
+viewport.addEventListener('mouseleave', () => { document.getElementById('brushCursor').style.display = 'none'; });
+
 // ───────────────────────── mask canvas (brush / eraser / SAM) ─────────────────────────
 function setTool(t){
   tool = t;
   document.querySelectorAll('.toolbtn').forEach(b => b.classList.toggle('active', b.dataset.tool === t));
   if(t !== 'point'){ pos = []; neg = []; }                  // brushing starts a fresh SAM interaction
+  endLine();                                                // switching tools finishes any open line
   view.style.cursor = (t === 'point') ? 'crosshair' : 'cell';
 }
 function ensureMaskSize(){
@@ -401,6 +422,27 @@ function evToNatural(e){
   return [(e.clientX - r.left) * (view.naturalWidth / r.width),
           (e.clientY - r.top) * (view.naturalHeight / r.height)];
 }
+// ── smart brush: collect rough scribble points; SAM refines on release ──
+function addScribble(e){
+  const [x, y] = evToNatural(e);
+  (smartNegStroke ? smartNeg : smartPos).push([x, y]);
+}
+async function refineSmart(){
+  if(!smartPos.length && !smartNeg.length) return;
+  const st = document.getElementById('clickStatus');
+  st.textContent = 'smart brush: refining …';
+  const state = (mode === 'review') ? reviewState : curState();
+  const body = {state, frame: frameName(idx), pos: smartPos, neg: smartNeg,
+                mask: maskCanvas.toDataURL('image/png')};
+  smartPos = []; smartNeg = [];
+  const r = await fetch('/api/refine', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  const d = await r.json();
+  if(d.error){ st.textContent = d.error; return; }
+  pushUndo();                                          // ctrl-z reverts the refine
+  loadMaskFromUrl(d.mask);
+  st.textContent = `smart brush: refined · ${d.px} px`;
+}
+
 function paintAt(e){
   const [x, y] = evToNatural(e);
   if(tool === 'erase'){ maskCtx.globalCompositeOperation = 'destination-out'; maskCtx.fillStyle = maskCtx.strokeStyle = '#000'; }
@@ -415,7 +457,11 @@ function paintAt(e){
 let down = false, moved = false, sx = 0, sy = 0, spx = 0, spy = 0;
 view.addEventListener('mousedown', (e) => {
   if(e.button !== 0 && e.button !== 1) return;
-  if(e.button === 0 && tool !== 'point' && maskEditable()){          // brush / erase
+  if(e.button === 0 && tool === 'smart' && maskEditable()){          // smart brush: collect scribble
+    gesture = 'smart'; down = true; smartNegStroke = e.shiftKey; smartPos = []; smartNeg = []; addScribble(e);
+  } else if(e.button === 0 && tool === 'line' && maskEditable()){     // line: click endpoints
+    gesture = 'line'; down = true; moved = false; sx = e.clientX; sy = e.clientY;
+  } else if(e.button === 0 && (tool === 'brush' || tool === 'erase') && maskEditable()){
     gesture = 'paint'; down = true; lastPt = null; ensureMaskSize(); pushUndo(); paintAt(e);
   } else {                                                            // middle, or point/pan
     gesture = (e.button === 0 && tool === 'point' && maskEditable()) ? 'point' : 'pan';
@@ -426,6 +472,8 @@ view.addEventListener('mousedown', (e) => {
 window.addEventListener('mousemove', (e) => {
   if(!down) return;
   if(gesture === 'paint'){ paintAt(e); return; }
+  if(gesture === 'smart'){ addScribble(e); return; }
+  if(gesture === 'line'){ if(Math.hypot(e.clientX - sx, e.clientY - sy) > 4) moved = true; return; }
   const dx = e.clientX - sx, dy = e.clientY - sy;
   if(!moved && Math.hypot(dx, dy) > 4) moved = true;
   if(moved){ panX = spx + dx; panY = spy + dy; applyTransform(); }
@@ -434,8 +482,25 @@ window.addEventListener('mouseup', (e) => {
   if(!down) return;
   down = false;
   if(gesture === 'point' && !moved) handleClick(e);
+  if(gesture === 'smart') refineSmart();
+  if(gesture === 'line' && !moved) doLine(e);
   gesture = null; lastPt = null;
 });
+
+// line tool: 1st click sets the start; each next click fills a thick straight
+// stroke (brush width) from the previous point, chaining into a polyline.
+function doLine(e){
+  const [x, y] = evToNatural(e);
+  ensureMaskSize();
+  if(lineStart === null){ lineStart = [x, y];
+    document.getElementById('clickStatus').textContent = 'line: click the end point (chains; Esc/Enter finishes)'; return; }
+  pushUndo();
+  maskCtx.globalCompositeOperation = 'source-over';
+  maskCtx.strokeStyle = 'rgba(255,0,0,0.51)'; maskCtx.lineWidth = 2 * brushSize; maskCtx.lineCap = 'round';
+  maskCtx.beginPath(); maskCtx.moveTo(lineStart[0], lineStart[1]); maskCtx.lineTo(x, y); maskCtx.stroke();
+  lineStart = [x, y];   // chain
+}
+function endLine(){ lineStart = null; }
 
 // ───────────────────────── click to segment (SAM) ─────────────────────────
 async function handleClick(e){
@@ -489,7 +554,9 @@ async function refreshObjects(){
 }
 function renderObjects(objs){
   const box = document.getElementById('objects'); box.innerHTML='';
-  Object.entries(objs).forEach(([key,o]) => {
+  Object.entries(objs)
+    .sort((a, b) => (b[1].n_masks || 0) - (a[1].n_masks || 0))   // most masks first
+    .forEach(([key,o]) => {
     const div = document.createElement('div'); div.className='obj'; div.dataset.oid = key;
     const masks = o.n_masks ? `<span class="pill">${o.n_masks} masks</span>` : '';
     const seeds = o.n_seeds > 1 ? `<span class="pill">${o.n_seeds} seeds</span>` : '';

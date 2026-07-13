@@ -376,7 +376,11 @@ def _remask_job(job_id, oid, label):
                 accepted += 1
             else:                                            # fallback: keep existing mask
                 kept += 1
-                m = (cv2.imread(str(od / mi[name]["mask_file"]), 0) > 127) if name in mi else None
+                m = None
+                if name in mi:
+                    prev = cv2.imread(str(od / mi[name]["mask_file"]), 0)   # None if file missing
+                    if prev is not None:
+                        m = prev > 127
             ov = bgr.copy()
             if m is not None:
                 ov[m] = (0.45 * ov[m] + 0.55 * np.array([0, 0, 255])).astype(np.uint8)
@@ -530,8 +534,9 @@ def api_overlay():
     if bgr is None:
         return jsonify(error="frame not found"), 404
     if m:
-        mask = cv2.imread(str(od / m["mask_file"]), 0) > 127
-        bgr = _overlay_mask(bgr, mask)
+        mm = cv2.imread(str(od / m["mask_file"]), 0)     # None if the mask file is missing
+        if mm is not None:
+            bgr = _overlay_mask(bgr, mm > 127)
     ok, buf = cv2.imencode(".jpg", bgr)
     return Response(buf.tobytes(), mimetype="image/jpeg")
 
@@ -563,6 +568,40 @@ def api_edit_click():
     for x, y in neg:
         cv2.circle(ov, (int(x), int(y)), 6, (255, 0, 0), -1)
     return jsonify(overlay=_png_b64(ov), mask=_mask_png_b64(best), px=int(best.sum()), score=float(scores.max()))
+
+
+@app.route("/api/refine", methods=["POST"])
+def api_refine():
+    """Smart brush: refine the CURRENT canvas mask with rough pos/neg scribble points.
+    SAM seeds from the mask (mask_input) and snaps to the object edge — a dab pulls a
+    missed part in, a stroke removes bleed. state+frame based (works in edit & annotate)."""
+    d = request.get_json()
+    state, name = d["state"], d["frame"]
+    pos = np.array(d.get("pos", []), np.float32).reshape(-1, 2)
+    neg = np.array(d.get("neg", []), np.float32).reshape(-1, 2)
+    if len(pos) + len(neg) == 0:
+        return jsonify(error="scribble something first"), 400
+    sid = CFG["states"][state]["session"]
+    bgr = cv2.imread(str(Path(CFG["capture"]) / "sessions" / sid / "raw_data" / name))
+    if bgr is None:
+        return jsonify(error="frame not found"), 404
+    H, W = bgr.shape[:2]
+    prior = _decode_mask(d["mask"]) if d.get("mask") else np.zeros((H, W), bool)
+    if prior.shape != (H, W):
+        prior = cv2.resize(prior.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST) > 0
+    # box = bbox of (prior ∪ scribbles), padded — so an added dab is inside the prompt box
+    ys, xs = np.where(prior)
+    xr = np.concatenate([xs, pos[:, 0], neg[:, 0]]) if len(xs) else np.concatenate([pos[:, 0], neg[:, 0]])
+    yr = np.concatenate([ys, pos[:, 1], neg[:, 1]]) if len(ys) else np.concatenate([pos[:, 1], neg[:, 1]])
+    pad = 30
+    box = [max(0, int(xr.min()) - pad), max(0, int(yr.min()) - pad),
+           min(W, int(xr.max()) + pad), min(H, int(yr.max()) + pad)]
+    pts = np.concatenate([pos, neg], 0)
+    labels = np.array([1] * len(pos) + [0] * len(neg), np.int32)
+    img = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    with LOCK:
+        refined = G._segment_refine(MODEL, PROC, img, pts, labels, box, prior)
+    return jsonify(mask=_mask_png_b64(refined), px=int(refined.sum()))
 
 
 @app.route("/api/save_edit", methods=["POST"])
@@ -604,9 +643,12 @@ def api_mask_png():
         return jsonify(error="unknown object"), 404
     od, _, _, m = _mask_entry(oid, name)
     sid = m["session"] if m else CFG["states"][OBJECTS[oid]["state"]]["session"]
+    mask = None
     if m:
-        mask = cv2.imread(str(od / m["mask_file"]), 0) > 127
-    else:
+        mm = cv2.imread(str(od / m["mask_file"]), 0)     # None if the mask file is missing
+        if mm is not None:
+            mask = mm > 127
+    if mask is None:
         bgr = cv2.imread(str(Path(CFG["capture"]) / "sessions" / sid / "raw_data" / name))
         mask = np.zeros(bgr.shape[:2], bool)
     h, w = mask.shape
