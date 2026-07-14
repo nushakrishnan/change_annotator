@@ -713,8 +713,22 @@ def api_set_meta():
         OBJECTS[key]["label"] = (d.get("label") or "").strip()
     if d.get("deformability") in ("rigid", "deformable"):
         OBJECTS[key]["deformability"] = d["deformability"]
+        # a moved pair is ONE physical object: keep deformability consistent across
+        # both halves (export merges them; a mismatch would be silently last-wins)
+        iid = OBJECTS[key].get("instance", OBJECTS[key]["id"])
+        for k2, o2 in OBJECTS.items():
+            if k2 != key and o2.get("instance", o2.get("id")) == iid:
+                o2["deformability"] = d["deformability"]
+    # two-person workflow flags: 'done' (annotator: masks finished) and 'reviewed'
+    # (second person verified). Independent booleans, persisted in gui_objects.json
+    # so both annotators sharing the workspace see them.
+    for flag in ("done", "reviewed"):
+        if flag in d:
+            OBJECTS[key][flag] = bool(d[flag])
     _save_working()
-    return jsonify(ok=True, instance=OBJECTS[key].get("instance"))
+    return jsonify(ok=True, instance=OBJECTS[key].get("instance"),
+                   done=OBJECTS[key].get("done", False),
+                   reviewed=OBJECTS[key].get("reviewed", False))
 
 
 # ───────────────────────────── export ─────────────────────────────

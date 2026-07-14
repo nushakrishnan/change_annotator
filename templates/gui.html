@@ -25,9 +25,14 @@
   #slider { width: 100%; }
   .navrow { display: flex; align-items: center; gap: 8px; }
   .navrow #slider { flex: 1; }
-  .obj { border: 1px solid #ddd; border-radius: 6px; padding: 8px; margin: 8px 0; background: #fff; }
+  .obj { border: 1px solid #ddd; border-radius: 6px; padding: 8px; margin: 8px 0; background: #fff; position: relative; }
+  .obj .flags { position: absolute; top: 6px; right: 8px; font-size: 11px; color: #555;
+                display: flex; gap: 8px; background: #fff; padding-left: 4px; }
+  .obj .flags label { font-size: 11px; cursor: pointer; user-select: none; }
+  .obj.f-done { border-color: #7bc; }
+  .obj.f-done.f-reviewed { border-color: #2a7; background: #f4fbf7; }
   .obj.reviewing { border-color: #2a7; box-shadow: 0 0 0 2px #2a72; }
-  .obj h4 { margin: 0 0 4px; font-size: 14px; }
+  .obj h4 { margin: 0 0 4px; font-size: 14px; padding-right: 118px; }  /* room for the flags */
   .obj .meta { font-size: 12px; color: #666; }
   .obj img { max-width: 100%; margin-top: 6px; border: 1px solid #eee; }
   .status { font-size: 12px; color: #888; }
@@ -89,6 +94,7 @@
     <button class="toolbtn" data-tool="erase" onclick="setTool('erase')">erase</button>
     <button class="toolbtn" data-tool="smart" onclick="setTool('smart')" title="smart brush: rough scribble to INCLUDE (shift-drag to EXCLUDE); SAM refines the mask to the object edge on release">smart brush</button>
     <button class="toolbtn" data-tool="line" onclick="setTool('line')" title="line: click the start then end of a thin part (leg/cable) to fill a straight stroke at brush width; keep clicking to chain a polyline; Esc/Enter finishes">line</button>
+    <button class="toolbtn" data-tool="fill" onclick="setTool('fill')" title="fill: click inside a closed outline (drawn with brush/line) to fill the enclosed area; cancels if the outline has a gap (fill would leak)">fill</button>
     &nbsp; size <input type="range" id="brushSize" min="3" max="250" value="40" style="vertical-align:middle" oninput="brushSize=+this.value">
   </div>
   <div id="viewport"><img id="view" src=""><canvas id="maskCanvas"></canvas><div id="brushCursor"></div></div>
@@ -367,11 +373,11 @@ viewport.addEventListener('wheel', (e) => {
 // brush-size cursor preview (shows where/how big you'll paint before you click)
 viewport.addEventListener('mousemove', (e) => {
   const c = document.getElementById('brushCursor');
-  const painty = (tool === 'brush' || tool === 'erase' || tool === 'smart' || tool === 'line');
+  const painty = (tool === 'brush' || tool === 'erase' || tool === 'smart' || tool === 'line' || tool === 'fill');
   if(!maskEditable() || !painty){ c.style.display = 'none'; return; }
   const vr = viewport.getBoundingClientRect(), r = view.getBoundingClientRect();
   const scale = r.width / (view.naturalWidth || r.width);
-  const d = (tool === 'smart') ? 16 : 2 * brushSize * scale;   // smart = small pointer dot
+  const d = (tool === 'smart' || tool === 'fill') ? 16 : 2 * brushSize * scale;   // smart/fill = small pointer dot
   c.style.width = d + 'px'; c.style.height = d + 'px';
   c.style.left = (e.clientX - vr.left) + 'px'; c.style.top = (e.clientY - vr.top) + 'px';
   c.style.borderColor = (tool === 'erase' || (tool === 'smart' && e.shiftKey))
@@ -459,8 +465,8 @@ view.addEventListener('mousedown', (e) => {
   if(e.button !== 0 && e.button !== 1) return;
   if(e.button === 0 && tool === 'smart' && maskEditable()){          // smart brush: collect scribble
     gesture = 'smart'; down = true; smartNegStroke = e.shiftKey; smartPos = []; smartNeg = []; addScribble(e);
-  } else if(e.button === 0 && tool === 'line' && maskEditable()){     // line: click endpoints
-    gesture = 'line'; down = true; moved = false; sx = e.clientX; sy = e.clientY;
+  } else if(e.button === 0 && (tool === 'line' || tool === 'fill') && maskEditable()){  // click tools
+    gesture = tool; down = true; moved = false; sx = e.clientX; sy = e.clientY;
   } else if(e.button === 0 && (tool === 'brush' || tool === 'erase') && maskEditable()){
     gesture = 'paint'; down = true; lastPt = null; ensureMaskSize(); pushUndo(); paintAt(e);
   } else {                                                            // middle, or point/pan
@@ -473,7 +479,7 @@ window.addEventListener('mousemove', (e) => {
   if(!down) return;
   if(gesture === 'paint'){ paintAt(e); return; }
   if(gesture === 'smart'){ addScribble(e); return; }
-  if(gesture === 'line'){ if(Math.hypot(e.clientX - sx, e.clientY - sy) > 4) moved = true; return; }
+  if(gesture === 'line' || gesture === 'fill'){ if(Math.hypot(e.clientX - sx, e.clientY - sy) > 4) moved = true; return; }
   const dx = e.clientX - sx, dy = e.clientY - sy;
   if(!moved && Math.hypot(dx, dy) > 4) moved = true;
   if(moved){ panX = spx + dx; panY = spy + dy; applyTransform(); }
@@ -484,8 +490,42 @@ window.addEventListener('mouseup', (e) => {
   if(gesture === 'point' && !moved) handleClick(e);
   if(gesture === 'smart') refineSmart();
   if(gesture === 'line' && !moved) doLine(e);
+  if(gesture === 'fill' && !moved) doFill(e);
   gesture = null; lastPt = null;
 });
+
+// fill tool: flood-fill the unpainted region around the click, bounded by painted
+// mask pixels. If the region reaches the image border, the outline wasn't closed
+// (the fill would flood the whole frame) -> cancel with a message instead.
+function doFill(e){
+  const [fx, fy] = evToNatural(e).map(Math.round);
+  ensureMaskSize();
+  const W = maskCanvas.width, H = maskCanvas.height;
+  const st = document.getElementById('clickStatus');
+  if(fx < 0 || fy < 0 || fx >= W || fy >= H) return;
+  const im = maskCtx.getImageData(0, 0, W, H), a = im.data;
+  const at = (x, y) => (y * W + x) * 4;
+  if(a[at(fx, fy) + 3] > 0){ st.textContent = 'fill: click INSIDE an unpainted enclosed area'; return; }
+  const seen = new Uint8Array(W * H);
+  const stack = [fy * W + fx];
+  const region = [];
+  seen[stack[0]] = 1;
+  let leaked = false;
+  while(stack.length){
+    const p = stack.pop();
+    const x = p % W, y = (p - x) / W;
+    if(x === 0 || y === 0 || x === W - 1 || y === H - 1){ leaked = true; break; }
+    region.push(p);
+    for(const q of [p - 1, p + 1, p - W, p + W]){
+      if(!seen[q] && a[q * 4 + 3] === 0){ seen[q] = 1; stack.push(q); }
+    }
+  }
+  if(leaked){ st.textContent = 'fill: area is NOT enclosed (leaks to the image border) — close the outline first'; return; }
+  pushUndo();
+  for(const p of region){ a[p * 4] = 255; a[p * 4 + 1] = 0; a[p * 4 + 2] = 0; a[p * 4 + 3] = 130; }
+  maskCtx.putImageData(im, 0, 0);
+  st.textContent = `fill: ${region.length.toLocaleString()} px filled`;
+}
 
 // line tool: 1st click sets the start; each next click fills a thick straight
 // stroke (brush width) from the previous point, chaining into a polyline.
@@ -548,16 +588,46 @@ async function addSeed(key){
   showFrame(); refreshObjects();
 }
 
+let objsCache = {};          // last-fetched objects, for the done/reviewed confirmation
 async function refreshObjects(){
   const d = await (await fetch('/api/objects')).json();
+  objsCache = d.objects;
   renderObjects(d.objects);
 }
+// moved pairs share a stable color, derived from the instance id (same across refreshes)
+const PAIR_COLORS = ['#e6194b','#3cb44b','#4363d8','#f58231','#911eb4','#01875f','#9a6324','#008080'];
+function pairColor(iid){ let h = 0; for(const ch of iid) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+                         return PAIR_COLORS[h % PAIR_COLORS.length]; }
+
 function renderObjects(objs){
   const box = document.getElementById('objects'); box.innerHTML='';
-  Object.entries(objs)
-    .sort((a, b) => (b[1].n_masks || 0) - (a[1].n_masks || 0))   // most masks first
+  // moved pairs group under their shared instance id and render adjacently
+  // (pre above post); groups/solos still rank by their best mask count.
+  const gkey = ([k, o]) => o.change_type === 'moved' ? 'pair:' + (o.instance || o.id) : 'solo:' + k;
+  const entries = Object.entries(objs);
+  const grank = {};
+  entries.forEach(e => { const g = gkey(e); grank[g] = Math.max(grank[g] || 0, e[1].n_masks || 0); });
+  entries
+    .sort((a, b) => {
+      const ga = gkey(a), gb = gkey(b);
+      if(ga !== gb) return (grank[gb] - grank[ga]) || (ga < gb ? -1 : 1);
+      return (a[1].state === 'pre' ? 0 : 1) - (b[1].state === 'pre' ? 0 : 1);
+    })
     .forEach(([key,o]) => {
-    const div = document.createElement('div'); div.className='obj'; div.dataset.oid = key;
+    const div = document.createElement('div'); div.dataset.oid = key;
+    div.className = 'obj' + (o.done ? ' f-done' : '') + (o.reviewed ? ' f-reviewed' : '');
+    let pairMark = '';
+    if(o.change_type === 'moved'){
+      const col = pairColor(o.instance || o.id);
+      div.style.boxShadow = 'inset 4px 0 0 ' + col;         // shared stripe = same pair
+      pairMark = `<span style="color:${col}" title="moved pair — same color/stripe = its counterpart in the other state">⇄</span> `;
+    }
+    const flags = `<span class="flags">
+      <label title="annotator: masks for this object are finished"><input type="checkbox"
+        ${o.done ? 'checked' : ''} onchange="setFlag('${key}','done',this.checked,this)"> done</label>
+      <label title="second person: independently verified this object's masks"><input type="checkbox"
+        ${o.reviewed ? 'checked' : ''} onchange="setFlag('${key}','reviewed',this.checked,this)"> reviewed</label>
+    </span>`;
     const masks = o.n_masks ? `<span class="pill">${o.n_masks} masks</span>` : '';
     const seeds = o.n_seeds > 1 ? `<span class="pill">${o.n_seeds} seeds</span>` : '';
     const cd = o.source === 'cloud_diff' ? '<span class="pill">cloud-diff</span>' : '';
@@ -573,8 +643,14 @@ function renderObjects(objs){
         <button onclick="setMeta('${key}')" title="save id + label">save</button>
         <button onclick="remask('${key}')" title="re-segment by concept from the label — pulls in thin legs/base the click-mask drops; keeps the current mask on frames it can't match">label → remask</button>
       </div>`;
-    div.innerHTML = `<h4>${o.ghost ? '👻 ' : ''}${iid} · ${o.state} ${cd} ${seeds} ${masks}</h4>
-      <div class="meta">${o.change_type} · ${o.deformability}</div>${remaskUI}${seedProp}
+    const deformUI = o.ghost ? o.deformability : `<select style="font-size:11px;padding:0"
+        onchange="setDeform('${key}', this.value)"
+        title="editable — a moved pair's other half is kept in sync automatically">
+        <option value="rigid" ${o.deformability === 'rigid' ? 'selected' : ''}>rigid</option>
+        <option value="deformable" ${o.deformability === 'deformable' ? 'selected' : ''}>deformable</option>
+      </select>`;
+    div.innerHTML = `${flags}<h4>${pairMark}${o.ghost ? '👻 ' : ''}${iid} · ${o.state} ${cd} ${seeds} ${masks}</h4>
+      <div class="meta">${o.change_type} · ${deformUI}</div>${remaskUI}${seedProp}
       <button onclick="openReview('${key}')" ${o.n_masks ? '' : 'disabled'}>review / edit</button>
       <button onclick="deleteObject('${key}')" class="del" title="remove this object — its seeds/masks are moved to .trash (recoverable on disk)">delete</button>
       <span class="status" id="st_${key}"></span>
@@ -600,6 +676,47 @@ async function propagate(id){
       refreshObjects(); }
     else if(j.status==='error'){ clearInterval(poll); st.textContent = 'error: ' + j.error; }
   }, 1500);
+}
+
+// change-type-aware confirmation: the classic GT error is a MOVED object sitting as
+// added/removed because its counterpart in the other sequence was never checked/linked.
+function flagConfirmMsg(key, flag){
+  const o = objsCache[key] || {};
+  const iid = o.instance || o.id || key;
+  const head = `Mark "${iid}" as ${flag.toUpperCase()}?\n\n`;
+  if(o.change_type === 'removed')
+    return head + 'This object is classified as REMOVED — it appears only in the PRE sequence.\n\n' +
+      'Have you double-checked the POST sequence to confirm it is truly gone, and not just moved?\n' +
+      'If it moved, add/link its post-state counterpart with the same id instead.';
+  if(o.change_type === 'added')
+    return head + 'This object is classified as ADDED — it appears only in the POST sequence.\n\n' +
+      'Have you double-checked the PRE sequence to confirm it was not there before, and not just moved?\n' +
+      'If it moved, add/link its pre-state counterpart with the same id instead.';
+  if(o.change_type === 'moved')
+    return head + 'This object is classified as MOVED — linked across both sequences.\n\n' +
+      'Have you double-checked that the pre and post masks show the same physical object?';
+  return head + 'Have you double-checked this object against the other sequence?';
+}
+
+async function setFlag(key, flag, val, el){
+  if(val && !confirm(flagConfirmMsg(key, flag))){   // confirm only when checking, not unchecking
+    if(el) el.checked = false;
+    return;
+  }
+  const r = await fetch('/api/set_meta', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({id: key, [flag]: val})});
+  const d = await r.json();
+  if(d.error){ alert(d.error); refreshObjects(); return; }
+  const card = document.querySelector(`.obj[data-oid="${key}"]`);   // update in place, no re-sort
+  if(card){ card.classList.toggle('f-done', d.done); card.classList.toggle('f-reviewed', d.reviewed); }
+}
+
+async function setDeform(key, val){
+  const r = await fetch('/api/set_meta', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({id: key, deformability: val})});
+  const d = await r.json();
+  if(d.error){ alert(d.error); }
+  refreshObjects();          // re-render so a linked pair's other half shows the synced value
 }
 
 async function setMeta(key){
