@@ -29,12 +29,23 @@
   .obj .flags { position: absolute; top: 6px; right: 8px; font-size: 11px; color: #555;
                 display: flex; gap: 8px; background: #fff; padding-left: 4px; }
   .obj .flags label { font-size: 11px; cursor: pointer; user-select: none; }
-  .obj.f-done { border-color: #7bc; }
-  .obj.f-done.f-reviewed { border-color: #2a7; background: #f4fbf7; }
+  /* green hue = finished GT, not to be touched casually; reviewed = even greener */
+  .obj.f-done { border-color: #8c8; background: #eef8ef; }
+  .obj.f-done.f-reviewed { border-color: #2a7; background: #d8f0de; }
   .obj.reviewing { border-color: #2a7; box-shadow: 0 0 0 2px #2a72; }
   .obj h4 { margin: 0 0 4px; font-size: 14px; padding-right: 118px; }  /* room for the flags */
   .obj .meta { font-size: 12px; color: #666; }
   .obj img { max-width: 100%; margin-top: 6px; border: 1px solid #eee; }
+  /* group container: several GUI objects = ONE physical object (shared instance id) */
+  .grp { border: 1px solid #ccc; border-radius: 6px; margin: 8px 0; background: #f6f6f6; }
+  .grp-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 6px 8px; font-size: 13px; }
+  .grp-cols { display: flex; gap: 6px; padding: 0 6px 6px; align-items: flex-start; }
+  .grp-col { flex: 1 1 0; min-width: 0; }
+  .grp-col .col-tag { font-size: 11px; font-weight: 600; color: #888; margin: 2px 0 2px 2px; }
+  .grp .obj { margin: 0 0 6px; }
+  .grp .obj .flags { position: static; display: block; margin: 0 0 2px; }
+  .grp .obj h4 { padding-right: 0; font-size: 13px; }
+  .selbox { margin-right: 4px; vertical-align: middle; }
   .status { font-size: 12px; color: #888; }
   .hint { font-size: 12px; color: #888; margin-top: 6px; }
   .tip { cursor: help; border-bottom: 1px dotted #999; color: #667; }
@@ -90,15 +101,14 @@
   <div class="row" id="toolBar">
     tool:
     <button class="toolbtn active" data-tool="point" onclick="setTool('point')">point (SAM)</button>
-    <button class="toolbtn" data-tool="brush" onclick="setTool('brush')">brush</button>
+    <button class="toolbtn" data-tool="brush" onclick="setTool('brush')" title="brush: drag to paint; when a stroke closes off an area (against the existing mask or by looping on itself) the enclosed area fills automatically; ctrl-z reverts stroke+fill together">brush</button>
     <button class="toolbtn" data-tool="erase" onclick="setTool('erase')">erase</button>
     <button class="toolbtn" data-tool="smart" onclick="setTool('smart')" title="smart brush: rough scribble to INCLUDE (shift-drag to EXCLUDE); SAM refines the mask to the object edge on release">smart brush</button>
     <button class="toolbtn" data-tool="line" onclick="setTool('line')" title="line: click the start then end of a thin part (leg/cable) to fill a straight stroke at brush width; keep clicking to chain a polyline; Esc/Enter finishes">line</button>
-    <button class="toolbtn" data-tool="fill" onclick="setTool('fill')" title="fill: click inside a closed outline (drawn with brush/line) to fill the enclosed area; cancels if the outline has a gap (fill would leak)">fill</button>
     &nbsp; size <input type="range" id="brushSize" min="3" max="250" value="40" style="vertical-align:middle" oninput="brushSize=+this.value">
   </div>
   <div id="viewport"><img id="view" src=""><canvas id="maskCanvas"></canvas><div id="brushCursor"></div></div>
-  <div class="hint" id="annotateHint"><b>point</b>: click=positive, shift-click=negative · <b>brush/erase</b>: drag to paint · <b>ctrl-z</b> undo · <b>scroll</b> zoom · <b>middle-drag</b> pan · <b>fit</b> resets · <b>← / →</b> scrub</div>
+  <div class="hint" id="annotateHint"><b>point</b>: click=positive, shift-click=negative · <b>brush/erase</b>: drag to paint (brush auto-fills areas the stroke closes off) · <b>ctrl-z</b> undo · <b>scroll</b> zoom · <b>middle-drag</b> pan · <b>fit</b> resets · <b>← / →</b> scrub</div>
   <div class="status" id="clickStatus"></div>
 </div>
 
@@ -140,6 +150,10 @@
   <div class="hint"><span class="tip" title="PRESETS&#10;  330 ml can:  voxel 0.01, min-cluster 40&#10;  bag / box:   voxel 0.015, min-cluster 150&#10;  furniture:   voxel 0.02, min-cluster 500&#10;&#10;Smaller voxel + min-cluster → smaller objects, but more noise to triage.&#10;&#10;⚠ Translucent items (Nalgene bottles, glass) are barely seen by lidar and may not appear at all — annotate those manually.&#10;&#10;Per-cluster proposals: give a moved object's pre & post the same id to link them.">ⓘ presets &amp; tips</span></div>
   <hr>
   <h2>objects</h2>
+  <div class="row" id="groupBar" style="display:none">
+    <button id="groupBtn" onclick="doGroup()">group selected</button>
+    <span class="hint" style="margin:0">selected objects become ONE physical object (first selected keeps its id)</span>
+  </div>
   <div id="objects"></div>
   <hr>
   <div class="row"><button onclick="exportSegments()">export segments.json</button> <span class="status" id="exportStatus"></span></div>
@@ -251,7 +265,18 @@ function renderMaskmap(){
   g.fillRect(Math.min(frames.length - 1, idx), 0, 2, c.height);
 }
 
+// a DONE object is finished GT — protect it from fat-finger edits: every mutating
+// action must pass this gate, which requires typing 'review' to proceed.
+function guardDone(key){
+  const o = objsCache[key] || {};
+  if(!o.done) return true;
+  const t = prompt("are you a reviewer of this object? otherwise, be really careful not to " +
+                   "edit a done object. type in 'review' to continue editing");
+  return (t || '').trim().toLowerCase() === 'review';
+}
+
 function startEdit(){
+  if(!guardDone(reviewObj)) return;
   editing = true; pos = []; neg = []; setEditUI(true); showMask(true); resetUndo();
   const f = frames[idx];
   setFrame('/frame?state=' + reviewState + '&name=' + encodeURIComponent(f.name),
@@ -272,6 +297,7 @@ async function saveEdit(){
 async function deleteMask(skipConfirm){
   const f = frames[idx];
   if(!f.has_mask) return;
+  if(!guardDone(reviewObj)) return;
   if(!skipConfirm && !confirm('delete mask on this frame?')) return;
   const r = await fetch('/api/delete_mask', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({id: reviewObj, frame: f.name})});
@@ -373,11 +399,11 @@ viewport.addEventListener('wheel', (e) => {
 // brush-size cursor preview (shows where/how big you'll paint before you click)
 viewport.addEventListener('mousemove', (e) => {
   const c = document.getElementById('brushCursor');
-  const painty = (tool === 'brush' || tool === 'erase' || tool === 'smart' || tool === 'line' || tool === 'fill');
+  const painty = (tool === 'brush' || tool === 'erase' || tool === 'smart' || tool === 'line');
   if(!maskEditable() || !painty){ c.style.display = 'none'; return; }
   const vr = viewport.getBoundingClientRect(), r = view.getBoundingClientRect();
   const scale = r.width / (view.naturalWidth || r.width);
-  const d = (tool === 'smart' || tool === 'fill') ? 16 : 2 * brushSize * scale;   // smart/fill = small pointer dot
+  const d = (tool === 'smart') ? 16 : 2 * brushSize * scale;   // smart = small pointer dot
   c.style.width = d + 'px'; c.style.height = d + 'px';
   c.style.left = (e.clientX - vr.left) + 'px'; c.style.top = (e.clientY - vr.top) + 'px';
   c.style.borderColor = (tool === 'erase' || (tool === 'smart' && e.shiftKey))
@@ -465,7 +491,7 @@ view.addEventListener('mousedown', (e) => {
   if(e.button !== 0 && e.button !== 1) return;
   if(e.button === 0 && tool === 'smart' && maskEditable()){          // smart brush: collect scribble
     gesture = 'smart'; down = true; smartNegStroke = e.shiftKey; smartPos = []; smartNeg = []; addScribble(e);
-  } else if(e.button === 0 && (tool === 'line' || tool === 'fill') && maskEditable()){  // click tools
+  } else if(e.button === 0 && tool === 'line' && maskEditable()){  // click tool
     gesture = tool; down = true; moved = false; sx = e.clientX; sy = e.clientY;
   } else if(e.button === 0 && (tool === 'brush' || tool === 'erase') && maskEditable()){
     gesture = 'paint'; down = true; lastPt = null; ensureMaskSize(); pushUndo(); paintAt(e);
@@ -479,7 +505,7 @@ window.addEventListener('mousemove', (e) => {
   if(!down) return;
   if(gesture === 'paint'){ paintAt(e); return; }
   if(gesture === 'smart'){ addScribble(e); return; }
-  if(gesture === 'line' || gesture === 'fill'){ if(Math.hypot(e.clientX - sx, e.clientY - sy) > 4) moved = true; return; }
+  if(gesture === 'line'){ if(Math.hypot(e.clientX - sx, e.clientY - sy) > 4) moved = true; return; }
   const dx = e.clientX - sx, dy = e.clientY - sy;
   if(!moved && Math.hypot(dx, dy) > 4) moved = true;
   if(moved){ panX = spx + dx; panY = spy + dy; applyTransform(); }
@@ -490,41 +516,48 @@ window.addEventListener('mouseup', (e) => {
   if(gesture === 'point' && !moved) handleClick(e);
   if(gesture === 'smart') refineSmart();
   if(gesture === 'line' && !moved) doLine(e);
-  if(gesture === 'fill' && !moved) doFill(e);
+  if(gesture === 'paint' && tool === 'brush') autoFillEnclosed();
   gesture = null; lastPt = null;
 });
 
-// fill tool: flood-fill the unpainted region around the click, bounded by painted
-// mask pixels. If the region reaches the image border, the outline wasn't closed
-// (the fill would flood the whole frame) -> cancel with a message instead.
-function doFill(e){
-  const [fx, fy] = evToNatural(e).map(Math.round);
-  ensureMaskSize();
+// brush auto-fill: when a stroke closes off an unpainted area — against the existing
+// mask, or by looping on itself — fill that area. Compares border-reachability of
+// unpainted pixels before vs after the stroke, so only areas THIS stroke sealed get
+// filled; a pre-existing enclosed hole (deliberately unmasked see-through gap) is
+// never touched. Mutates the canvas after the stroke's mousedown snapshot, so one
+// ctrl-z reverts stroke + fill together.
+function autoFillEnclosed(){
   const W = maskCanvas.width, H = maskCanvas.height;
-  const st = document.getElementById('clickStatus');
-  if(fx < 0 || fy < 0 || fx >= W || fy >= H) return;
+  const before = undoStack[undoStack.length - 1];
+  if(!before || before.width !== W || before.height !== H) return;
   const im = maskCtx.getImageData(0, 0, W, H), a = im.data;
-  const at = (x, y) => (y * W + x) * 4;
-  if(a[at(fx, fy) + 3] > 0){ st.textContent = 'fill: click INSIDE an unpainted enclosed area'; return; }
-  const seen = new Uint8Array(W * H);
-  const stack = [fy * W + fx];
-  const region = [];
-  seen[stack[0]] = 1;
-  let leaked = false;
-  while(stack.length){
-    const p = stack.pop();
-    const x = p % W, y = (p - x) / W;
-    if(x === 0 || y === 0 || x === W - 1 || y === H - 1){ leaked = true; break; }
-    region.push(p);
-    for(const q of [p - 1, p + 1, p - W, p + W]){
-      if(!seen[q] && a[q * 4 + 3] === 0){ seen[q] = 1; stack.push(q); }
+  const openBefore = borderReach(before.data, W, H);
+  const openAfter = borderReach(a, W, H);
+  let n = 0;
+  for(let p = 0; p < W * H; p++){
+    if(a[p * 4 + 3] === 0 && openBefore[p] && !openAfter[p]){
+      a[p * 4] = 255; a[p * 4 + 1] = 0; a[p * 4 + 2] = 0; a[p * 4 + 3] = 130; n++;
     }
   }
-  if(leaked){ st.textContent = 'fill: area is NOT enclosed (leaks to the image border) — close the outline first'; return; }
-  pushUndo();
-  for(const p of region){ a[p * 4] = 255; a[p * 4 + 1] = 0; a[p * 4 + 2] = 0; a[p * 4 + 3] = 130; }
+  if(!n) return;
   maskCtx.putImageData(im, 0, 0);
-  st.textContent = `fill: ${region.length.toLocaleString()} px filled`;
+  document.getElementById('clickStatus').textContent = `brush: auto-filled ${n.toLocaleString()} px`;
+}
+// flood from every border pixel across unpainted (alpha=0) pixels; returns a
+// per-pixel map of "reachable from the border" (0 = painted or enclosed).
+function borderReach(a, W, H){
+  const open = new Uint8Array(W * H), stack = [];
+  const push = (p) => { if(!open[p] && a[p * 4 + 3] === 0){ open[p] = 1; stack.push(p); } };
+  for(let x = 0; x < W; x++){ push(x); push((H - 1) * W + x); }
+  for(let y = 0; y < H; y++){ push(y * W); push(y * W + W - 1); }
+  while(stack.length){
+    const p = stack.pop(), x = p % W;
+    if(x > 0) push(p - 1);
+    if(x < W - 1) push(p + 1);
+    if(p >= W) push(p - W);
+    if(p < W * (H - 1)) push(p + W);
+  }
+  return open;
 }
 
 // line tool: 1st click sets the start; each next click fills a thick straight
@@ -579,6 +612,7 @@ async function addObject(){
 
 async function addSeed(key){
   if(mode !== 'annotate'){ alert('switch to annotate (← back to annotate) to add a seed frame'); return; }
+  if(!guardDone(key)) return;
   const body = { id: key, state: curState(), frame: frameName(idx),
     points: pos, mask: maskCanvas.toDataURL('image/png') };
   const r = await fetch('/api/add_seed', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
@@ -599,65 +633,168 @@ const PAIR_COLORS = ['#e6194b','#3cb44b','#4363d8','#f58231','#911eb4','#01875f'
 function pairColor(iid){ let h = 0; for(const ch of iid) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
                          return PAIR_COLORS[h % PAIR_COLORS.length]; }
 
+// ── objects list: units ──────────────────────────────────────────────────────
+// Every non-ghost object belongs to its instance id; 2+ members sharing an
+// instance = a GROUP (one physical object: a moved pre/post pair, or several
+// part-annotations like a curtain split into left/right). A group renders as
+// ONE container card (pre | post member columns) so members never drift apart
+// in the ranking and asymmetric groups (1 pre vs 2 post) are visible at a glance.
+let groupUnits = {};   // iid -> [keys]  (rebuilt each render; drives group/ungroup)
+let groupSel = [];     // ordered iid selection for the 'group selected' button
+
 function renderObjects(objs){
   const box = document.getElementById('objects'); box.innerHTML='';
-  // moved pairs group under their shared instance id and render adjacently
-  // (pre above post); groups/solos still rank by their best mask count.
-  const gkey = ([k, o]) => o.change_type === 'moved' ? 'pair:' + (o.instance || o.id) : 'solo:' + k;
-  const entries = Object.entries(objs);
-  const grank = {};
-  entries.forEach(e => { const g = gkey(e); grank[g] = Math.max(grank[g] || 0, e[1].n_masks || 0); });
-  entries
-    .sort((a, b) => {
-      const ga = gkey(a), gb = gkey(b);
-      if(ga !== gb) return (grank[gb] - grank[ga]) || (ga < gb ? -1 : 1);
-      return (a[1].state === 'pre' ? 0 : 1) - (b[1].state === 'pre' ? 0 : 1);
-    })
-    .forEach(([key,o]) => {
-    const div = document.createElement('div'); div.dataset.oid = key;
-    div.className = 'obj' + (o.done ? ' f-done' : '') + (o.reviewed ? ' f-reviewed' : '');
-    let pairMark = '';
-    if(o.change_type === 'moved'){
-      const col = pairColor(o.instance || o.id);
-      div.style.boxShadow = 'inset 4px 0 0 ' + col;         // shared stripe = same pair
-      pairMark = `<span style="color:${col}" title="moved pair — same color/stripe = its counterpart in the other state">⇄</span> `;
-    }
-    const flags = `<span class="flags">
-      <label title="annotator: masks for this object are finished"><input type="checkbox"
-        ${o.done ? 'checked' : ''} onchange="setFlag('${key}','done',this.checked,this)"> done</label>
-      <label title="second person: independently verified this object's masks"><input type="checkbox"
-        ${o.reviewed ? 'checked' : ''} onchange="setFlag('${key}','reviewed',this.checked,this)"> reviewed</label>
-    </span>`;
-    const masks = o.n_masks ? `<span class="pill">${o.n_masks} masks</span>` : '';
-    const seeds = o.n_seeds > 1 ? `<span class="pill">${o.n_seeds} seeds</span>` : '';
-    const cd = o.source === 'cloud_diff' ? '<span class="pill">cloud-diff</span>' : '';
-    const seedProp = (o.ghost || o.source === 'cloud_diff') ? '' : `
-      <button onclick="addSeed('${key}')" title="add the current frame as another seed view (spread-out frames → stronger propagation)">+ seed</button>
-      <button onclick="propagate('${key}')">propagate</button>`;
-    const iid = (o.instance || o.id);
-    const remaskUI = o.ghost ? '' : `
-      <div class="row">
-        <input id="iid_${key}" value="${iid.replace(/"/g, '&quot;')}" placeholder="id" style="width:76px"
-          title="give a moved object's PRE and POST the SAME id to link them as one 'moved' object">
-        <input id="lbl_${key}" value="${(o.label || '').replace(/"/g, '&quot;')}" placeholder="label e.g. chair" style="width:96px">
-        <button onclick="setMeta('${key}')" title="save id + label">save</button>
-        <button onclick="remask('${key}')" title="re-segment by concept from the label — pulls in thin legs/base the click-mask drops; keeps the current mask on frames it can't match">label → remask</button>
-      </div>`;
-    const deformUI = o.ghost ? o.deformability : `<select style="font-size:11px;padding:0"
-        onchange="setDeform('${key}', this.value)"
-        title="editable — a moved pair's other half is kept in sync automatically">
-        <option value="rigid" ${o.deformability === 'rigid' ? 'selected' : ''}>rigid</option>
-        <option value="deformable" ${o.deformability === 'deformable' ? 'selected' : ''}>deformable</option>
-      </select>`;
-    div.innerHTML = `${flags}<h4>${pairMark}${o.ghost ? '👻 ' : ''}${iid} · ${o.state} ${cd} ${seeds} ${masks}</h4>
-      <div class="meta">${o.change_type} · ${deformUI}</div>${remaskUI}${seedProp}
-      <button onclick="openReview('${key}')" ${o.n_masks ? '' : 'disabled'}>review / edit</button>
-      <button onclick="deleteObject('${key}')" class="del" title="remove this object — its seeds/masks are moved to .trash (recoverable on disk)">delete</button>
-      <span class="status" id="st_${key}"></span>
-      <div id="res_${key}"></div>`;
-    box.appendChild(div);
+  groupUnits = {};
+  const byInst = {};
+  Object.entries(objs).forEach(([k, o]) => {
+    const iid = o.ghost ? 'ghost:' + k : (o.instance || o.id);
+    (byInst[iid] = byInst[iid] || []).push([k, o]);
   });
+  const units = Object.entries(byInst).map(([iid, members]) => ({
+    iid, members: members.sort((a, b) => a[0] < b[0] ? -1 : 1),
+    rank: Math.max(...members.map(([, o]) => o.n_masks || 0)),
+  }));
+  units.sort((a, b) => (b.rank - a.rank) || (a.iid < b.iid ? -1 : 1));
+  units.forEach(u => {
+    groupUnits[u.iid] = u.members.map(([k]) => k);
+    box.appendChild(u.members.length === 1
+      ? objCard(u.members[0][0], u.members[0][1], false)
+      : groupCard(u));
+  });
+  groupSel = groupSel.filter(iid => groupUnits[iid]);   // drop stale selections
+  updateGroupBar();
   highlightReviewing();
+}
+
+// one object card; member=true renders the compact in-group variant (the group
+// header owns instance id / label / change type / deformability)
+function objCard(key, o, member){
+  const div = document.createElement('div'); div.dataset.oid = key;
+  div.className = 'obj' + (o.done ? ' f-done' : '') + (o.reviewed ? ' f-reviewed' : '');
+  const flags = `<span class="flags">
+    <label title="annotator: masks for this object are finished"><input type="checkbox"
+      ${o.done ? 'checked' : ''} onchange="setFlag('${key}','done',this.checked,this)"> done</label>
+    <label title="second person: independently verified this object's masks"><input type="checkbox"
+      ${o.reviewed ? 'checked' : ''} onchange="setFlag('${key}','reviewed',this.checked,this)"> reviewed</label>
+  </span>`;
+  const masks = o.n_masks ? `<span class="pill">${o.n_masks} masks</span>` : '';
+  const seeds = o.n_seeds > 1 ? `<span class="pill">${o.n_seeds} seeds</span>` : '';
+  const cd = o.source === 'cloud_diff' ? '<span class="pill">cloud-diff</span>' : '';
+  const seedProp = (o.ghost || o.source === 'cloud_diff') ? '' : `
+    <button onclick="addSeed('${key}')" title="add the current frame as another seed view (spread-out frames → stronger propagation)">+ seed</button>
+    <button onclick="propagate('${key}')">propagate</button>`;
+  const iid = (o.instance || o.id);
+  const remaskBtn = o.ghost ? '' : `<button onclick="remask('${key}')"
+    title="re-segment by concept from the label — pulls in thin legs/base the click-mask drops; keeps the current mask on frames it can't match">label → remask</button>`;
+  const metaRow = member ? (remaskBtn && `<div class="row">${remaskBtn}</div>`) : (o.ghost ? '' : `
+    <div class="row">
+      <input id="iid_${key}" value="${iid.replace(/"/g, '&quot;')}" placeholder="id" style="width:76px"
+        title="objects sharing the SAME id are one physical object — or select cards and use 'group selected'">
+      <input id="lbl_${key}" value="${(o.label || '').replace(/"/g, '&quot;')}" placeholder="label e.g. chair" style="width:96px">
+      <button onclick="setMeta('${key}')" title="save id + label">save</button>
+      ${remaskBtn}
+    </div>`);
+  const deformUI = o.ghost ? o.deformability : `<select style="font-size:11px;padding:0"
+      onchange="setDeform('${key}', this.value)"
+      title="editable — kept in sync across the whole group">
+      <option value="rigid" ${o.deformability === 'rigid' ? 'selected' : ''}>rigid</option>
+      <option value="deformable" ${o.deformability === 'deformable' ? 'selected' : ''}>deformable</option>
+    </select>`;
+  const metaLine = member ? '' : `<div class="meta">${o.change_type} · ${deformUI}</div>`;
+  const title = member ? o.id : `${o.ghost ? '👻 ' : ''}${iid} · ${o.state}`;
+  div.innerHTML = `${flags}<h4>${title} ${cd} ${seeds} ${masks}</h4>
+    ${metaLine}${metaRow}${seedProp}
+    <button onclick="openReview('${key}')" ${o.n_masks ? '' : 'disabled'}>review / edit</button>
+    <button onclick="deleteObject('${key}')" class="del" title="remove this object — its seeds/masks are moved to .trash (recoverable on disk)">delete</button>
+    <span class="status" id="st_${key}"></span>
+    <div id="res_${key}"></div>`;
+  if(!member && !o.ghost) attachSelBox(div.querySelector('h4'), iid);
+  return div;
+}
+
+function groupCard(u){
+  const iid = u.iid, keys = u.members.map(([k]) => k);
+  const col = pairColor(iid);
+  const first = u.members[0][1];
+  const label = u.members.map(([, o]) => o.label).find(l => l) || '';
+  const pre = u.members.filter(([, o]) => o.state === 'pre');
+  const post = u.members.filter(([, o]) => o.state === 'post');
+  const div = document.createElement('div');
+  div.className = 'grp';
+  div.style.boxShadow = 'inset 4px 0 0 ' + col;
+  const head = document.createElement('div'); head.className = 'grp-head';
+  head.innerHTML = `
+    <input class="giid" value="${iid.replace(/"/g, '&quot;')}" style="width:86px"
+      title="group id — shared by every member; the export uses it as the object id">
+    <input class="glbl" value="${label.replace(/"/g, '&quot;')}" placeholder="label e.g. curtain" style="width:96px">
+    <button class="gsave" title="save id + label to every member">save</button>
+    <span class="pill" style="background:${col};color:#fff" title="derived from the group: any pre + any post = moved">${first.change_type}</span>
+    <span class="pill">${pre.length} pre · ${post.length} post</span>
+    <select class="gdeform" style="font-size:11px;padding:0" title="one physical object — applies to every member">
+      <option value="rigid" ${first.deformability === 'rigid' ? 'selected' : ''}>rigid</option>
+      <option value="deformable" ${first.deformability === 'deformable' ? 'selected' : ''}>deformable</option>
+    </select>
+    <button class="gungroup" title="dissolve the group — each member's id reverts to its own; masks untouched">ungroup</button>`;
+  attachSelBox(head, iid);
+  head.querySelector('.gsave').onclick = () => saveGroupMeta(head, keys);
+  head.querySelector('.gdeform').onchange = (e) => setDeform(keys[0], e.target.value);  // server syncs the group
+  head.querySelector('.gungroup').onclick = () => unGroup(iid, keys.length);
+  const cols = document.createElement('div'); cols.className = 'grp-cols';
+  [['PRE', pre], ['POST', post]].forEach(([tag, members]) => {
+    const c = document.createElement('div'); c.className = 'grp-col';
+    c.innerHTML = `<div class="col-tag">${tag} (${members.length})</div>`;
+    members.forEach(([k, o]) => c.appendChild(objCard(k, o, true)));
+    if(!members.length) c.innerHTML += `<div class="col-tag">—</div>`;
+    cols.appendChild(c);
+  });
+  div.append(head, cols);
+  return div;
+}
+
+// ── grouping actions ──
+function attachSelBox(host, iid){
+  const cb = document.createElement('input');
+  cb.type = 'checkbox'; cb.className = 'selbox';
+  cb.title = 'select, then use "group selected" to merge into one physical object';
+  cb.checked = groupSel.includes(iid);
+  cb.onchange = () => { groupSel = groupSel.filter(x => x !== iid); if(cb.checked) groupSel.push(iid); updateGroupBar(); };
+  host.prepend(cb);
+}
+function updateGroupBar(){
+  const n = groupSel.length;
+  document.getElementById('groupBar').style.display = n ? '' : 'none';
+  const btn = document.getElementById('groupBtn');
+  btn.textContent = `group selected (${n}) as one object`;
+  btn.disabled = n < 2;
+}
+async function doGroup(){
+  const keys = groupSel.flatMap(iid => groupUnits[iid] || []);
+  if(keys.length < 2) return;
+  if(!confirm(`Group ${keys.length} objects as ONE physical object "${groupSel[0]}"?\n\n` +
+    'They will export as a single instance (change type derived from the whole group). ' +
+    'Masks stay untouched and each part remains editable — reversible with ungroup.')) return;
+  const d = await (await fetch('/api/group', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({keys})})).json();
+  if(d.error){ alert(d.error); return; }
+  groupSel = [];
+  refreshObjects();
+}
+async function saveGroupMeta(head, keys){
+  const instance = head.querySelector('.giid').value.trim();
+  const label = head.querySelector('.glbl').value.trim();
+  for(const k of keys){
+    const d = await (await fetch('/api/set_meta', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({id: k, instance, label})})).json();
+    if(d.error){ alert(d.error); return; }
+  }
+  refreshObjects();
+}
+async function unGroup(iid, n){
+  if(!confirm(`Ungroup "${iid}"?\n\nIts ${n} members become separate objects again (ids revert to their own; masks untouched).`)) return;
+  const d = await (await fetch('/api/ungroup', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({instance: iid})})).json();
+  if(d.error){ alert(d.error); return; }
+  refreshObjects();
 }
 function highlightReviewing(){
   document.querySelectorAll('.obj').forEach(el =>
@@ -665,6 +802,8 @@ function highlightReviewing(){
 }
 
 async function propagate(id){
+  if(!guardDone(id)) return;
+  if(!confirm('Are you sure you wish to propagate?\n\nYour manually added masks may be impacted (overwritten in place — there is no undo).')) return;
   const st = document.getElementById('st_'+id);
   st.textContent = `seeds (geometry, ${seedN > 0 ? '~'+seedN+' frames' : 'all frames'}) + SAM … this can take a minute`;
   const r = await fetch('/api/propagate', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({id})});
@@ -731,8 +870,11 @@ async function setMeta(key){
 }
 
 async function remask(key){
-  const lbl = document.getElementById('lbl_' + key).value.trim();
-  if(!lbl){ alert('type a label first (e.g. chair, table)'); return; }
+  const inp = document.getElementById('lbl_' + key);   // group members have no own input:
+  const lbl = (inp ? inp.value : (objsCache[key] || {}).label || '').trim();  // use the group label
+  if(!lbl){ alert('type a label first (e.g. chair, table)' + (inp ? '' : ' — set it in the group header and save')); return; }
+  if(!guardDone(key)) return;
+  if(!confirm(`Are you sure you wish to remask as "${lbl}"?\n\nYour manually added masks may be impacted (frames the concept matches are overwritten in place — there is no undo).`)) return;
   const st = document.getElementById('st_' + key);
   st.textContent = `remasking as "${lbl}" … concept segmentation, ~1–2 min`;
   const r = await fetch('/api/remask', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({id: key, label: lbl})});
@@ -788,6 +930,7 @@ async function cloudDiff(){
 }
 
 async function deleteObject(key){
+  if(!guardDone(key)) return;
   if(!confirm(`Delete object "${key}"?\n\nIt is removed from the annotation set and its seeds/masks are moved to .trash (recoverable on disk).`)) return;
   const r = await fetch('/api/delete_object', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({id:key})});
   if(!r.ok){ alert('delete failed: ' + (await r.json()).error); return; }

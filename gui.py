@@ -731,33 +731,114 @@ def api_set_meta():
                    reviewed=OBJECTS[key].get("reviewed", False))
 
 
+# ───────────────────────────── grouping ─────────────────────────────
+@app.route("/api/group", methods=["POST"])
+def api_group():
+    """Group 2+ objects as ONE physical object: every member gets the FIRST key's
+    instance id (e.g. a curtain annotated as left/right parts, or a moved pair plus
+    a third part). Non-destructive: on-disk dirs/masks are untouched and members
+    stay independently editable; the export merges a group into a single object.
+    Reverse with /api/ungroup."""
+    d = request.get_json()
+    keys = d.get("keys") or []
+    if len(keys) < 2:
+        return jsonify(error="select at least two objects to group"), 400
+    for k in keys:
+        if k not in OBJECTS:
+            return jsonify(error=f"unknown object {k}"), 404
+        if OBJECTS[k].get("ghost"):
+            return jsonify(error="ghost objects cannot be grouped"), 400
+    first = OBJECTS[keys[0]]
+    iid = first.get("instance") or first["id"]
+    deform = first.get("deformability", "rigid")
+    for k in keys:
+        OBJECTS[k]["instance"] = iid
+        OBJECTS[k]["deformability"] = deform   # one physical object (same sync as set_meta)
+    _save_working()
+    return jsonify(ok=True, instance=iid, n=len(keys))
+
+
+@app.route("/api/ungroup", methods=["POST"])
+def api_ungroup():
+    """Dissolve a group: every member's instance id reverts to its own object id."""
+    d = request.get_json()
+    iid = d.get("instance")
+    n = 0
+    for o in OBJECTS.values():
+        if not o.get("ghost") and (o.get("instance") or o["id"]) == iid:
+            o["instance"] = o["id"]
+            n += 1
+    if not n:
+        return jsonify(error="unknown instance"), 404
+    _save_working()
+    return jsonify(ok=True, n=n)
+
+
 # ───────────────────────────── export ─────────────────────────────
+def _composite_group_mask(iid, state, frame, paths):
+    """A group (several GUI objects = one physical object) can have 2+ members with a
+    mask on the SAME frame+state (e.g. curtain left/right parts at the seam). The
+    schema stays one mask_file per frame, so union the members' masks into a single
+    PNG under <GEOM_OUT>/_groups/ and reference that. Returns the file path, or None
+    if no member's mask was readable."""
+    acc = None
+    for p in paths:
+        m = cv2.imread(str(p), 0)
+        if m is None:
+            print(f"warn: group '{iid}' {state} {frame}: unreadable {p}, skipped", flush=True)
+            continue
+        if acc is not None and m.shape != acc.shape:
+            m = cv2.resize(m, (acc.shape[1], acc.shape[0]), interpolation=cv2.INTER_NEAREST)
+        acc = (m > 127) if acc is None else (acc | (m > 127))
+    if acc is None:
+        return None
+    od = G.out_dir(CFG["capture"], f"_groups/{iid.replace('/', '_')}/{state}")
+    fp = od / (os.path.splitext(frame.replace("/", "_"))[0] + ".png")
+    cv2.imwrite(str(fp), acc.astype(np.uint8) * 255)
+    return fp
+
+
 @app.route("/api/export", methods=["POST"])
 def api_export():
-    # merge the per-state entries of each object id (pre + post = a moved object).
+    # merge the per-state entries of each shared instance id: a moved pair, or a larger
+    # GROUP (several part-annotations of one physical object). Downstream sees ONE
+    # object per instance with ONE mask_file per frame; a frame covered by several
+    # members gets a union PNG (_composite_group_mask). mask_file paths are relative
+    # to <capture>/changes/ (same base as the change_mask block) so they resolve even
+    # when the instance id differs from its members' on-disk dir names.
     # ghost pseudo-objects (point_ghost_prototype.py ghosts) are derived output,
     # not annotations -- they never enter segments.json or the native change mask.
+    changes_root = Path(CFG["capture"]) / "changes"
     by_id = {}
     for key, o in OBJECTS.items():
         if o.get("ghost"):
             continue
-        mi_path = G.out_dir(CFG["capture"], key) / "masks_index.json"
-        state_masks = ({name: m["mask_file"] for name, m in json.load(open(mi_path)).items()}
-                       if mi_path.exists() else {})
-        iid = o.get("instance", o["id"])       # moved pair = shared instance id
+        od = G.out_dir(CFG["capture"], key)
+        mi_path = od / "masks_index.json"
+        mi = json.load(open(mi_path)) if mi_path.exists() else {}
+        iid = o.get("instance") or o["id"]     # group / moved pair = shared instance id
         e = by_id.setdefault(iid, {"label": o["label"],
-                                   "deformability": o["deformability"], "masks": {}})
+                                   "deformability": o["deformability"], "contrib": {}})
         e["label"] = o.get("label") or e["label"]          # keep a non-empty label
         e["deformability"] = o.get("deformability", e["deformability"])
-        if state_masks:
-            e["masks"][o["state"]] = state_masks
+        for name, m in mi.items():
+            e["contrib"].setdefault(o["state"], {}).setdefault(name, []).append(od / m["mask_file"])
     objects_out = {}
     for oid, e in by_id.items():
-        in_pre, in_post = "pre" in e["masks"], "post" in e["masks"]
+        masks = {}
+        for state, frames in e["contrib"].items():
+            fm = {}
+            for name, paths in frames.items():
+                fp = paths[0] if len(paths) == 1 else _composite_group_mask(oid, state, name, paths)
+                if fp is not None:
+                    fm[name] = os.path.relpath(fp, changes_root)
+            if fm:
+                masks[state] = fm
+        in_pre, in_post = "pre" in masks, "post" in masks
         objects_out[oid] = {"label": e["label"], "deformability": e["deformability"],
                             "in_pre": in_pre, "in_post": in_post,
                             "change_type": _change_type(in_pre, in_post),  # derived (spec §4a)
-                            "masks": e["masks"]}
+                            "masks": masks}
     segments = {"scene": CFG["scene"], "tier": CFG.get("tier", "instance"), "camera": "cam0",
                 "pre": CFG["states"]["pre"], "post": CFG["states"]["post"], "objects": objects_out}
     # per-frame binary change mask = union of object masks (the scored GT, spec §6/§7)
