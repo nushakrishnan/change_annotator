@@ -87,6 +87,7 @@
       &nbsp; <button onclick="propagateFix()" id="propBtn"
         title="carry THIS frame's saved mask to its temporal neighbours (SAM3 tracker, geometry-gated). Shows a preview — nothing is written until you apply.">propagate this fix</button>
       <span id="propControls" style="display:none">
+        <button onclick="propShowPreview()" title="re-show the propagation preview grid in the main view (scrubbing returns to frames)">preview</button>
         <button onclick="propApply()" id="propApplyBtn" style="background:#2a7;color:#fff">apply</button>
         <button onclick="propDiscard()">discard</button>
       </span>
@@ -320,14 +321,24 @@ async function propagateFix(){
     clearInterval(poll);
     document.getElementById('propBtn').disabled = false;
     if(j.status === 'error'){ st.textContent = 'propagate error: ' + j.error; return; }
-    if(!j.n){ st.textContent = 'nothing propagated (geometry gate stopped immediately)'; return; }
-    st.textContent = `propagated ${j.n} frames — preview in sidebar; apply?`;
-    if(j.preview) document.getElementById('res_' + reviewObj).innerHTML =
-      `<img src="${j.preview}?t=${Date.now()}" title="propagation preview — orange border = hand-fixed frame (protected)">`;
+    if(!j.n){ st.textContent = j.msg || 'nothing to fill'; return; }
+    st.textContent = `${j.anchors} anchor(s) → ${j.n} gap frames filled`
+      + (j.n_lowconf ? ` · ${j.n_lowconf} low-confidence (yellow)` : '')
+      + (j.n_legacy ? ` · ${j.n_legacy} legacy overwrites (cyan)` : '')
+      + (j.invisible ? ` · ${j.invisible} left unmasked (object not visible)` : '')
+      + ' — check the preview, then apply';
+    propPreview = j.preview ? j.preview + '?t=' + Date.now() : null;
     const ab = document.getElementById('propApplyBtn');
-    ab.textContent = j.n_hand ? `apply ${j.n} (skips ${j.n_hand} hand-fixed)` : `apply ${j.n}`;
+    ab.textContent = `apply ${j.n}`;
     document.getElementById('propControls').style.display = '';
+    propShowPreview();                                  // full-size, in the main sequence zone
   }, 1500);
+}
+let propPreview = null;
+function propShowPreview(){
+  if(!propPreview) return;
+  showMask(false); view.onload = null;                  // grid replaces the frame; scrub to return
+  view.src = propPreview;
 }
 async function propApply(){
   const r = await fetch('/api/propagate_apply', {method:'POST', headers:{'Content-Type':'application/json'},
@@ -335,6 +346,7 @@ async function propApply(){
   const d = await r.json();
   if(d.error){ alert(d.error); return; }
   document.getElementById('propControls').style.display = 'none';
+  propPreview = null;
   document.getElementById('coverInfo').textContent =
     `applied ${d.written} propagated masks` + (d.skipped_hand ? ` (${d.skipped_hand} hand-fixed kept)` : '');
   refreshObjects(); openReview(reviewObj);
@@ -343,7 +355,8 @@ async function propDiscard(){
   await fetch('/api/propagate_discard', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({job_id: propJob})});
   document.getElementById('propControls').style.display = 'none';
-  updateCoverInfo();
+  propPreview = null;
+  showReview();                                         // restore the frame view
 }
 
 async function deleteMask(skipConfirm){
@@ -721,6 +734,7 @@ function renderObjects(objs){
 // one object card; member=true renders the compact in-group variant (the group
 // header owns instance id / label / change type / deformability)
 function objCard(key, o, member){
+  const finished = !!o.done;   // done ⇒ collapse working controls; uncheck to get them back
   const div = document.createElement('div'); div.dataset.oid = key;
   div.className = 'obj' + (o.done ? ' f-done' : '') + (o.reviewed ? ' f-reviewed' : '');
   const flags = `<span class="flags">
@@ -732,21 +746,24 @@ function objCard(key, o, member){
   const masks = o.n_masks ? `<span class="pill">${o.n_masks} masks</span>` : '';
   const seeds = o.n_seeds > 1 ? `<span class="pill">${o.n_seeds} seeds</span>` : '';
   const cd = o.source === 'cloud_diff' ? '<span class="pill">cloud-diff</span>' : '';
-  const seedProp = (o.ghost || o.source === 'cloud_diff') ? '' : `
+  const seedProp = (o.ghost || o.source === 'cloud_diff' || finished) ? '' : `
     <button onclick="addSeed('${key}')" title="add the current frame as another seed view (spread-out frames → stronger propagation)">+ seed</button>
     <button onclick="propagate('${key}')">propagate</button>`;
   const iid = (o.instance || o.id);
-  const remaskBtn = o.ghost ? '' : `<button onclick="remask('${key}')"
+  const remaskBtn = (o.ghost || finished) ? '' : `<button onclick="remask('${key}')"
     title="re-segment by concept from the label — pulls in thin legs/base the click-mask drops; keeps the current mask on frames it can't match">label → remask</button>`;
-  const metaRow = member ? (remaskBtn && `<div class="row">${remaskBtn}</div>`) : (o.ghost ? '' : `
+  const metaRow = member ? (remaskBtn && `<div class="row">${remaskBtn}</div>`)
+    : (o.ghost ? '' : (finished
+      ? (o.label ? `<div class="meta">${o.label}</div>` : '')
+      : `
     <div class="row">
       <input id="iid_${key}" value="${iid.replace(/"/g, '&quot;')}" placeholder="id" style="width:76px"
         title="objects sharing the SAME id are one physical object — or select cards and use 'group selected'">
       <input id="lbl_${key}" value="${(o.label || '').replace(/"/g, '&quot;')}" placeholder="label e.g. chair" style="width:96px">
       <button onclick="setMeta('${key}')" title="save id + label">save</button>
       ${remaskBtn}
-    </div>`);
-  const deformUI = o.ghost ? o.deformability : `<select style="font-size:11px;padding:0"
+    </div>`));
+  const deformUI = (o.ghost || finished) ? o.deformability : `<select style="font-size:11px;padding:0"
       onchange="setDeform('${key}', this.value)"
       title="editable — kept in sync across the whole group">
       <option value="rigid" ${o.deformability === 'rigid' ? 'selected' : ''}>rigid</option>
@@ -757,7 +774,7 @@ function objCard(key, o, member){
   div.innerHTML = `${flags}<h4>${title} ${cd} ${seeds} ${masks}</h4>
     ${metaLine}${metaRow}${seedProp}
     <button onclick="openReview('${key}')" ${o.n_masks ? '' : 'disabled'}>review / edit</button>
-    <button onclick="deleteObject('${key}')" class="del" title="remove this object — its seeds/masks are moved to .trash (recoverable on disk)">delete</button>
+    ${finished ? '' : `<button onclick="deleteObject('${key}')" class="del" title="remove this object — its seeds/masks are moved to .trash (recoverable on disk)">delete</button>`}
     <span class="status" id="st_${key}"></span>
     <div id="res_${key}"></div>`;
   if(!member && !o.ghost) attachSelBox(div.querySelector('h4'), iid);
@@ -774,8 +791,14 @@ function groupCard(u){
   const div = document.createElement('div');
   div.className = 'grp';
   div.style.boxShadow = 'inset 4px 0 0 ' + col;
+  const allDone = u.members.every(([, o]) => o.done);   // whole group done ⇒ collapse the head too
   const head = document.createElement('div'); head.className = 'grp-head';
-  head.innerHTML = `
+  head.innerHTML = allDone ? `
+    <b style="font-size:13px">${iid.replace(/</g, '&lt;')}</b>
+    ${label ? `<span style="font-size:12px;color:#666">· ${label.replace(/</g, '&lt;')}</span>` : ''}
+    <span class="pill" style="background:${col};color:#fff" title="derived from the group: any pre + any post = moved">${first.change_type}</span>
+    <span class="pill">${pre.length} pre · ${post.length} post</span>
+    <span class="pill">${first.deformability}</span>` : `
     <input class="giid" value="${iid.replace(/"/g, '&quot;')}" style="width:86px"
       title="group id — shared by every member; the export uses it as the object id">
     <input class="glbl" value="${label.replace(/"/g, '&quot;')}" placeholder="label e.g. curtain" style="width:96px">
@@ -787,10 +810,12 @@ function groupCard(u){
       <option value="deformable" ${first.deformability === 'deformable' ? 'selected' : ''}>deformable</option>
     </select>
     <button class="gungroup" title="dissolve the group — each member's id reverts to its own; masks untouched">ungroup</button>`;
-  attachSelBox(head, iid);
-  head.querySelector('.gsave').onclick = () => saveGroupMeta(head, keys);
-  head.querySelector('.gdeform').onchange = (e) => setDeform(keys[0], e.target.value);  // server syncs the group
-  head.querySelector('.gungroup').onclick = () => unGroup(iid, keys.length);
+  if(!allDone){
+    attachSelBox(head, iid);
+    head.querySelector('.gsave').onclick = () => saveGroupMeta(head, keys);
+    head.querySelector('.gdeform').onchange = (e) => setDeform(keys[0], e.target.value);  // server syncs the group
+    head.querySelector('.gungroup').onclick = () => unGroup(iid, keys.length);
+  }
   const cols = document.createElement('div'); cols.className = 'grp-cols';
   [['PRE', pre], ['POST', post]].forEach(([tag, members]) => {
     const c = document.createElement('div'); c.className = 'grp-col';

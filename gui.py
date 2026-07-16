@@ -428,42 +428,54 @@ def _propagate_fix_job(job_id, oid, frame, window):
         od = G.out_dir(CFG["capture"], oid)
         cb = lambda s: JOBS[job_id].update(msg=s)
         cb("loading video tracker (first use takes ~1 min) …")
-        results, info = PF.propagate(CFG["capture"], od, frame, window=window, progress=cb)
+        results, flags, meta = PF.propagate(CFG["capture"], od, frame, progress=cb)
         if not results:
-            JOBS[job_id].update(status="done", n=0, n_hand=0, msg="nothing propagated")
+            JOBS[job_id].update(status="done", n=0,
+                                msg="nothing to fill (span already hand-covered?)")
             return
         mi = json.load(open(od / "masks_index.json"))
-        hand = sorted(n for n in results if mi.get(n, {}).get("src") == "hand")
-        # preview strip: up to 12 sampled frames, orange border = hand-fixed (protected)
+        # preview grid: up to 24 sampled frames; YELLOW border = low-confidence fill,
+        # CYAN = overwrites a legacy (pre-provenance) mask. Hand frames never appear.
         names = sorted(results)
-        sel = names[::max(1, len(names) // 12)][:12]
+        sel = names[::max(1, len(names) // 24)][:24]
         tiles = []
         for n in sel:
             sid = mi.get(n, mi[frame])["session"]
             bgr = cv2.imread(str(Path(CFG["capture"]) / "sessions" / sid / "raw_data" / n))
             m = results[n]
             bgr[m] = (0.45 * bgr[m] + 0.55 * np.array([0, 0, 255])).astype(np.uint8)
-            t = cv2.resize(bgr, (242, 242))
-            if n in hand:
-                cv2.rectangle(t, (0, 0), (241, 241), (0, 165, 255), 6)
+            t = cv2.resize(bgr, (330, 330))
+            f = flags.get(n, {})
+            if f.get("lowconf"):
+                cv2.rectangle(t, (0, 0), (329, 329), (0, 220, 255), 8)
+            elif f.get("legacy"):
+                cv2.rectangle(t, (0, 0), (329, 329), (255, 200, 0), 5)
+            cv2.rectangle(t, (0, 0), (330, 20), (0, 0, 0), -1)
+            cv2.putText(t, Path(n).stem[-8:] + ("  LOWCONF" if f.get("lowconf") else ""),
+                        (4, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1)
             tiles.append(t)
         while len(tiles) % 4:
-            tiles.append(np.zeros((242, 242, 3), np.uint8))
+            tiles.append(np.zeros((330, 330, 3), np.uint8))
         rows = [np.concatenate(tiles[j:j + 4], 1) for j in range(0, len(tiles), 4)]
         prev = f"prop_preview_{job_id}.png"
         cv2.imwrite(str(od / prev), np.concatenate(rows, 0))
         PROP_PENDING[job_id] = results
-        stops = [i["stopped"] for i in info if i.get("stopped")]
-        JOBS[job_id].update(status="done", n=len(results), n_hand=len(hand),
-                            hand=hand, stops=stops, preview=f"/results/{oid}/{prev}")
+        n_low = sum(1 for f in flags.values() if f.get("lowconf"))
+        n_leg = sum(1 for f in flags.values() if f.get("legacy"))
+        JOBS[job_id].update(status="done", n=len(results), n_lowconf=n_low,
+                            n_legacy=n_leg, anchors=meta["anchors"], span=meta["span"],
+                            invisible=meta.get("invisible", 0),
+                            stops=[s["stopped"] for s in meta["stops"]],
+                            preview=f"/results/{oid}/{prev}")
     except Exception as e:
         JOBS[job_id].update(status="error", error=str(e))
 
 
 @app.route("/api/propagate_apply", methods=["POST"])
 def api_propagate_apply():
-    """Write a confirmed propagation. Hand-fixed frames (src='hand') are skipped unless
-    include_hand; every overwritten mask is backed up under masks/.bak_<job>/."""
+    """Write a confirmed propagation. src='hand' frames are co-ground-truth and are
+    NEVER overwritten (results shouldn't contain them; skipped here regardless).
+    Every overwritten mask is backed up under masks/.bak_<job>/."""
     d = request.get_json()
     job_id = d["job_id"]
     results = PROP_PENDING.get(job_id)
@@ -471,7 +483,6 @@ def api_propagate_apply():
     oid = job.get("obj")
     if results is None or oid is None:
         return jsonify(error="no pending propagation for this job"), 404
-    include_hand = bool(d.get("include_hand"))
     od = G.out_dir(CFG["capture"], oid)
     mi_path = od / "masks_index.json"
     mi = json.load(open(mi_path))
@@ -479,7 +490,7 @@ def api_propagate_apply():
     written, skipped = 0, 0
     for name, mask in sorted(results.items()):
         cur = mi.get(name)
-        if cur and cur.get("src") == "hand" and not include_hand:
+        if cur and cur.get("src") == "hand":         # co-GT: immutable to propagation
             skipped += 1
             continue
         flat = name.replace("/", "_")
