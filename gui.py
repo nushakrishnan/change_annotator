@@ -38,6 +38,7 @@ from flask import Flask, jsonify, request, render_template, send_file, Response
 import change_mask as CM
 import cloud_diff_prototype as CD
 import geom_sam_prototype as G
+import propagate_fix as PF
 
 # One interpreter for every stage (defaults to the one running the GUI, i.e. the
 # single env from setup.sh). The seeds stage is shelled out only to keep its
@@ -57,7 +58,8 @@ LOCK = threading.Lock()
 PENDING = {}          # last click preview: {state, frame, points, neg, mask}
 EDIT = {}             # pending review-mode re-segment: {id, frame, session, mask}
 OBJECTS = {}          # id -> {label, change_type, deformability, state, frame, points}
-JOBS = {}             # job_id -> {status, ...}
+JOBS = {}             # job_id -> {status, ...}   (JSON-serializable ONLY: api_job jsonifies it)
+PROP_PENDING = {}     # job_id -> {frame_name: bool mask} awaiting human confirm (numpy, NOT in JOBS)
 
 
 def _png_b64(bgr):
@@ -371,7 +373,8 @@ def _remask_job(job_id, oid, label):
             flat = name.replace("/", "_")
             if chosen is not None and chosen.any():          # concept matched -> improve
                 cv2.imwrite(str(od / "masks" / flat), (chosen * 255).astype(np.uint8))
-                mi[name] = {"session": sid, "mask_file": f"masks/{flat}", "px": int(chosen.sum())}
+                mi[name] = {"session": sid, "mask_file": f"masks/{flat}",
+                            "px": int(chosen.sum()), "src": "concept"}
                 m = chosen
                 accepted += 1
             else:                                            # fallback: keep existing mask
@@ -397,6 +400,106 @@ def _remask_job(job_id, oid, label):
                             contact=f"/results/{oid}/result_contact.png")
     except Exception as e:
         JOBS[job_id].update(status="error", error=str(e))
+
+
+# ─────────────── propagate this fix (anchored tracker, preview->confirm) ───────────────
+@app.route("/api/propagate_fix", methods=["POST"])
+def api_propagate_fix():
+    """Carry the anchor frame's SAVED mask to temporal neighbours (SAM3 video tracker,
+    geometry-gated; see propagate_fix.py). Results are held for PREVIEW — nothing is
+    written until /api/propagate_apply confirms."""
+    d = request.get_json()
+    oid, frame = d["id"], d["frame"]
+    if oid not in OBJECTS:
+        return jsonify(error="unknown object"), 404
+    mi_path = G.out_dir(CFG["capture"], oid) / "masks_index.json"
+    mi = json.load(open(mi_path)) if mi_path.exists() else {}
+    if frame not in mi:
+        return jsonify(error="this frame has no saved mask — fix & save it first"), 400
+    job_id = uuid.uuid4().hex[:8]
+    JOBS[job_id] = {"status": "running", "obj": oid, "msg": "starting …"}
+    threading.Thread(target=_propagate_fix_job,
+                     args=(job_id, oid, frame, int(d.get("window", 25))), daemon=True).start()
+    return jsonify(job_id=job_id)
+
+
+def _propagate_fix_job(job_id, oid, frame, window):
+    try:
+        od = G.out_dir(CFG["capture"], oid)
+        cb = lambda s: JOBS[job_id].update(msg=s)
+        cb("loading video tracker (first use takes ~1 min) …")
+        results, info = PF.propagate(CFG["capture"], od, frame, window=window, progress=cb)
+        if not results:
+            JOBS[job_id].update(status="done", n=0, n_hand=0, msg="nothing propagated")
+            return
+        mi = json.load(open(od / "masks_index.json"))
+        hand = sorted(n for n in results if mi.get(n, {}).get("src") == "hand")
+        # preview strip: up to 12 sampled frames, orange border = hand-fixed (protected)
+        names = sorted(results)
+        sel = names[::max(1, len(names) // 12)][:12]
+        tiles = []
+        for n in sel:
+            sid = mi.get(n, mi[frame])["session"]
+            bgr = cv2.imread(str(Path(CFG["capture"]) / "sessions" / sid / "raw_data" / n))
+            m = results[n]
+            bgr[m] = (0.45 * bgr[m] + 0.55 * np.array([0, 0, 255])).astype(np.uint8)
+            t = cv2.resize(bgr, (242, 242))
+            if n in hand:
+                cv2.rectangle(t, (0, 0), (241, 241), (0, 165, 255), 6)
+            tiles.append(t)
+        while len(tiles) % 4:
+            tiles.append(np.zeros((242, 242, 3), np.uint8))
+        rows = [np.concatenate(tiles[j:j + 4], 1) for j in range(0, len(tiles), 4)]
+        prev = f"prop_preview_{job_id}.png"
+        cv2.imwrite(str(od / prev), np.concatenate(rows, 0))
+        PROP_PENDING[job_id] = results
+        stops = [i["stopped"] for i in info if i.get("stopped")]
+        JOBS[job_id].update(status="done", n=len(results), n_hand=len(hand),
+                            hand=hand, stops=stops, preview=f"/results/{oid}/{prev}")
+    except Exception as e:
+        JOBS[job_id].update(status="error", error=str(e))
+
+
+@app.route("/api/propagate_apply", methods=["POST"])
+def api_propagate_apply():
+    """Write a confirmed propagation. Hand-fixed frames (src='hand') are skipped unless
+    include_hand; every overwritten mask is backed up under masks/.bak_<job>/."""
+    d = request.get_json()
+    job_id = d["job_id"]
+    results = PROP_PENDING.get(job_id)
+    job = JOBS.get(job_id) or {}
+    oid = job.get("obj")
+    if results is None or oid is None:
+        return jsonify(error="no pending propagation for this job"), 404
+    include_hand = bool(d.get("include_hand"))
+    od = G.out_dir(CFG["capture"], oid)
+    mi_path = od / "masks_index.json"
+    mi = json.load(open(mi_path))
+    bak = od / "masks" / f".bak_{job_id}"
+    written, skipped = 0, 0
+    for name, mask in sorted(results.items()):
+        cur = mi.get(name)
+        if cur and cur.get("src") == "hand" and not include_hand:
+            skipped += 1
+            continue
+        flat = name.replace("/", "_")
+        if cur and (od / cur["mask_file"]).exists():         # backup before overwrite
+            bak.mkdir(parents=True, exist_ok=True)
+            shutil.copy(od / cur["mask_file"], bak / flat)
+        cv2.imwrite(str(od / "masks" / flat), (mask * 255).astype(np.uint8))
+        sid = cur["session"] if cur else mi[sorted(mi)[0]]["session"]
+        mi[name] = {"session": sid, "mask_file": f"masks/{flat}",
+                    "px": int(mask.sum()), "src": "prop"}
+        written += 1
+    json.dump(mi, open(mi_path, "w"), indent=1)
+    PROP_PENDING.pop(job_id, None)
+    return jsonify(ok=True, written=written, skipped_hand=skipped, n_masks=len(mi))
+
+
+@app.route("/api/propagate_discard", methods=["POST"])
+def api_propagate_discard():
+    PROP_PENDING.pop(request.get_json().get("job_id"), None)
+    return jsonify(ok=True)
 
 
 @app.route("/api/job/<job_id>")
@@ -452,7 +555,8 @@ def _perframe_inproc(objdir, default_session):
         mask = masks[0].astype(bool)
         flat = name.replace("/", "_")
         cv2.imwrite(str(masks_dir / flat), (mask * 255).astype(np.uint8))
-        mask_index[name] = {"session": sid, "mask_file": f"masks/{flat}", "px": int(mask.sum())}
+        mask_index[name] = {"session": sid, "mask_file": f"masks/{flat}",
+                            "px": int(mask.sum()), "src": "geom"}
         ov = bgr.copy()
         ov[mask] = (0.45 * ov[mask] + 0.55 * np.array([0, 0, 255])).astype(np.uint8)
         x0, y0, x1, y1 = [int(v) for v in s["box"]]
@@ -623,7 +727,9 @@ def api_save_edit():
     flat = name.replace("/", "_")
     if mask.any():
         cv2.imwrite(str(od / "masks" / flat), (mask * 255).astype(np.uint8))
-        mi[name] = {"session": sid, "mask_file": f"masks/{flat}", "px": int(mask.sum())}
+        # src="hand": human-verified — propagation must never silently overwrite these
+        mi[name] = {"session": sid, "mask_file": f"masks/{flat}",
+                    "px": int(mask.sum()), "src": "hand"}
     else:                                                # erased to empty -> drop the frame
         f = od / (m["mask_file"] if m else f"masks/{flat}")
         if f.exists():

@@ -435,7 +435,7 @@ def cmd_perframe(args):
         if args.save_masks:
             flat = name.replace("/", "_")
             cv2.imwrite(str(masks_dir / flat), (mask * 255).astype(np.uint8))
-            mask_index[name] = {"session": sid, "mask_file": f"masks/{flat}",
+            mask_index[name] = {"session": sid, "mask_file": f"masks/{flat}", "src": "geom",
                                 "px": int(mask.sum()), "box": s["box"],
                                 "n_visible": s.get("n_visible")}
         ov = bgr.copy()

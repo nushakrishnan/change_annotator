@@ -84,6 +84,12 @@
       <button onclick="jumpMasked(1)" title="next masked frame">masked ▸</button>
       &nbsp; <button onclick="startEdit()" id="editBtn" title="shortcut: x">re-segment frame (x)</button>
       <button onclick="deleteMask()" id="delBtn" title="shortcut: d">delete mask (d)</button>
+      &nbsp; <button onclick="propagateFix()" id="propBtn"
+        title="carry THIS frame's saved mask to its temporal neighbours (SAM3 tracker, geometry-gated). Shows a preview — nothing is written until you apply.">propagate this fix</button>
+      <span id="propControls" style="display:none">
+        <button onclick="propApply()" id="propApplyBtn" style="background:#2a7;color:#fff">apply</button>
+        <button onclick="propDiscard()">discard</button>
+      </span>
     </span>
   </div>
 
@@ -221,6 +227,7 @@ async function openReview(oid){
 }
 function exitReview(){
   mode = 'annotate'; reviewObj = null; editing = false;
+  document.getElementById('propControls').style.display = 'none';   // pending preview is object-scoped
   document.getElementById('annotateBar').style.display = '';
   document.getElementById('reviewBar').style.display = 'none';
   document.getElementById('annotateHint').style.display = '';
@@ -294,6 +301,51 @@ async function saveEdit(){
   frames[idx].has_mask = d.px > 0; frames[idx].px = d.px;
   editing = false; setEditUI(false); refreshObjects(); showReview();
 }
+// ── propagate this fix: anchor = current frame's saved mask; preview -> confirm ──
+let propJob = null;
+async function propagateFix(){
+  const f = frames[idx];
+  if(!f.has_mask){ alert('this frame has no saved mask to propagate — fix & save it first'); return; }
+  const st = document.getElementById('coverInfo');
+  document.getElementById('propBtn').disabled = true;
+  document.getElementById('propControls').style.display = 'none';
+  const r = await fetch('/api/propagate_fix', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({id: reviewObj, frame: f.name})});
+  const d = await r.json();
+  if(d.error){ alert(d.error); document.getElementById('propBtn').disabled = false; return; }
+  propJob = d.job_id;
+  const poll = setInterval(async () => {
+    const j = await (await fetch('/api/job/' + propJob)).json();
+    if(j.status === 'running'){ st.textContent = j.msg || 'propagating …'; return; }
+    clearInterval(poll);
+    document.getElementById('propBtn').disabled = false;
+    if(j.status === 'error'){ st.textContent = 'propagate error: ' + j.error; return; }
+    if(!j.n){ st.textContent = 'nothing propagated (geometry gate stopped immediately)'; return; }
+    st.textContent = `propagated ${j.n} frames — preview in sidebar; apply?`;
+    if(j.preview) document.getElementById('res_' + reviewObj).innerHTML =
+      `<img src="${j.preview}?t=${Date.now()}" title="propagation preview — orange border = hand-fixed frame (protected)">`;
+    const ab = document.getElementById('propApplyBtn');
+    ab.textContent = j.n_hand ? `apply ${j.n} (skips ${j.n_hand} hand-fixed)` : `apply ${j.n}`;
+    document.getElementById('propControls').style.display = '';
+  }, 1500);
+}
+async function propApply(){
+  const r = await fetch('/api/propagate_apply', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({job_id: propJob})});
+  const d = await r.json();
+  if(d.error){ alert(d.error); return; }
+  document.getElementById('propControls').style.display = 'none';
+  document.getElementById('coverInfo').textContent =
+    `applied ${d.written} propagated masks` + (d.skipped_hand ? ` (${d.skipped_hand} hand-fixed kept)` : '');
+  refreshObjects(); openReview(reviewObj);
+}
+async function propDiscard(){
+  await fetch('/api/propagate_discard', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({job_id: propJob})});
+  document.getElementById('propControls').style.display = 'none';
+  updateCoverInfo();
+}
+
 async function deleteMask(skipConfirm){
   const f = frames[idx];
   if(!f.has_mask) return;
