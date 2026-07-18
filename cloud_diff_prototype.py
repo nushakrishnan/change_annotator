@@ -240,6 +240,9 @@ def propose(capture, states, bridge_path, *, tau=0.10, voxel=0.02, eps=0.10,
         key = f"{c['id']}__{c['state']}"
         od = G.out_dir(capture, key)                         # respects GEOM_OUT
         json.dump(c["seeds"], open(od / "seeds.json", "w"), indent=1)
+        # persist the raw-cloud cluster: the dense on-object geometry the seeds'
+        # centroid+box throws away — powers the GUI "geom mask" silhouette
+        np.save(od / "cluster.npy", c["pts"].astype(np.float32))
         entry = {"id": c["id"], "label": "", "deformability": "rigid",
                  "state": c["state"], "frame": next(iter(c["seeds"])),
                  "points": [], "seed_frames": [], "source": "cloud_diff"}

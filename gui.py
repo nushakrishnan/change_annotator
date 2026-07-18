@@ -60,6 +60,8 @@ EDIT = {}             # pending review-mode re-segment: {id, frame, session, mas
 OBJECTS = {}          # id -> {label, change_type, deformability, state, frame, points}
 JOBS = {}             # job_id -> {status, ...}   (JSON-serializable ONLY: api_job jsonifies it)
 PROP_PENDING = {}     # job_id -> {frame_name: bool mask} awaiting human confirm (numpy, NOT in JOBS)
+PROP_FLAGS = {}       # job_id -> {frame_name: {"lowconf","legacy"}} for the pending review UI
+GEOM_CTX = {}         # state -> (capo, sess, renderer) cache for the geom-mask button
 
 
 def _png_b64(bgr):
@@ -416,19 +418,22 @@ def api_propagate_fix():
     mi = json.load(open(mi_path)) if mi_path.exists() else {}
     if frame not in mi:
         return jsonify(error="this frame has no saved mask — fix & save it first"), 400
+    mode = d.get("mode", "forward")                  # forward = never write behind the click
     job_id = uuid.uuid4().hex[:8]
-    JOBS[job_id] = {"status": "running", "obj": oid, "msg": "starting …"}
+    JOBS[job_id] = {"status": "running", "obj": oid, "msg": "starting …", "mode": mode}
     threading.Thread(target=_propagate_fix_job,
-                     args=(job_id, oid, frame, int(d.get("window", 25))), daemon=True).start()
+                     args=(job_id, oid, frame, mode), daemon=True).start()
     return jsonify(job_id=job_id)
 
 
-def _propagate_fix_job(job_id, oid, frame, window):
+def _propagate_fix_job(job_id, oid, frame, mode):
     try:
         od = G.out_dir(CFG["capture"], oid)
         cb = lambda s: JOBS[job_id].update(msg=s)
         cb("loading video tracker (first use takes ~1 min) …")
-        results, flags, meta = PF.propagate(CFG["capture"], od, frame, progress=cb)
+        results, flags, meta = PF.propagate(
+            CFG["capture"], od, frame, mode=mode,
+            frontier_name=OBJECTS[oid].get("verified_until"), progress=cb)
         if not results:
             JOBS[job_id].update(status="done", n=0,
                                 msg="nothing to fill (span already hand-covered?)")
@@ -460,6 +465,7 @@ def _propagate_fix_job(job_id, oid, frame, window):
         prev = f"prop_preview_{job_id}.png"
         cv2.imwrite(str(od / prev), np.concatenate(rows, 0))
         PROP_PENDING[job_id] = results
+        PROP_FLAGS[job_id] = flags
         n_low = sum(1 for f in flags.values() if f.get("lowconf"))
         n_leg = sum(1 for f in flags.values() if f.get("legacy"))
         JOBS[job_id].update(status="done", n=len(results), n_lowconf=n_low,
@@ -469,6 +475,45 @@ def _propagate_fix_job(job_id, oid, frame, window):
                             preview=f"/results/{oid}/{prev}")
     except Exception as e:
         JOBS[job_id].update(status="error", error=str(e))
+
+
+@app.route("/api/prop_frames")
+def api_prop_frames():
+    """Pending-review support: which frames a propagation proposes, with flags —
+    drives the maskmap colouring and per-frame veto in the GUI."""
+    job_id = request.args["job_id"]
+    results = PROP_PENDING.get(job_id)
+    if results is None:
+        return jsonify(error="no pending propagation"), 404
+    flags = PROP_FLAGS.get(job_id, {})
+    return jsonify(frames=[{"name": n, **flags.get(n, {})} for n in sorted(results)])
+
+
+@app.route("/api/prop_overlay")
+def api_prop_overlay():
+    """Pending-review frame: PROPOSED mask as red fill, CURRENT stored mask as a
+    green contour — one glance answers 'is the proposal better than what's there'."""
+    job_id, name = request.args["job_id"], request.args["name"]
+    results = PROP_PENDING.get(job_id)
+    job = JOBS.get(job_id) or {}
+    oid = job.get("obj")
+    if results is None or name not in results or oid is None:
+        return jsonify(error="no pending mask for this frame"), 404
+    od, _, _, cur = _mask_entry(oid, name)
+    sid = cur["session"] if cur else CFG["states"][OBJECTS[oid]["state"]]["session"]
+    bgr = cv2.imread(str(Path(CFG["capture"]) / "sessions" / sid / "raw_data" / name))
+    if bgr is None:
+        return jsonify(error="frame not found"), 404
+    m = results[name]
+    bgr[m] = (0.45 * bgr[m] + 0.55 * np.array([0, 0, 255])).astype(np.uint8)
+    if cur:
+        prev = cv2.imread(str(od / cur["mask_file"]), 0)
+        if prev is not None:
+            cnts, _ = cv2.findContours((prev > 127).astype(np.uint8),
+                                       cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(bgr, cnts, -1, (0, 255, 0), 3)
+    ok, buf = cv2.imencode(".jpg", bgr)
+    return Response(buf.tobytes(), mimetype="image/jpeg")
 
 
 @app.route("/api/propagate_apply", methods=["POST"])
@@ -483,6 +528,7 @@ def api_propagate_apply():
     oid = job.get("obj")
     if results is None or oid is None:
         return jsonify(error="no pending propagation for this job"), 404
+    exclude = set(d.get("exclude") or [])            # per-frame vetoes from pending review
     od = G.out_dir(CFG["capture"], oid)
     mi_path = od / "masks_index.json"
     mi = json.load(open(mi_path))
@@ -490,7 +536,7 @@ def api_propagate_apply():
     written, skipped = 0, 0
     for name, mask in sorted(results.items()):
         cur = mi.get(name)
-        if cur and cur.get("src") == "hand":         # co-GT: immutable to propagation
+        if name in exclude or (cur and cur.get("src") == "hand"):  # veto / co-GT
             skipped += 1
             continue
         flat = name.replace("/", "_")
@@ -504,13 +550,67 @@ def api_propagate_apply():
         written += 1
     json.dump(mi, open(mi_path, "w"), indent=1)
     PROP_PENDING.pop(job_id, None)
+    PROP_FLAGS.pop(job_id, None)
     return jsonify(ok=True, written=written, skipped_hand=skipped, n_masks=len(mi))
 
 
 @app.route("/api/propagate_discard", methods=["POST"])
 def api_propagate_discard():
-    PROP_PENDING.pop(request.get_json().get("job_id"), None)
+    jid = request.get_json().get("job_id")
+    PROP_PENDING.pop(jid, None)
+    PROP_FLAGS.pop(jid, None)
     return jsonify(ok=True)
+
+
+# ───────────────── geom mask (dense lidar-cluster silhouette) ─────────────────
+@app.route("/api/geom_mask", methods=["POST"])
+def api_geom_mask():
+    """Project the object's raw-cloud diff cluster into the frame -> dense
+    silhouette as a starting mask. For objects where visual cues offer no hint
+    (curtain vs wall, thin desk vs clutter) the lidar silhouette needs none.
+    Measured on the dlab desk: ~2x the signal of the mesh-lift path."""
+    d = request.get_json()
+    oid, name = d["id"], d["frame"]
+    if oid not in OBJECTS:
+        return jsonify(error="unknown object"), 404
+    od = G.out_dir(CFG["capture"], oid)
+    cpath = od / "cluster.npy"
+    if not cpath.exists():
+        return jsonify(error="no 3D cluster stored for this object (created by "
+                             "detect-changes runs from now on)"), 404
+    state = OBJECTS[oid]["state"]
+    if state not in GEOM_CTX:
+        from scantools.proc.rendering import Renderer
+        from scantools.utils.io import read_mesh
+        st = CFG["states"][state]
+        capo, sess = G._session(CFG["capture"], st["session"], st["ref"])
+        mesh = capo.proc_path(st["ref"]) / capo.sessions[st["ref"]].proc.meshes["mesh"]
+        GEOM_CTX[state] = (capo, sess, Renderer(read_mesh(mesh)))
+    from scantools.utils.geometry import project, sample_depth
+    capo, sess, renderer = GEOM_CTX[state]
+    key = next((k for k in sess.images.key_pairs()
+                if str(sess.images[k[0], k[1]]) == name), None)
+    if key is None:
+        return jsonify(error="frame not in this state's session"), 404
+    cam = sess.sensors[key[1]]
+    T = sess.get_pose(key[0], key[1])
+    P = np.load(cpath)
+    p2d, z, vis = project(P, cam, pose=T.inverse())
+    if not vis.any():
+        return jsonify(error="cluster not visible in this frame"), 400
+    cam_s, sx, sy = G._scaled_camera(cam, 0.5)
+    _, depth = renderer.render_from_capture(T, cam_s)
+    occ_z, occ_ok = sample_depth(p2d[vis] * np.array([sx, sy]), depth)
+    pv = p2d[vis][occ_ok & (z[vis] <= occ_z + 0.05)]
+    if len(pv) < 10:
+        return jsonify(error="cluster occluded in this frame"), 400
+    H, W = cam.height, cam.width
+    sil = np.zeros((H, W), np.uint8)
+    for x, y in pv:
+        if 0 <= int(x) < W and 0 <= int(y) < H:
+            cv2.circle(sil, (int(x), int(y)), 9, 255, -1)
+    sil = cv2.morphologyEx(sil, cv2.MORPH_CLOSE, np.ones((31, 31), np.uint8)) > 0
+    return jsonify(mask=_mask_png_b64(sil), px=int(sil.sum()), pts=int(len(pv)))
 
 
 @app.route("/api/job/<job_id>")
@@ -842,6 +942,10 @@ def api_set_meta():
     for flag in ("done", "reviewed"):
         if flag in d:
             OBJECTS[key][flag] = bool(d[flag])
+    # verified frontier: "confirmed up to here" — frames at/behind it are co-GT
+    # (scrub-approved) and are never touched by propagation.
+    if "verified_until" in d:
+        OBJECTS[key]["verified_until"] = d.get("verified_until") or None
     _save_working()
     return jsonify(ok=True, instance=OBJECTS[key].get("instance"),
                    done=OBJECTS[key].get("done", False),

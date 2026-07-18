@@ -75,6 +75,7 @@
     <b id="reviewName"></b>
     <span id="editControls" style="display:none">
       &nbsp;|&nbsp; <span class="status">click the object to re-segment this frame</span>
+      <button onclick="geomMask()" title="drop the object's lidar-cluster silhouette in as the starting mask — needs no visual cues; refine with line/fill/smart brush then save">geom mask</button>
       <button onclick="saveEdit()">save mask</button>
       <button onclick="cancelEdit()">cancel</button>
     </span>
@@ -84,10 +85,13 @@
       <button onclick="jumpMasked(1)" title="next masked frame">masked ▸</button>
       &nbsp; <button onclick="startEdit()" id="editBtn" title="shortcut: x">re-segment frame (x)</button>
       <button onclick="deleteMask()" id="delBtn" title="shortcut: d">delete mask (d)</button>
-      &nbsp; <button onclick="propagateFix()" id="propBtn"
-        title="carry THIS frame's saved mask to its temporal neighbours (SAM3 tracker, geometry-gated). Shows a preview — nothing is written until you apply.">propagate this fix</button>
+      &nbsp; <button onclick="setFrontier()" title="mark everything up to THIS frame as confirmed (green-lit): propagation will never touch frames at or before it, and its mask becomes an approved anchor">✓ good up to here</button>
+      <button onclick="propagateFix()" id="propBtn"
+        title="fill gaps FORWARD from this frame's saved mask (hand anchors + frontier are immutable posts). Tick 'whole span' to fill backward too — first-pass bootstrap only.">propagate this fix</button>
+      <label style="font-size:12px" title="also fill frames BEFORE the clicked one (whole visible span). Default off: your green-lit past stays untouched."><input type="checkbox" id="propSpanChk"> whole span</label>
       <span id="propControls" style="display:none">
-        <button onclick="propShowPreview()" title="re-show the propagation preview grid in the main view (scrubbing returns to frames)">preview</button>
+        <button onclick="propShowPreview()" title="show the sampled preview grid; scrubbing returns to frames">grid</button>
+        <button onclick="toggleVeto()" title="shortcut: v — exclude/include the current frame from this propagation">veto (v)</button>
         <button onclick="propApply()" id="propApplyBtn" style="background:#2a7;color:#fff">apply</button>
         <button onclick="propDiscard()">discard</button>
       </span>
@@ -182,6 +186,7 @@ const maskCtx = maskCanvas.getContext('2d');
 let tool = 'point', brushSize = 40, reviewState = 'pre', gesture = null, lastPt = null;
 let smartPos = [], smartNeg = [], smartNegStroke = false;   // smart-brush scribble points
 let lineStart = null;                                       // line tool: previous clicked point
+let reviewFrontier = null;                                  // "confirmed up to here" frame name
 let undoStack = [];        // canvas snapshots for ctrl-z (one per brush stroke / SAM apply)
 
 function curState(){ return document.querySelector('input[name=state]:checked').value; }
@@ -215,6 +220,8 @@ async function openReview(oid){
   if(d.error){ alert(d.error); return; }
   if(!d.count){ alert('no frames found for this object\'s session'); return; }
   mode = 'review'; reviewObj = oid; frames = d.frames; editing = false; reviewState = d.state;
+  if(pendingObj && pendingObj !== oid) clearPending();          // pending is object-scoped
+  reviewFrontier = (objsCache[oid] || {}).verified_until || null;
   const first = frames.findIndex(f => f.has_mask);   // land on the propagated region
   idx = first >= 0 ? first : 0;
   document.getElementById('annotateBar').style.display = 'none';
@@ -240,10 +247,19 @@ function showReview(){
   pos = []; neg = [];
   showMask(false); view.onload = null;
   const f = frames[idx];
-  view.src = '/api/overlay?id=' + encodeURIComponent(reviewObj) +
-             '&name=' + encodeURIComponent(f.name) + '&t=' + Date.now();
+  if(pendingMap && pendingObj === reviewObj && pendingMap.has(f.name)){
+    // pending-review: proposed mask (red fill) vs current mask (green contour)
+    view.src = '/api/prop_overlay?job_id=' + propJob + '&name=' + encodeURIComponent(f.name) + '&t=' + Date.now();
+    const fl = pendingMap.get(f.name) || {};
+    document.getElementById('reviewName').textContent = reviewObj + '  [PENDING'
+      + (pendingVeto.has(f.name) ? ' · VETOED' : '') + (fl.lowconf ? ' · LOWCONF' : '')
+      + (fl.legacy ? ' · legacy' : '') + ']';
+  } else {
+    view.src = '/api/overlay?id=' + encodeURIComponent(reviewObj) +
+               '&name=' + encodeURIComponent(f.name) + '&t=' + Date.now();
+    document.getElementById('reviewName').textContent = reviewObj;
+  }
   document.getElementById('clickStatus').textContent = '';
-  document.getElementById('reviewName').textContent = reviewObj;
   updateLabel();
   updateCoverInfo();
   renderMaskmap();
@@ -265,9 +281,20 @@ function renderMaskmap(){
   c.style.display = 'block';
   if(c.width !== frames.length) c.width = frames.length;
   const g = c.getContext('2d');
+  const pending = pendingMap && pendingObj === reviewObj;
   for(let i = 0; i < frames.length; i++){
-    g.fillStyle = frames[i].has_mask ? '#22aa77' : '#e6e6e6';
+    const n = frames[i].name;
+    if(pending && pendingMap.has(n)){
+      g.fillStyle = pendingVeto.has(n) ? '#a3f'                          // vetoed
+        : (pendingMap.get(n).lowconf ? '#fc0' : '#39f');                 // lowconf / proposed
+    } else {
+      g.fillStyle = frames[i].has_mask ? '#22aa77' : '#e6e6e6';
+    }
     g.fillRect(i, 0, 1, c.height);
+  }
+  if(reviewFrontier){                                   // frontier tick: confirmed up to here
+    const fi = frames.findIndex(f => f.name === reviewFrontier);
+    if(fi >= 0){ g.fillStyle = '#000'; g.fillRect(fi, 0, 2, c.height); }
   }
   g.fillStyle = '#d00';
   g.fillRect(Math.min(frames.length - 1, idx), 0, 2, c.height);
@@ -310,8 +337,10 @@ async function propagateFix(){
   const st = document.getElementById('coverInfo');
   document.getElementById('propBtn').disabled = true;
   document.getElementById('propControls').style.display = 'none';
+  clearPending();
+  const mode = document.getElementById('propSpanChk').checked ? 'span' : 'forward';
   const r = await fetch('/api/propagate_fix', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({id: reviewObj, frame: f.name})});
+    body: JSON.stringify({id: reviewObj, frame: f.name, mode})});
   const d = await r.json();
   if(d.error){ alert(d.error); document.getElementById('propBtn').disabled = false; return; }
   propJob = d.job_id;
@@ -322,19 +351,39 @@ async function propagateFix(){
     document.getElementById('propBtn').disabled = false;
     if(j.status === 'error'){ st.textContent = 'propagate error: ' + j.error; return; }
     if(!j.n){ st.textContent = j.msg || 'nothing to fill'; return; }
-    st.textContent = `${j.anchors} anchor(s) → ${j.n} gap frames filled`
-      + (j.n_lowconf ? ` · ${j.n_lowconf} low-confidence (yellow)` : '')
-      + (j.n_legacy ? ` · ${j.n_legacy} legacy overwrites (cyan)` : '')
-      + (j.invisible ? ` · ${j.invisible} left unmasked (object not visible)` : '')
-      + ' — check the preview, then apply';
+    // enter pending review: scrub the proposals live (red fill = proposed,
+    // green contour = current) and veto per frame before applying
+    const pf = await (await fetch('/api/prop_frames?job_id=' + propJob)).json();
+    pendingMap = new Map((pf.frames || []).map(x => [x.name, x]));
+    pendingVeto = new Set(); pendingObj = reviewObj;
+    st.textContent = `${j.anchors} anchor(s) → ${j.n} filled`
+      + (j.n_lowconf ? ` · ${j.n_lowconf} lowconf (yellow)` : '')
+      + (j.invisible ? ` · ${j.invisible} not visible (unmasked)` : '')
+      + ' — scrub: red=proposed, green=current · v=veto · then apply';
     propPreview = j.preview ? j.preview + '?t=' + Date.now() : null;
-    const ab = document.getElementById('propApplyBtn');
-    ab.textContent = `apply ${j.n}`;
+    updateApplyLabel();
     document.getElementById('propControls').style.display = '';
-    propShowPreview();                                  // full-size, in the main sequence zone
+    const first = frames.findIndex(fr => pendingMap.has(fr.name));
+    renderMaskmap();
+    if(first >= 0) gotoIdx(first); else showReview();
   }, 1500);
 }
 let propPreview = null;
+let pendingMap = null, pendingVeto = new Set(), pendingObj = null;
+function clearPending(){ pendingMap = null; pendingVeto = new Set(); pendingObj = null; }
+function updateApplyLabel(){
+  if(!pendingMap) return;
+  const n = pendingMap.size - pendingVeto.size;
+  document.getElementById('propApplyBtn').textContent =
+    `apply ${n}` + (pendingVeto.size ? ` (−${pendingVeto.size} vetoed)` : '');
+}
+function toggleVeto(){
+  if(!pendingMap || mode !== 'review') return;
+  const n = frames[idx].name;
+  if(!pendingMap.has(n)) return;
+  pendingVeto.has(n) ? pendingVeto.delete(n) : pendingVeto.add(n);
+  updateApplyLabel(); renderMaskmap(); showReview();
+}
 function propShowPreview(){
   if(!propPreview) return;
   showMask(false); view.onload = null;                  // grid replaces the frame; scrub to return
@@ -342,21 +391,50 @@ function propShowPreview(){
 }
 async function propApply(){
   const r = await fetch('/api/propagate_apply', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({job_id: propJob})});
+    body: JSON.stringify({job_id: propJob, exclude: [...pendingVeto]})});
   const d = await r.json();
   if(d.error){ alert(d.error); return; }
   document.getElementById('propControls').style.display = 'none';
-  propPreview = null;
+  propPreview = null; clearPending();
   document.getElementById('coverInfo').textContent =
-    `applied ${d.written} propagated masks` + (d.skipped_hand ? ` (${d.skipped_hand} hand-fixed kept)` : '');
+    `applied ${d.written} propagated masks` + (d.skipped_hand ? ` (${d.skipped_hand} kept)` : '');
   refreshObjects(); openReview(reviewObj);
 }
 async function propDiscard(){
   await fetch('/api/propagate_discard', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({job_id: propJob})});
   document.getElementById('propControls').style.display = 'none';
-  propPreview = null;
-  showReview();                                         // restore the frame view
+  propPreview = null; clearPending();
+  renderMaskmap(); showReview();                        // restore the frame view
+}
+
+// frontier: everything up to the current frame is confirmed (green-lit) —
+// propagation will never touch it, and its mask becomes an approved anchor
+async function setFrontier(){
+  if(mode !== 'review') return;
+  const name = frames[idx].name;
+  const r = await fetch('/api/set_meta', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({id: reviewObj, verified_until: name})});
+  const d = await r.json();
+  if(d.error){ alert(d.error); return; }
+  reviewFrontier = name;
+  if(objsCache[reviewObj]) objsCache[reviewObj].verified_until = name;
+  document.getElementById('coverInfo').textContent = `frontier set @ frame ${idx + 1}`;
+  renderMaskmap();
+}
+
+// geom mask: lidar-cluster silhouette as the starting mask (edit mode)
+async function geomMask(){
+  if(mode !== 'review' || !editing) return;
+  const st = document.getElementById('clickStatus');
+  st.textContent = 'geom mask: projecting cluster …';
+  const r = await fetch('/api/geom_mask', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({id: reviewObj, frame: frames[idx].name})});
+  const d = await r.json();
+  if(d.error){ st.textContent = 'geom mask: ' + d.error; return; }
+  pushUndo();
+  loadMaskFromUrl(d.mask);
+  st.textContent = `geom mask: ${d.px.toLocaleString()} px from ${d.pts} lidar pts — refine, then save`;
 }
 
 async function deleteMask(skipConfirm){
@@ -416,6 +494,7 @@ document.addEventListener('keydown', (e) => {
   else if((e.key === 'a' || e.key === 'A') && mode === 'annotate'){ e.preventDefault(); addObject(); }
   else if((e.key === 'x' || e.key === 'X') && mode === 'review' && !editing){ e.preventDefault(); startEdit(); }
   else if((e.key === 'Escape' || e.key === 'Enter') && tool === 'line'){ e.preventDefault(); endLine(); document.getElementById('clickStatus').textContent = 'line finished'; }
+  else if((e.key === 'v' || e.key === 'V') && mode === 'review' && pendingMap){ e.preventDefault(); toggleVeto(); }
   else if((e.key === 'q' || e.key === 'Q') && !e.repeat){ e.preventDefault(); peek(true); }   // hold q = peek original
 });
 document.addEventListener('keyup', (e) => { if(e.key === 'q' || e.key === 'Q') peek(false); });
@@ -519,9 +598,12 @@ function evToNatural(e){
   return [(e.clientX - r.left) * (view.naturalWidth / r.width),
           (e.clientY - r.top) * (view.naturalHeight / r.height)];
 }
+function inFrame(x, y){ return x >= 0 && y >= 0 && x < view.naturalWidth && y < view.naturalHeight; }
+
 // ── smart brush: collect rough scribble points; SAM refines on release ──
 function addScribble(e){
   const [x, y] = evToNatural(e);
+  if(!inFrame(x, y)) return;                 // SAM prompts must be in-frame
   (smartNegStroke ? smartNeg : smartPos).push([x, y]);
 }
 async function refineSmart(){
@@ -552,7 +634,9 @@ function paintAt(e){
 }
 
 let down = false, moved = false, sx = 0, sy = 0, spx = 0, spy = 0;
-view.addEventListener('mousedown', (e) => {
+// listen on the VIEWPORT (not the image): a huge brush can start OUTSIDE the frame
+// and only its overlap paints — the canvas clips out-of-bounds strokes naturally
+viewport.addEventListener('mousedown', (e) => {
   if(e.button !== 0 && e.button !== 1) return;
   if(e.button === 0 && tool === 'smart' && maskEditable()){          // smart brush: collect scribble
     gesture = 'smart'; down = true; smartNegStroke = e.shiftKey; smartPos = []; smartNeg = []; addScribble(e);
@@ -628,7 +712,9 @@ function borderReach(a, W, H){
 // line tool: 1st click sets the start; each next click fills a thick straight
 // stroke (brush width) from the previous point, chaining into a polyline.
 function doLine(e){
-  const [x, y] = evToNatural(e);
+  let [x, y] = evToNatural(e);
+  x = Math.max(0, Math.min(view.naturalWidth - 1, x));    // clamp: line may be aimed off-frame
+  y = Math.max(0, Math.min(view.naturalHeight - 1, y));
   ensureMaskSize();
   if(lineStart === null){ lineStart = [x, y];
     document.getElementById('clickStatus').textContent = 'line: click the end point (chains; Esc/Enter finishes)'; return; }
@@ -645,6 +731,7 @@ async function handleClick(e){
   if(!frames.length) return;
   if(mode === 'review' && !editing) return;       // review browse = read-only
   const [x, y] = evToNatural(e);
+  if(!inFrame(x, y)) return;                      // SAM point prompts must be in-frame
   (e.shiftKey ? neg : pos).push([x, y]);
   if(pos.length === 0) return;
   const url = (mode === 'review') ? '/api/edit_click' : '/api/click';

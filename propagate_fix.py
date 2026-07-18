@@ -80,16 +80,24 @@ def _gate(m, prev, seed, iou_floor):
 
 
 def propagate(capture, obj_dir, anchor_name, iou_floor=0.2, max_span=600,
+              mode="forward", frontier_name=None,
               progress=None, tracker=None, window=None):
     """Fill the gaps between hand anchors across the object's visible span.
 
+    mode="forward" (default): propose ONLY frames AFTER the clicked frame — the
+    annotator works forward in time; frames behind them are green-lit and a
+    future fix must never flow back. mode="span" fills the whole span (opt-in
+    bootstrap). `frontier_name`, if given, marks the object's "confirmed up to
+    here" frame: frames at-or-before it are NEVER proposed in either mode, and
+    the frontier frame's own mask (whatever its src) is fed to the tracker as an
+    approved anchor.
+
     Returns (results, flags, meta):
       results = {frame_name: bool mask}  — proposals only; NEVER includes a
-                src="hand" frame;
+                src="hand" frame or a frame at/behind the frontier;
       flags   = {frame_name: {"lowconf": bool, "legacy": bool}};
-      meta    = {"anchors": int, "span": int, "stops": [...]}.
-    `anchor_name` is the clicked frame — used as the fallback single anchor when
-    the object has no hand-tagged frames yet. `window` kept for API compat.
+      meta    = {"anchors": int, "span": int, "stops": [...], "invisible": int}.
+    `window` kept for API compat.
     """
     import json
     import torch
@@ -106,6 +114,7 @@ def propagate(capture, obj_dir, anchor_name, iou_floor=0.2, max_span=600,
     names = sorted((f"images/cam0/{p.name}" for p in fdir.glob("*.jpg")),
                    key=lambda n: int(Path(n).stem))
     idx = {n: i for i, n in enumerate(names)}
+    frontier_glob = idx.get(frontier_name, -1)       # global index; -1 = no frontier
 
     # visible span = everything the object touches (seeds or masks)
     cov = sorted(idx[n] for n in (set(seeds) | set(mi)) if n in idx)
@@ -115,10 +124,23 @@ def propagate(capture, obj_dir, anchor_name, iou_floor=0.2, max_span=600,
         lo = max(lo, a_glob - max_span // 2)
         hi = min(hi, a_glob + max_span // 2)
     win = names[lo:hi + 1]
+    click_local = win.index(anchor_name)
 
     hand = {n for n in win if mi.get(n, {}).get("src") == "hand"}
-    anchors = sorted((win.index(n) for n in hand), key=int) or [win.index(anchor_name)]
-    say(f"{len(anchors)} anchor(s), span {len(win)} frames")
+    anchor_names = set(hand) | {anchor_name}
+    if frontier_name in mi and frontier_name in win:  # blessed frontier mask = anchor
+        anchor_names.add(frontier_name)
+    anchors = sorted(win.index(n) for n in anchor_names)
+
+    def _writable(i):
+        """May frame i be proposed? Not hand, not at/behind the frontier, and in
+        forward mode only frames after the clicked fix."""
+        if win[i] in hand or (lo + i) <= frontier_glob:
+            return False
+        return mode == "span" or i > click_local
+
+    say(f"{len(anchors)} anchor(s), span {len(win)} frames, mode={mode}"
+        + (f", frontier@{frontier_glob - lo}" if frontier_glob >= lo else ""))
 
     def _anchor_mask(local):
         m = cv2.imread(str(od / mi[win[local]]["mask_file"]), 0)
@@ -140,8 +162,9 @@ def propagate(capture, obj_dir, anchor_name, iou_floor=0.2, max_span=600,
             for al in anchors:
                 tr.add_new_mask(st, frame_idx=al, obj_id=1,
                                 mask=torch.from_numpy(_anchor_mask(al).astype(np.float32)))
-            for reverse, store, start in ((False, fwd, anchors[0]),
-                                          (True, bwd, anchors[-1])):
+            passes = ([(False, fwd, click_local)] if mode == "forward" else
+                      [(False, fwd, anchors[0]), (True, bwd, anchors[-1])])
+            for reverse, store, start in passes:
                 say(f"propagating {'backward' if reverse else 'forward'} "
                     f"({len(win)} frames) …")
                 for fi, _oids, _lr, vrm, _sc in tr.propagate_in_video(
@@ -169,10 +192,10 @@ def propagate(capture, obj_dir, anchor_name, iou_floor=0.2, max_span=600,
 
     def _consider(i, prev):
         """Gate frame i against `prev`. Returns (mask, geo_ok, temporal_ok), or
-        None (hand/absent), or "invisible" for a near-empty track — the object is
-        out of view there, and NO mask is the correct GT (don't propose, don't flag)."""
+        None (hand/frontier-protected/absent/out-of-mode), or "invisible" for a
+        near-empty track — object out of view, NO mask is the correct GT."""
         m = _pick(i)
-        if m is None or win[i] in hand:
+        if m is None or not _writable(i):
             return None
         if m.sum() < 200:
             return "invisible"
