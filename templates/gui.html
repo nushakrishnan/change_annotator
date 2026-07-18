@@ -76,14 +76,14 @@
     <span id="editControls" style="display:none">
       &nbsp;|&nbsp; <span class="status">click the object to re-segment this frame</span>
       <button onclick="geomMask()" title="geom+SAM: project the object's lidar cluster, then SAM snaps it to the image edge — recovers legs/parts RGB drops (shadows/exposure). Refuses when the geometry is too sparse in this view.">geom mask</button>
-      <button onclick="saveEdit()">save mask</button>
+      <button onclick="saveEdit()" title="shortcut: z">save mask (z)</button>
       <button onclick="cancelEdit()">cancel</button>
     </span>
     <span id="reviewControls">
       &nbsp;|&nbsp; <span class="status" id="coverInfo"></span>
       <button onclick="jumpMasked(-1)" title="previous masked frame">◂ masked</button>
       <button onclick="jumpMasked(1)" title="next masked frame">masked ▸</button>
-      &nbsp; <button onclick="startEdit()" id="editBtn" title="shortcut: x">re-segment frame (x)</button>
+      &nbsp; <button onclick="startEdit()" id="editBtn" title="shortcut: x or z">re-segment frame (x/z)</button>
       <button onclick="deleteMask()" id="delBtn" title="shortcut: d">delete mask (d)</button>
       &nbsp; <button onclick="setFrontier()" title="shortcut: g — drop the second g here: frames 0…here are confirmed (green band). No machine writer (remask/propagate) touches them; this frame's mask becomes an approved anchor">g — good up to here</button>
       <button onclick="propagateFix()" id="propBtn"
@@ -525,6 +525,9 @@ document.addEventListener('keydown', (e) => {
   else if((e.key === 'd' || e.key === 'D') && mode === 'review' && !editing){ e.preventDefault(); deleteMask(true); }
   else if((e.key === 'a' || e.key === 'A') && mode === 'annotate'){ e.preventDefault(); addObject(); }
   else if((e.key === 'x' || e.key === 'X') && mode === 'review' && !editing){ e.preventDefault(); startEdit(); }
+  // plain z = the fix loop: enter edit, and once editing, save. (ctrl/cmd+z stays undo, handled above)
+  else if((e.key === 'z' || e.key === 'Z') && !e.ctrlKey && !e.metaKey && mode === 'review'){
+    e.preventDefault(); editing ? saveEdit() : startEdit(); }
   else if((e.key === 'Escape' || e.key === 'Enter') && tool === 'line'){ e.preventDefault(); endLine(); document.getElementById('clickStatus').textContent = 'line finished'; }
   else if((e.key === 'v' || e.key === 'V') && mode === 'review' && pendingMap){ e.preventDefault(); toggleVeto(); }
   else if((e.key === 'g' || e.key === 'G') && mode === 'review' && !editing){ e.preventDefault(); setFrontier(); }
