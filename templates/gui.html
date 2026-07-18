@@ -115,7 +115,7 @@
     <button class="toolbtn" data-tool="brush" onclick="setTool('brush')" title="brush: drag to paint; when a stroke closes off an area (against the existing mask or by looping on itself) the enclosed area fills automatically; ctrl-z reverts stroke+fill together">brush</button>
     <button class="toolbtn" data-tool="erase" onclick="setTool('erase')">erase</button>
     <button class="toolbtn" data-tool="smart" onclick="setTool('smart')" title="smart brush: rough scribble to INCLUDE (shift-drag to EXCLUDE); SAM refines the mask to the object edge on release">smart brush</button>
-    <button class="toolbtn" data-tool="line" onclick="setTool('line')" title="line: click the start then end of a thin part (leg/cable) to fill a straight stroke at brush width; keep clicking to chain a polyline (a segment that closes a loop auto-fills it); Esc/Enter finishes">line</button>
+    <button class="toolbtn" data-tool="line" onclick="setTool('line')" title="line: click the start then end of a thin part (leg/cable) to fill a straight stroke at brush width; keep clicking to chain a polyline; Esc/Enter finishes">line</button>
     <button class="toolbtn" data-tool="geombrush" onclick="setTool('geombrush')" title="geom brush: paint over a WRONG region — only inside your stroke the mask is replaced by the lidar-geometry(+SAM) answer; the rest stays untouched. Review→edit mode, needs a stored cluster (cloud-diff objects).">geom brush</button>
     &nbsp; size <input type="range" id="brushSize" min="3" max="250" value="40" style="vertical-align:middle" oninput="brushSize=+this.value">
   </div>
@@ -708,7 +708,7 @@ window.addEventListener('mouseup', (e) => {
   down = false;
   if(gesture === 'point' && !moved) handleClick(e);
   if(gesture === 'smart') refineSmart();
-  if(gesture === 'line' && !moved && doLine(e)) autoFillEnclosed();  // a closing segment fills the loop
+  if(gesture === 'line' && !moved) doLine(e);         // line = stroke only, no auto-fill (brush keeps it)
   if(gesture === 'paint' && tool === 'brush') autoFillEnclosed();
   if(gesture === 'geombrush') applyGeomBrush();
   gesture = null; lastPt = null;
