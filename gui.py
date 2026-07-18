@@ -158,7 +158,10 @@ def index():
 def api_frames():
     s = CFG["states"][request.args["state"]]["session"]
     d = Path(CFG["capture"]) / "sessions" / s / "raw_data" / "images" / "cam0"
-    return jsonify(sorted(f"images/cam0/{p.name}" for p in d.glob("*.jpg")))
+    # numeric (timestamp) order — must match propagate_fix; lexical order diverges
+    # on captures with mixed-width stems (e.g. billiards_*)
+    return jsonify(sorted((f"images/cam0/{p.name}" for p in d.glob("*.jpg")),
+                          key=lambda n: int(Path(n).stem)))
 
 
 @app.route("/frame")
@@ -453,6 +456,19 @@ def api_propagate_fix():
     if frame not in mi:
         return jsonify(error="this frame has no saved mask — fix & save it first"), 400
     mode = d.get("mode", "forward")                  # forward = never write behind the click
+    # evict any prior pending preview for this object (its masks pin ~0.5GB/span)
+    # and cap total pending jobs — abandoned previews must not leak for the
+    # process lifetime.
+    for jid in [j for j in list(PROP_PENDING)
+                if (JOBS.get(j) or {}).get("obj") == oid]:
+        PROP_PENDING.pop(jid, None)
+        PROP_FLAGS.pop(jid, None)
+        JOBS.get(jid, {}).update(status="superseded")
+    while len(PROP_PENDING) > 3:                     # oldest first (dict insertion order)
+        old = next(iter(PROP_PENDING))
+        PROP_PENDING.pop(old, None)
+        PROP_FLAGS.pop(old, None)
+        JOBS.get(old, {}).update(status="superseded")
     job_id = uuid.uuid4().hex[:8]
     JOBS[job_id] = {"status": "running", "obj": oid, "msg": "starting …", "mode": mode}
     threading.Thread(target=_propagate_fix_job,
@@ -562,6 +578,11 @@ def api_propagate_apply():
     oid = job.get("obj")
     if results is None or oid is None:
         return jsonify(error="no pending propagation for this job"), 404
+    # apply-time REVALIDATION: the preview may be stale — done/frontier can have
+    # changed between preview and apply, and protection must hold at WRITE time.
+    if OBJECTS.get(oid, {}).get("done"):
+        return jsonify(error="object was marked done after this preview — uncheck done to apply"), 400
+    f_ts = G.frontier_ts(OBJECTS.get(oid, {}).get("verified_until"))
     exclude = set(d.get("exclude") or [])            # per-frame vetoes from pending review
     od = G.out_dir(CFG["capture"], oid)
     mi_path = od / "masks_index.json"
@@ -570,7 +591,8 @@ def api_propagate_apply():
     written, skipped = 0, 0
     for name, mask in sorted(results.items()):
         cur = mi.get(name)
-        if name in exclude or (cur and cur.get("src") == "hand"):  # veto / co-GT
+        if (name in exclude or (cur and cur.get("src") == "hand")
+                or int(Path(name).stem) <= f_ts):    # veto / co-GT / current frontier
             skipped += 1
             continue
         flat = name.replace("/", "_")
@@ -725,15 +747,16 @@ def _perframe_inproc(objdir, default_session):
     masks_dir = od / "masks"
     masks_dir.mkdir(exist_ok=True)
     cap = Path(CFG["capture"])
-    # start from the EXISTING index (a re-propagate must not drop entries) and
-    # protect co-GT: hand frames + frames at/behind the object's g frontier.
+    # co-GT protection + stale-entry cleanup (shared rules, see G.index_keep_protected):
+    # hand/frontier frames and non-geom work survive untouched; stale geom entries
+    # for frames no longer seeded are DROPPED so they can't reach the export.
     mi_path = od / "masks_index.json"
-    mask_index = json.load(open(mi_path)) if mi_path.exists() else {}
-    frontier = (OBJECTS.get(objdir) or {}).get("verified_until")
-    f_ts = int(Path(frontier).stem) if frontier else -1
+    old_index = json.load(open(mi_path)) if mi_path.exists() else {}
+    f_ts = G.frontier_ts((OBJECTS.get(objdir) or {}).get("verified_until"))
+    mask_index = G.index_keep_protected(old_index, set(seeds), f_ts)
     tiles = []
     for name, s in seeds.items():
-        if mask_index.get(name, {}).get("src") == "hand" or int(Path(name).stem) <= f_ts:
+        if name in mask_index:                    # protected — do not regenerate
             continue
         sid = s.get("session", default_session)
         bgr = cv2.imread(str(cap / "sessions" / sid / "raw_data" / name))
@@ -797,7 +820,8 @@ def api_object_frames():
         return jsonify(error="unknown object"), 404
     sid = CFG["states"][OBJECTS[oid]["state"]]["session"]
     fdir = Path(CFG["capture"]) / "sessions" / sid / "raw_data" / "images" / "cam0"
-    names = sorted(f"images/cam0/{p.name}" for p in fdir.glob("*.jpg"))
+    names = sorted((f"images/cam0/{p.name}" for p in fdir.glob("*.jpg")),
+                   key=lambda n: int(Path(n).stem))     # timestamp order, matches propagation
     mi_path = G.out_dir(CFG["capture"], _objdir(oid)) / "masks_index.json"
     mi = json.load(open(mi_path)) if mi_path.exists() else {}
     frames = [{"name": n, "session": mi[n]["session"] if n in mi else sid,
@@ -956,16 +980,25 @@ def api_mask_png():
 
 @app.route("/api/delete_mask", methods=["POST"])
 def api_delete_mask():
-    """Drop one frame's mask from the object (bad propagation)."""
+    """Drop one frame's mask. Co-GT frames (src=hand, or at/behind the g frontier)
+    need an explicit force=true (the GUI asks for confirmation first); every
+    deleted mask is moved to masks/.deleted/ instead of unlinked — recoverable."""
     d = request.get_json()
     oid, name = d["id"], d["frame"]
     if oid not in OBJECTS:
         return jsonify(error="unknown object"), 404
     od, mi_path, mi, m = _mask_entry(oid, name)
     if m:
+        f_ts = G.frontier_ts(OBJECTS[oid].get("verified_until"))
+        protected = m.get("src") == "hand" or int(Path(name).stem) <= f_ts
+        if protected and not d.get("force"):
+            return jsonify(error="this frame is human-verified (hand/confirmed) — "
+                                 "confirm to delete it", protected=True), 400
         f = od / m["mask_file"]
-        if f.exists():
-            f.unlink()
+        if f.exists():                               # backup, never hard-delete
+            trash = od / "masks" / ".deleted"
+            trash.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(f), str(trash / f"{f.name}.{int(time.time())}"))
         mi.pop(name, None)
         json.dump(mi, open(mi_path, "w"), indent=1)
     return jsonify(ok=True, count=len(mi))

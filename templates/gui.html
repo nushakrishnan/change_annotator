@@ -221,6 +221,10 @@ async function openReview(oid){
   if(!d.count){ alert('no frames found for this object\'s session'); return; }
   mode = 'review'; reviewObj = oid; frames = d.frames; editing = false; reviewState = d.state;
   if(pendingObj && pendingObj !== oid) clearPending();          // pending is object-scoped
+  if(pendingObj === oid && pendingMap){                         // returning to a ready preview
+    document.getElementById('propControls').style.display = '';
+    updateApplyLabel();
+  }
   reviewFrontier = (objsCache[oid] || {}).verified_until || null;
   const first = frames.findIndex(f => f.has_mask);   // land on the propagated region
   idx = first >= 0 ? first : 0;
@@ -339,38 +343,45 @@ let propJob = null;
 async function propagateFix(){
   const f = frames[idx];
   if(!f.has_mask){ alert('this frame has no saved mask to propagate — fix & save it first'); return; }
+  const obj = reviewObj;              // CAPTURE the launch object: the poll below must
+                                      // never bind results to whatever is open later
   const st = document.getElementById('coverInfo');
   document.getElementById('propBtn').disabled = true;
   document.getElementById('propControls').style.display = 'none';
   clearPending();
   const mode = document.getElementById('propSpanChk').checked ? 'span' : 'forward';
   const r = await fetch('/api/propagate_fix', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({id: reviewObj, frame: f.name, mode})});
+    body: JSON.stringify({id: obj, frame: f.name, mode})});
   const d = await r.json();
   if(d.error){ alert(d.error); document.getElementById('propBtn').disabled = false; return; }
   propJob = d.job_id;
   const poll = setInterval(async () => {
     const j = await (await fetch('/api/job/' + propJob)).json();
-    if(j.status === 'running'){ st.textContent = j.msg || 'propagating …'; return; }
+    if(j.status === 'running'){ if(reviewObj === obj) st.textContent = j.msg || 'propagating …'; return; }
     clearInterval(poll);
     document.getElementById('propBtn').disabled = false;
-    if(j.status === 'error'){ st.textContent = 'propagate error: ' + j.error; return; }
-    if(!j.n){ st.textContent = j.msg || 'nothing to fill'; return; }
+    if(j.status === 'error'){ if(reviewObj === obj) st.textContent = 'propagate error: ' + j.error; return; }
+    if(!j.n){ if(reviewObj === obj) st.textContent = j.msg || 'nothing to fill'; return; }
     // enter pending review: scrub the proposals live (red fill = proposed,
     // green contour = current) and veto per frame before applying
     const pf = await (await fetch('/api/prop_frames?job_id=' + propJob)).json();
     pendingMap = new Map((pf.frames || []).map(x => [x.name, x]));
-    pendingVeto = new Set(); pendingObj = reviewObj;
-    st.textContent = `${j.anchors} anchor(s) → ${j.n} filled`
-      + (j.n_lowconf ? ` · ${j.n_lowconf} lowconf (yellow)` : '')
-      + (j.invisible ? ` · ${j.invisible} not visible (unmasked)` : '')
-      + ' — scrub: red=proposed, green=current · v=veto · then apply';
+    pendingVeto = new Set(); pendingObj = obj;      // bound to the LAUNCH object
     propPreview = j.preview ? j.preview + '?t=' + Date.now() : null;
     updateApplyLabel();
-    document.getElementById('propControls').style.display = '';
-    const first = frames.findIndex(fr => pendingMap.has(fr.name));
-    renderMaskmap();
-    if(first >= 0) gotoIdx(first); else showReview();
+    if(reviewObj === obj){
+      st.textContent = `${j.anchors} anchor(s) → ${j.n} filled`
+        + (j.n_lowconf ? ` · ${j.n_lowconf} lowconf (yellow)` : '')
+        + (j.invisible ? ` · ${j.invisible} not visible (unmasked)` : '')
+        + ' — scrub: red=proposed, green=current · v=veto · then apply';
+      document.getElementById('propControls').style.display = '';
+      const first = frames.findIndex(fr => pendingMap.has(fr.name));
+      renderMaskmap();
+      if(first >= 0) gotoIdx(first); else showReview();
+    } else {
+      const cardSt = document.getElementById('st_' + obj);
+      if(cardSt) cardSt.textContent = 'propagation ready — open review to inspect';
+    }
   }, 1500);
 }
 let propPreview = null;
@@ -447,9 +458,15 @@ async function deleteMask(skipConfirm){
   if(!f.has_mask) return;
   if(!guardDone(reviewObj)) return;
   if(!skipConfirm && !confirm('delete mask on this frame?')) return;
-  const r = await fetch('/api/delete_mask', {method:'POST', headers:{'Content-Type':'application/json'},
+  let r = await fetch('/api/delete_mask', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({id: reviewObj, frame: f.name})});
-  const d = await r.json();
+  let d = await r.json();
+  if(d.protected){                          // hand/frontier co-GT: server demands explicit confirm
+    if(!confirm('This mask is HUMAN-VERIFIED (hand-saved or behind your g frontier).\n\nReally delete it? (a backup is kept under masks/.deleted/)')) return;
+    r = await fetch('/api/delete_mask', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({id: reviewObj, frame: f.name, force: true})});
+    d = await r.json();
+  }
   if(d.error){ alert(d.error); return; }
   frames[idx].has_mask = false; frames[idx].px = null;
   refreshObjects(); showReview();
@@ -645,6 +662,9 @@ let down = false, moved = false, sx = 0, sy = 0, spx = 0, spy = 0;
 viewport.addEventListener('mousedown', (e) => {
   if(e.button !== 0 && e.button !== 1) return;
   if(e.button === 0 && tool === 'smart' && maskEditable()){          // smart brush: collect scribble
+    if(!view.complete){ document.getElementById('clickStatus').textContent =
+      'frame still loading — smart brush would use a stale mask as prior'; return; }
+    ensureMaskSize();
     gesture = 'smart'; down = true; smartNegStroke = e.shiftKey; smartPos = []; smartNeg = []; addScribble(e);
   } else if(e.button === 0 && tool === 'line' && maskEditable()){  // click tool
     gesture = tool; down = true; moved = false; sx = e.clientX; sy = e.clientY;
@@ -1016,8 +1036,10 @@ async function setFlag(key, flag, val, el){
     body: JSON.stringify({id: key, [flag]: val})});
   const d = await r.json();
   if(d.error){ alert(d.error); refreshObjects(); return; }
-  const card = document.querySelector(`.obj[data-oid="${key}"]`);   // update in place, no re-sort
-  if(card){ card.classList.toggle('f-done', d.done); card.classList.toggle('f-reviewed', d.reviewed); }
+  // keep objsCache truthful — guardDone() and the done-collapse read it — then
+  // re-render (sort key is n_masks, unchanged by flags, so no jarring re-sort)
+  if(objsCache[key]){ objsCache[key].done = d.done; objsCache[key].reviewed = d.reviewed; }
+  renderObjects(objsCache);
 }
 
 async function setDeform(key, val){

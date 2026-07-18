@@ -254,14 +254,14 @@ The generated ghosts can be **hand-corrected in the GUI**: `point_ghost_prototyp
       "in_post": false,
       "change_type": "removed",
       "masks": {
-        "pre": {"images/cam0/<frame>.jpg": "masks/images_cam0_<frame>.jpg"}
+        "pre": {"images/cam0/<frame>.jpg": "geom_sam_out/<id>__pre/masks/images_cam0_<frame>.jpg"}
       }
     }
   }
 }
 ```
 
-`change_type` is derived from presence: `pre` only → `removed`, `post` only → `added`, both states → `moved`. Only the states an object appears in show up under `masks`. Each mask path is relative to that object's `changes/geom_sam_out/<id>__<state>/` directory and points to a binary PNG (white = object).
+`change_type` is derived from presence: `pre` only → `removed`, `post` only → `added`, both states → `moved`. Only the states an object appears in show up under `masks`. Each mask path is relative to the capture's `changes/` directory (i.e. resolve as `<capture>/changes/<path>`) and points to a binary PNG (white = object).
 
 ### Loading Masks
 

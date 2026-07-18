@@ -123,6 +123,27 @@ def _segment_refine(model, processor, img_rgb, points, labels, box, prior_mask, 
     return np.asarray(masks)[0].astype(bool)
 
 
+def index_keep_protected(old_index, seed_names, frontier_ts):
+    """Split an existing masks_index before a per-frame regeneration: returns the
+    entries that MUST survive. Kept: src='hand' frames and frames at/behind the
+    verified frontier (co-ground-truth, never regenerated), plus non-'geom'
+    entries (prop/concept/legacy) for frames no longer seeded — dropping those
+    would delete propagation/remask/hand-era work. Stale 'geom' entries for
+    frames that dropped out of the seeds ARE dropped (the geometry now says the
+    object isn't there; exporting them would corrupt GT)."""
+    keep = {}
+    for name, e in old_index.items():
+        prot = e.get("src") == "hand" or int(Path(name).stem) <= frontier_ts
+        if prot or (name not in seed_names and e.get("src") != "geom"):
+            keep[name] = e
+    return keep
+
+
+def frontier_ts(verified_until):
+    """Frontier frame name -> comparable timestamp (-1 = no frontier)."""
+    return int(Path(verified_until).stem) if verified_until else -1
+
+
 def _box_iou(a, b):
     ix0, iy0 = max(a[0], b[0]), max(a[1], b[1])
     ix1, iy1 = min(a[2], b[2]), min(a[3], b[3])
@@ -418,12 +439,25 @@ def cmd_perframe(args):
     masks_dir = od / "masks"
     if args.save_masks:
         masks_dir.mkdir(exist_ok=True)
-    mask_index = {}
+    # co-GT protection (same rules as the GUI): keep hand frames + frames at/behind
+    # the object's verified frontier + non-geom work on unseeded frames; never
+    # rebuild over them. Frontier comes from the workspace's gui_objects.json.
+    mi_path = od / "masks_index.json"
+    old_index = json.load(open(mi_path)) if mi_path.exists() else {}
+    gobj_path = out_dir(cap) / "gui_objects.json"
+    gobj = json.load(open(gobj_path)) if gobj_path.exists() else {}
+    f_ts = frontier_ts(gobj.get(args.obj, {}).get("verified_until"))
+    mask_index = index_keep_protected(old_index, set(seeds), f_ts)
+    n_prot = len(mask_index)
+    if n_prot:
+        print(f"protected (hand/frontier/non-geom): {n_prot} frames kept as-is")
 
     names = list(seeds.keys())
     h = w = None
     frames = []
     for name in names:
+        if name in mask_index:                    # protected — do not regenerate
+            continue
         s = seeds[name]
         sid = s.get("session", args.session)  # seeds may span both sessions
         rgb_path = cap / "sessions" / sid / "raw_data" / name

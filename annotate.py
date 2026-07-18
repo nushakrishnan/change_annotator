@@ -100,7 +100,11 @@ def main():
                 stage_perframe(cap, objdir)
 
             mi = json.load(open(od / "masks_index.json"))
-            per_state_masks[st] = {name: m["mask_file"] for name, m in mi.items()}
+            # changes/-relative paths (matches gui.py api_export; the old
+            # object-dir-relative form can't express grouped instances whose id
+            # differs from the on-disk dir name)
+            per_state_masks[st] = {name: f"geom_sam_out/{objdir}/{m['mask_file']}"
+                                   for name, m in mi.items()}
             present.add(st)
 
             # collect review visualizations (under the workspace, no external dir)
@@ -122,7 +126,7 @@ def main():
             "in_pre": in_pre,
             "in_post": in_post,
             "change_type": change_type,
-            # masks: {state: {frame_name: mask_file relative to geom_sam_out/<id>__<state>/}}
+            # masks: {state: {frame_name: mask path relative to <capture>/changes/}}
             "masks": per_state_masks,
         }
 

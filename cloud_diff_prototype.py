@@ -304,7 +304,9 @@ def cmd_propose(a):
     out = propose(a.capture, _states(a),
                   _bridge(a.capture, a.pre_ref, a.post_ref, a.bridge),
                   tau=a.tau, voxel=a.voxel, eps=a.eps, min_points=a.min_points,
-                  min_cluster=a.min_cluster, gate_n=a.gate_n, min_vis=a.min_vis,
+                  min_cluster=a.min_cluster,
+                  remove_floor=not a.keep_floor, floor_tol=a.floor_tol,
+                  gate_n=a.gate_n, min_vis=a.min_vis,
                   occ_scale=a.occ_scale, min_frames=a.min_frames, prefix=a.prefix,
                   progress=lambda s: print("  ·", s, flush=True))
     gp = G.out_dir(a.capture) / "gui_objects.json"
