@@ -116,6 +116,7 @@
     <button class="toolbtn" data-tool="erase" onclick="setTool('erase')">erase</button>
     <button class="toolbtn" data-tool="smart" onclick="setTool('smart')" title="smart brush: rough scribble to INCLUDE (shift-drag to EXCLUDE); SAM refines the mask to the object edge on release">smart brush</button>
     <button class="toolbtn" data-tool="line" onclick="setTool('line')" title="line: click the start then end of a thin part (leg/cable) to fill a straight stroke at brush width; keep clicking to chain a polyline (a segment that closes a loop auto-fills it); Esc/Enter finishes">line</button>
+    <button class="toolbtn" data-tool="geombrush" onclick="setTool('geombrush')" title="geom brush: paint over a WRONG region — only inside your stroke the mask is replaced by the lidar-geometry(+SAM) answer; the rest stays untouched. Review→edit mode, needs a stored cluster (cloud-diff objects).">geom brush</button>
     &nbsp; size <input type="range" id="brushSize" min="3" max="250" value="40" style="vertical-align:middle" oninput="brushSize=+this.value">
   </div>
   <div id="viewport"><img id="view" src=""><canvas id="maskCanvas"></canvas><div id="brushCursor"></div></div>
@@ -187,6 +188,8 @@ let tool = 'point', brushSize = 40, reviewState = 'pre', gesture = null, lastPt 
 let smartPos = [], smartNeg = [], smartNegStroke = false;   // smart-brush scribble points
 let lineStart = null;                                       // line tool: previous clicked point
 let reviewFrontier = null;                                  // "confirmed up to here" frame name
+let gbPts = [];                                             // geom-brush stroke points
+let geomCache = {obj: null, frame: null, img: null, mode: null};   // per-frame geom+SAM result
 let undoStack = [];        // canvas snapshots for ctrl-z (one per brush stroke / SAM apply)
 
 function curState(){ return document.querySelector('input[name=state]:checked').value; }
@@ -573,7 +576,7 @@ viewport.addEventListener('wheel', (e) => {
 // brush-size cursor preview (shows where/how big you'll paint before you click)
 viewport.addEventListener('mousemove', (e) => {
   const c = document.getElementById('brushCursor');
-  const painty = (tool === 'brush' || tool === 'erase' || tool === 'smart' || tool === 'line');
+  const painty = (tool === 'brush' || tool === 'erase' || tool === 'smart' || tool === 'line' || tool === 'geombrush');
   if(!maskEditable() || !painty){ c.style.display = 'none'; return; }
   const vr = viewport.getBoundingClientRect(), r = view.getBoundingClientRect();
   const scale = r.width / (view.naturalWidth || r.width);
@@ -581,7 +584,9 @@ viewport.addEventListener('mousemove', (e) => {
   c.style.width = d + 'px'; c.style.height = d + 'px';
   c.style.left = (e.clientX - vr.left) + 'px'; c.style.top = (e.clientY - vr.top) + 'px';
   c.style.borderColor = (tool === 'erase' || (tool === 'smart' && e.shiftKey))
-      ? 'rgba(255,80,80,.9)' : 'rgba(0,200,255,.9)';   // red = removing/exclude, cyan = adding
+      ? 'rgba(255,80,80,.9)'
+      : tool === 'geombrush' ? 'rgba(160,80,255,.9)'   // purple = geometry fix
+      : 'rgba(0,200,255,.9)';                          // red = removing/exclude, cyan = adding
   c.style.display = 'block';
 });
 viewport.addEventListener('mouseleave', () => { document.getElementById('brushCursor').style.display = 'none'; });
@@ -673,6 +678,11 @@ viewport.addEventListener('mousedown', (e) => {
       'frame still loading — smart brush would use a stale mask as prior'; return; }
     ensureMaskSize();
     gesture = 'smart'; down = true; smartNegStroke = e.shiftKey; smartPos = []; smartNeg = []; addScribble(e);
+  } else if(e.button === 0 && tool === 'geombrush' && maskEditable()){  // geom brush: local geometry fix
+    if(mode !== 'review' || !editing){ document.getElementById('clickStatus').textContent =
+      'geom brush works in review → edit mode (x), on an object with a stored cluster'; return; }
+    if(!view.complete) return;
+    gesture = 'geombrush'; down = true; ensureMaskSize(); pushUndo(); gbPts = []; gbFeedback(e);
   } else if(e.button === 0 && tool === 'line' && maskEditable()){  // click tool
     gesture = tool; down = true; moved = false; sx = e.clientX; sy = e.clientY;
   } else if(e.button === 0 && (tool === 'brush' || tool === 'erase') && maskEditable()){
@@ -687,6 +697,7 @@ window.addEventListener('mousemove', (e) => {
   if(!down) return;
   if(gesture === 'paint'){ paintAt(e); return; }
   if(gesture === 'smart'){ addScribble(e); return; }
+  if(gesture === 'geombrush'){ gbFeedback(e); return; }
   if(gesture === 'line'){ if(Math.hypot(e.clientX - sx, e.clientY - sy) > 4) moved = true; return; }
   const dx = e.clientX - sx, dy = e.clientY - sy;
   if(!moved && Math.hypot(dx, dy) > 4) moved = true;
@@ -699,8 +710,70 @@ window.addEventListener('mouseup', (e) => {
   if(gesture === 'smart') refineSmart();
   if(gesture === 'line' && !moved && doLine(e)) autoFillEnclosed();  // a closing segment fills the loop
   if(gesture === 'paint' && tool === 'brush') autoFillEnclosed();
+  if(gesture === 'geombrush') applyGeomBrush();
   gesture = null; lastPt = null;
 });
+
+// ── geom brush: live purple feedback while stroking; on release the stroked
+// region — and ONLY that region — is replaced by the geometry(+SAM) mask ──
+function gbFeedback(e){
+  const [x, y] = evToNatural(e);
+  gbPts.push([x, y]);
+  maskCtx.globalCompositeOperation = 'source-over';
+  maskCtx.strokeStyle = maskCtx.fillStyle = 'rgba(160,80,255,0.35)';
+  maskCtx.lineCap = 'round';
+  maskCtx.beginPath(); maskCtx.arc(x, y, brushSize, 0, 7); maskCtx.fill();
+  if(gbPts.length > 1){
+    const p = gbPts[gbPts.length - 2];
+    maskCtx.lineWidth = 2 * brushSize;
+    maskCtx.beginPath(); maskCtx.moveTo(p[0], p[1]); maskCtx.lineTo(x, y); maskCtx.stroke();
+  }
+}
+async function fetchGeomMask(){
+  const name = frames[idx].name;
+  if(geomCache.obj === reviewObj && geomCache.frame === name && geomCache.img) return geomCache;
+  const st = document.getElementById('clickStatus');
+  st.textContent = 'geom brush: computing geometry mask … (first use per state loads the mesh, ~1 min)';
+  let d;
+  try{
+    const r = await fetch('/api/geom_mask', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({id: reviewObj, frame: name})});
+    d = await r.json();
+  } catch(err){ st.textContent = 'geom brush: server did not answer with JSON — restart the GUI?'; return null; }
+  if(d.error){ st.textContent = 'geom brush: ' + d.error; return null; }
+  const img = new Image();
+  await new Promise(res => { img.onload = res; img.src = d.mask; });
+  geomCache = {obj: reviewObj, frame: name, img, mode: d.mode || 'geom'};
+  return geomCache;
+}
+async function applyGeomBrush(){
+  const before = undoStack[undoStack.length - 1];
+  const pts = gbPts; gbPts = [];
+  if(before && before.width === maskCanvas.width) maskCtx.putImageData(before, 0, 0);  // wipe feedback
+  if(!pts.length) return;
+  const g = await fetchGeomMask();
+  if(!g) return;                                    // error already shown; canvas restored
+  const W = maskCanvas.width, H = maskCanvas.height;
+  const rc = document.createElement('canvas'); rc.width = W; rc.height = H;   // stroke region R
+  const rg = rc.getContext('2d');
+  rg.lineCap = rg.lineJoin = 'round'; rg.strokeStyle = rg.fillStyle = '#fff'; rg.lineWidth = 2 * brushSize;
+  rg.beginPath(); rg.arc(pts[0][0], pts[0][1], brushSize, 0, 7); rg.fill();
+  for(let i = 1; i < pts.length; i++){
+    rg.beginPath(); rg.moveTo(pts[i-1][0], pts[i-1][1]); rg.lineTo(pts[i][0], pts[i][1]); rg.stroke();
+    rg.beginPath(); rg.arc(pts[i][0], pts[i][1], brushSize, 0, 7); rg.fill();
+  }
+  const tc = document.createElement('canvas'); tc.width = W; tc.height = H;   // geom ∩ R
+  const tg = tc.getContext('2d');
+  tg.drawImage(g.img, 0, 0, W, H);
+  tg.globalCompositeOperation = 'destination-in';
+  tg.drawImage(rc, 0, 0);
+  maskCtx.globalCompositeOperation = 'destination-out';   // clear R on the working mask
+  maskCtx.drawImage(rc, 0, 0);
+  maskCtx.globalCompositeOperation = 'source-over';       // paste geometry's answer into R
+  maskCtx.drawImage(tc, 0, 0);
+  document.getElementById('clickStatus').textContent =
+    `geom brush [${g.mode}]: stroked region replaced by geometry — ctrl-z reverts`;
+}
 
 // brush auto-fill: when a stroke closes off an unpainted area — against the existing
 // mask, or by looping on itself — fill that area. Compares border-reachability of
