@@ -63,6 +63,7 @@ JOBS = {}             # job_id -> {status, ...}   (JSON-serializable ONLY: api_j
 PROP_PENDING = {}     # job_id -> {frame_name: bool mask} awaiting human confirm (numpy, NOT in JOBS)
 PROP_FLAGS = {}       # job_id -> {frame_name: {"lowconf","legacy"}} for the pending review UI
 GEOM_CTX = {}         # state -> (capo, sess, renderer) cache for the geom-mask button
+GEOM_LOCK = threading.Lock()
 
 
 def _png_b64(bgr):
@@ -635,13 +636,14 @@ def api_geom_mask():
         return jsonify(error="no 3D cluster stored for this object (created by "
                              "detect-changes runs from now on)"), 404
     state = OBJECTS[oid]["state"]
-    if state not in GEOM_CTX:
-        from scantools.proc.rendering import Renderer
-        from scantools.utils.io import read_mesh
-        st = CFG["states"][state]
-        capo, sess = G._session(CFG["capture"], st["session"], st["ref"])
-        mesh = capo.proc_path(st["ref"]) / capo.sessions[st["ref"]].proc.meshes["mesh"]
-        GEOM_CTX[state] = (capo, sess, Renderer(read_mesh(mesh)))
+    with GEOM_LOCK:                                  # impatient double-clicks must not
+        if state not in GEOM_CTX:                    # build two renderers concurrently
+            from scantools.proc.rendering import Renderer
+            from scantools.utils.io import read_mesh
+            st = CFG["states"][state]
+            capo, sess = G._session(CFG["capture"], st["session"], st["ref"])
+            mesh = capo.proc_path(st["ref"]) / capo.sessions[st["ref"]].proc.meshes["mesh"]
+            GEOM_CTX[state] = (capo, sess, Renderer(read_mesh(mesh)))
     from scantools.utils.geometry import project, sample_depth
     capo, sess, renderer = GEOM_CTX[state]
     key = next((k for k in sess.images.key_pairs()

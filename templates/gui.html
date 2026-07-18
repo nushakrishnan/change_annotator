@@ -443,11 +443,18 @@ async function setFrontier(){
 async function geomMask(){
   if(mode !== 'review' || !editing) return;
   const st = document.getElementById('clickStatus');
-  st.textContent = 'geom mask: projecting cluster …';
-  const r = await fetch('/api/geom_mask', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({id: reviewObj, frame: frames[idx].name})});
-  const d = await r.json();
-  if(d.error){ st.textContent = 'geom mask: ' + d.error; return; }
+  st.textContent = 'geom mask: projecting cluster … (first use per state loads the mesh — up to ~1 min; watch this line)';
+  let d;
+  try{
+    const r = await fetch('/api/geom_mask', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({id: reviewObj, frame: frames[idx].name})});
+    d = await r.json();
+  } catch(err){
+    st.textContent = 'geom mask: server did not answer with JSON — the running GUI is probably OLD code; restart it';
+    alert('geom mask failed: the running server likely predates this feature.\nRestart the GUI (Ctrl-C, relaunch) to load the latest code.');
+    return;
+  }
+  if(d.error){ st.textContent = 'geom mask: ' + d.error; alert('geom mask: ' + d.error); return; }
   pushUndo();
   loadMaskFromUrl(d.mask);
   st.textContent = `geom mask [${d.mode || 'raw'}]: ${d.px.toLocaleString()} px from ${d.pts} lidar pts — touch up if needed, then save`;
