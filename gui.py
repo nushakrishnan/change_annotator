@@ -644,7 +644,43 @@ def api_geom_mask():
         if 0 <= int(x) < W and 0 <= int(y) < H:
             cv2.circle(sil, (int(x), int(y)), 9, 255, -1)
     sil = cv2.morphologyEx(sil, cv2.MORPH_CLOSE, np.ones((31, 31), np.uint8)) > 0
-    return jsonify(mask=_mask_png_b64(sil), px=int(sil.sum()), pts=int(len(pv)))
+    sil_px = int(sil.sum())
+    # sparsity guard (validated on the chair): when only a sliver of the cluster
+    # projects, the prior is misleading — refuse rather than produce a confident
+    # wrong mask (frame 301412 case: sil 1085px vs true mask 5929px -> IoU 0.10).
+    _, _, _, cur = _mask_entry(oid, name)
+    cur_px = cur.get("px", 0) if cur else 0
+    if sil_px < 800 or (cur_px >= 1000 and sil_px < 0.35 * cur_px):
+        return jsonify(error=f"geometry too sparse in this view (silhouette {sil_px}px"
+                             + (f" vs existing {cur_px}px" if cur_px else "")
+                             + ") — use smart brush / line here"), 400
+    # geom+SAM: seed SAM from the silhouette (mask_input + core positives + box) so
+    # it snaps to the image edge where contrast exists and keeps geometry where not
+    mode_used = "geom+SAM"
+    out = sil
+    try:
+        bgr = cv2.imread(str(Path(CFG["capture"]) / "sessions"
+                          / CFG["states"][state]["session"] / "raw_data" / name))
+        img = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        core = cv2.erode(sil.astype(np.uint8), np.ones((21, 21), np.uint8)) > 0
+        ys, xs = np.where(core if core.any() else sil)
+        sel = np.linspace(0, len(xs) - 1, 5).astype(int)
+        pos = [[float(xs[k]), float(ys[k])] for k in sel]
+        ys2, xs2 = np.where(sil)
+        box = [float(xs2.min()) - 40, float(ys2.min()) - 40,
+               float(xs2.max()) + 40, float(ys2.max()) + 40]
+        with LOCK:
+            refined = G._segment_refine(MODEL, PROC, img, pos, [1] * len(pos), box, sil)
+        clip = cv2.dilate(sil.astype(np.uint8), np.ones((61, 61), np.uint8)) > 0
+        refined = refined & clip                     # anti-runaway bound
+        if refined.sum() >= 200:
+            out = refined
+        else:
+            mode_used = "raw silhouette (SAM returned ~empty)"
+    except Exception as e:                           # SAM hiccup -> raw silhouette
+        mode_used = f"raw silhouette (refine failed: {e})"
+    return jsonify(mask=_mask_png_b64(out), px=int(out.sum()), pts=int(len(pv)),
+                   mode=mode_used)
 
 
 @app.route("/api/job/<job_id>")

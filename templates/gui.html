@@ -75,7 +75,7 @@
     <b id="reviewName"></b>
     <span id="editControls" style="display:none">
       &nbsp;|&nbsp; <span class="status">click the object to re-segment this frame</span>
-      <button onclick="geomMask()" title="drop the object's lidar-cluster silhouette in as the starting mask — needs no visual cues; refine with line/fill/smart brush then save">geom mask</button>
+      <button onclick="geomMask()" title="geom+SAM: project the object's lidar cluster, then SAM snaps it to the image edge — recovers legs/parts RGB drops (shadows/exposure). Refuses when the geometry is too sparse in this view.">geom mask</button>
       <button onclick="saveEdit()">save mask</button>
       <button onclick="cancelEdit()">cancel</button>
     </span>
@@ -439,7 +439,7 @@ async function geomMask(){
   if(d.error){ st.textContent = 'geom mask: ' + d.error; return; }
   pushUndo();
   loadMaskFromUrl(d.mask);
-  st.textContent = `geom mask: ${d.px.toLocaleString()} px from ${d.pts} lidar pts — refine, then save`;
+  st.textContent = `geom mask [${d.mode || 'raw'}]: ${d.px.toLocaleString()} px from ${d.pts} lidar pts — touch up if needed, then save`;
 }
 
 async function deleteMask(skipConfirm){
