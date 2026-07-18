@@ -85,7 +85,7 @@
       <button onclick="jumpMasked(1)" title="next masked frame">masked ▸</button>
       &nbsp; <button onclick="startEdit()" id="editBtn" title="shortcut: x">re-segment frame (x)</button>
       <button onclick="deleteMask()" id="delBtn" title="shortcut: d">delete mask (d)</button>
-      &nbsp; <button onclick="setFrontier()" title="mark everything up to THIS frame as confirmed (green-lit): propagation will never touch frames at or before it, and its mask becomes an approved anchor">✓ good up to here</button>
+      &nbsp; <button onclick="setFrontier()" title="shortcut: g — drop the second g here: frames 0…here are confirmed (green band). No machine writer (remask/propagate) touches them; this frame's mask becomes an approved anchor">g — good up to here</button>
       <button onclick="propagateFix()" id="propBtn"
         title="fill gaps FORWARD from this frame's saved mask (hand anchors + frontier are immutable posts). Tick 'whole span' to fill backward too — first-pass bootstrap only.">propagate this fix</button>
       <label style="font-size:12px" title="also fill frames BEFORE the clicked one (whole visible span). Default off: your green-lit past stays untouched."><input type="checkbox" id="propSpanChk"> whole span</label>
@@ -292,9 +292,14 @@ function renderMaskmap(){
     }
     g.fillRect(i, 0, 1, c.height);
   }
-  if(reviewFrontier){                                   // frontier tick: confirmed up to here
+  if(reviewFrontier){                    // g band: frames 0…g are confirmed (green overlay)
     const fi = frames.findIndex(f => f.name === reviewFrontier);
-    if(fi >= 0){ g.fillStyle = '#000'; g.fillRect(fi, 0, 2, c.height); }
+    if(fi >= 0){
+      g.fillStyle = 'rgba(0,150,50,0.45)';
+      g.fillRect(0, 0, fi + 1, c.height);
+      g.fillStyle = '#063';
+      g.fillRect(fi, 0, 2, c.height);    // the dropped g itself
+    }
   }
   g.fillStyle = '#d00';
   g.fillRect(Math.min(frames.length - 1, idx), 0, 2, c.height);
@@ -495,6 +500,7 @@ document.addEventListener('keydown', (e) => {
   else if((e.key === 'x' || e.key === 'X') && mode === 'review' && !editing){ e.preventDefault(); startEdit(); }
   else if((e.key === 'Escape' || e.key === 'Enter') && tool === 'line'){ e.preventDefault(); endLine(); document.getElementById('clickStatus').textContent = 'line finished'; }
   else if((e.key === 'v' || e.key === 'V') && mode === 'review' && pendingMap){ e.preventDefault(); toggleVeto(); }
+  else if((e.key === 'g' || e.key === 'G') && mode === 'review' && !editing){ e.preventDefault(); setFrontier(); }
   else if((e.key === 'q' || e.key === 'Q') && !e.repeat){ e.preventDefault(); peek(true); }   // hold q = peek original
 });
 document.addEventListener('keyup', (e) => { if(e.key === 'q' || e.key === 'Q') peek(false); });

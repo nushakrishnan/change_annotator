@@ -28,6 +28,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -269,6 +270,8 @@ def api_propagate():
                              "point_ghost_prototype.py ghosts"), 400
     if OBJECTS[oid].get("source") == "cloud_diff":
         return jsonify(error="cloud-diff proposal already has seeds -- review/edit its masks"), 400
+    if OBJECTS[oid].get("done"):
+        return jsonify(error="object is marked done — uncheck done to re-propagate"), 400
     job_id = uuid.uuid4().hex[:8]
     JOBS[job_id] = {"status": "running", "obj": oid}
     threading.Thread(target=_propagate_job, args=(job_id, oid), daemon=True).start()
@@ -283,10 +286,30 @@ def api_cloud_diff():
     object (per-cluster; link moved pairs by giving them a shared id). Background
     job — poll /api/job/<id>."""
     d = request.get_json() or {}
+    _snapshot_workspace("predetect")                 # cheap hardlink backup, keeps last 10
     job_id = uuid.uuid4().hex[:8]
     JOBS[job_id] = {"status": "running", "msg": "starting …"}
     threading.Thread(target=_cloud_diff_job, args=(job_id, d), daemon=True).start()
     return jsonify(job_id=job_id)
+
+
+def _snapshot_workspace(tag):
+    """Hardlink snapshot of the whole workspace (masks + indexes + gui_objects)
+    into <workspace>/snapshots/<stamp>_<tag>/ — near-zero disk/time. Restore with:
+    rsync -a <snapshot>/ <workspace>/ . Keeps the newest 10."""
+    root = G.out_dir(CFG["capture"])
+    if not any(p.is_dir() and "__" in p.name for p in root.iterdir()):
+        return                                        # empty workspace: nothing to back up
+    snaps = root / "snapshots"
+    dest = snaps / f"{time.strftime('%Y%m%d_%H%M%S')}_{tag}"
+    try:
+        shutil.copytree(root, dest, copy_function=os.link,
+                        ignore=shutil.ignore_patterns("snapshots", ".trash", "_review"))
+        for old in sorted(snaps.iterdir())[:-10]:     # prune beyond the newest 10
+            shutil.rmtree(old, ignore_errors=True)
+        print(f"snapshot -> {dest}", flush=True)
+    except Exception as e:                            # backup must never block work
+        print(f"warn: snapshot failed: {e}", flush=True)
 
 
 def _cloud_diff_job(job_id, opts):
@@ -342,6 +365,8 @@ def api_remask():
     oid, label = d["id"], (d.get("label") or "").strip()
     if oid not in OBJECTS:
         return jsonify(error="unknown object"), 404
+    if OBJECTS[oid].get("done"):
+        return jsonify(error="object is marked done — uncheck done to remask"), 400
     if not label:
         return jsonify(error="type a label first (e.g. chair, table)"), 400
     if not (G.out_dir(CFG["capture"], oid) / "seeds.json").exists():
@@ -363,8 +388,15 @@ def _remask_job(job_id, oid, label):
         mi = json.load(open(mi_path)) if mi_path.exists() else {}
         (od / "masks").mkdir(exist_ok=True)
         names = list(seeds.keys())
+        # co-GT protection: hand frames and everything at/behind the object's g
+        # (verified frontier) are human territory — never re-masked, not even run.
+        frontier = OBJECTS[oid].get("verified_until")
+        f_ts = int(Path(frontier).stem) if frontier else -1
         tiles, accepted, kept = [], 0, 0
         for i, name in enumerate(names, 1):
+            if mi.get(name, {}).get("src") == "hand" or int(Path(name).stem) <= f_ts:
+                kept += 1
+                continue
             s = seeds[name]
             sid, gb = s.get("session"), s["box"]
             bgr = cv2.imread(str(cap / "sessions" / sid / "raw_data" / name))
@@ -414,6 +446,8 @@ def api_propagate_fix():
     oid, frame = d["id"], d["frame"]
     if oid not in OBJECTS:
         return jsonify(error="unknown object"), 404
+    if OBJECTS[oid].get("done"):
+        return jsonify(error="object is marked done — uncheck done to propagate"), 400
     mi_path = G.out_dir(CFG["capture"], oid) / "masks_index.json"
     mi = json.load(open(mi_path)) if mi_path.exists() else {}
     if frame not in mi:
@@ -655,8 +689,16 @@ def _perframe_inproc(objdir, default_session):
     masks_dir = od / "masks"
     masks_dir.mkdir(exist_ok=True)
     cap = Path(CFG["capture"])
-    mask_index, tiles = {}, []
+    # start from the EXISTING index (a re-propagate must not drop entries) and
+    # protect co-GT: hand frames + frames at/behind the object's g frontier.
+    mi_path = od / "masks_index.json"
+    mask_index = json.load(open(mi_path)) if mi_path.exists() else {}
+    frontier = (OBJECTS.get(objdir) or {}).get("verified_until")
+    f_ts = int(Path(frontier).stem) if frontier else -1
+    tiles = []
     for name, s in seeds.items():
+        if mask_index.get(name, {}).get("src") == "hand" or int(Path(name).stem) <= f_ts:
+            continue
         sid = s.get("session", default_session)
         bgr = cv2.imread(str(cap / "sessions" / sid / "raw_data" / name))
         img = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
