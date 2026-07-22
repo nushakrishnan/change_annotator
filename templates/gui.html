@@ -116,6 +116,7 @@
     <button class="toolbtn" data-tool="erase" onclick="setTool('erase')">erase</button>
     <button class="toolbtn" data-tool="smart" onclick="setTool('smart')" title="smart brush: rough scribble to INCLUDE (shift-drag to EXCLUDE); SAM refines the mask to the object edge on release">smart brush</button>
     <button class="toolbtn" data-tool="line" onclick="setTool('line')" title="line: click the start then end of a thin part (leg/cable) to fill a straight stroke at brush width; keep clicking to chain a polyline; Esc/Enter finishes">line</button>
+    <button class="toolbtn" data-tool="linefill" onclick="setTool('linefill')" title="line fill: same as line, but when a chained segment closes a loop (on itself or against the existing mask) the enclosed area fills automatically; ctrl-z reverts segment+fill; Esc/Enter finishes">line fill</button>
     <button class="toolbtn" data-tool="geombrush" onclick="setTool('geombrush')" title="geom brush: paint over a WRONG region — only inside your stroke the mask is replaced by the lidar-geometry(+SAM) answer; the rest stays untouched. Review→edit mode, needs a stored cluster (cloud-diff objects).">geom brush</button>
     &nbsp; size <input type="range" id="brushSize" min="3" max="250" value="40" style="vertical-align:middle" oninput="brushSize=+this.value">
   </div>
@@ -528,7 +529,7 @@ document.addEventListener('keydown', (e) => {
   // plain z = the fix loop: enter edit, and once editing, save. (ctrl/cmd+z stays undo, handled above)
   else if((e.key === 'z' || e.key === 'Z') && !e.ctrlKey && !e.metaKey && mode === 'review'){
     e.preventDefault(); editing ? saveEdit() : startEdit(); }
-  else if((e.key === 'Escape' || e.key === 'Enter') && tool === 'line'){ e.preventDefault(); endLine(); document.getElementById('clickStatus').textContent = 'line finished'; }
+  else if((e.key === 'Escape' || e.key === 'Enter') && (tool === 'line' || tool === 'linefill')){ e.preventDefault(); endLine(); document.getElementById('clickStatus').textContent = 'line finished'; }
   else if((e.key === 'v' || e.key === 'V') && mode === 'review' && pendingMap){ e.preventDefault(); toggleVeto(); }
   else if((e.key === 'g' || e.key === 'G') && mode === 'review' && !editing){ e.preventDefault(); setFrontier(); }
   else if((e.key === 'q' || e.key === 'Q') && !e.repeat){ e.preventDefault(); peek(true); }   // hold q = peek original
@@ -579,7 +580,7 @@ viewport.addEventListener('wheel', (e) => {
 // brush-size cursor preview (shows where/how big you'll paint before you click)
 viewport.addEventListener('mousemove', (e) => {
   const c = document.getElementById('brushCursor');
-  const painty = (tool === 'brush' || tool === 'erase' || tool === 'smart' || tool === 'line' || tool === 'geombrush');
+  const painty = (tool === 'brush' || tool === 'erase' || tool === 'smart' || tool === 'line' || tool === 'linefill' || tool === 'geombrush');
   if(!maskEditable() || !painty){ c.style.display = 'none'; return; }
   const vr = viewport.getBoundingClientRect(), r = view.getBoundingClientRect();
   const scale = r.width / (view.naturalWidth || r.width);
@@ -686,7 +687,7 @@ viewport.addEventListener('mousedown', (e) => {
       'geom brush works in review → edit mode (x), on an object with a stored cluster'; return; }
     if(!view.complete) return;
     gesture = 'geombrush'; down = true; ensureMaskSize(); pushUndo(); gbPts = []; gbFeedback(e);
-  } else if(e.button === 0 && tool === 'line' && maskEditable()){  // click tool
+  } else if(e.button === 0 && (tool === 'line' || tool === 'linefill') && maskEditable()){  // click tools
     gesture = tool; down = true; moved = false; sx = e.clientX; sy = e.clientY;
   } else if(e.button === 0 && (tool === 'brush' || tool === 'erase') && maskEditable()){
     gesture = 'paint'; down = true; lastPt = null; ensureMaskSize(); pushUndo(); paintAt(e);
@@ -701,7 +702,7 @@ window.addEventListener('mousemove', (e) => {
   if(gesture === 'paint'){ paintAt(e); return; }
   if(gesture === 'smart'){ addScribble(e); return; }
   if(gesture === 'geombrush'){ gbFeedback(e); return; }
-  if(gesture === 'line'){ if(Math.hypot(e.clientX - sx, e.clientY - sy) > 4) moved = true; return; }
+  if(gesture === 'line' || gesture === 'linefill'){ if(Math.hypot(e.clientX - sx, e.clientY - sy) > 4) moved = true; return; }
   const dx = e.clientX - sx, dy = e.clientY - sy;
   if(!moved && Math.hypot(dx, dy) > 4) moved = true;
   if(moved){ panX = spx + dx; panY = spy + dy; applyTransform(); }
@@ -711,7 +712,8 @@ window.addEventListener('mouseup', (e) => {
   down = false;
   if(gesture === 'point' && !moved) handleClick(e);
   if(gesture === 'smart') refineSmart();
-  if(gesture === 'line' && !moved) doLine(e);         // line = stroke only, no auto-fill (brush keeps it)
+  if(gesture === 'line' && !moved) doLine(e);         // line = stroke only, no auto-fill
+  if(gesture === 'linefill' && !moved && doLine(e)) autoFillEnclosed();  // closing segment fills the loop
   if(gesture === 'paint' && tool === 'brush') autoFillEnclosed();
   if(gesture === 'geombrush') applyGeomBrush();
   gesture = null; lastPt = null;
