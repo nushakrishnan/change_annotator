@@ -83,9 +83,9 @@
       &nbsp;|&nbsp; <span class="status" id="coverInfo"></span>
       <button onclick="jumpMasked(-1)" title="previous masked frame">◂ masked</button>
       <button onclick="jumpMasked(1)" title="next masked frame">masked ▸</button>
-      &nbsp; <button onclick="startEdit()" id="editBtn" title="shortcut: x or z">re-segment frame (x/z)</button>
+      &nbsp; <button onclick="startEdit()" id="editBtn" title="shortcut: z (x also works)">re-segment frame (z)</button>
       <button onclick="deleteMask()" id="delBtn" title="shortcut: d">delete mask (d)</button>
-      &nbsp; <button onclick="setFrontier()" title="shortcut: g — drop the second g here: frames 0…here are confirmed (green band). No machine writer (remask/propagate) touches them; this frame's mask becomes an approved anchor">g — good up to here</button>
+      &nbsp; <button onclick="setFrontier()" title="shortcut: g — frames 0…here are confirmed (green band). No machine writer (remask/propagate) touches them; this frame's mask becomes an approved anchor">good up to here (g)</button>
       <button onclick="propagateFix()" id="propBtn"
         title="fill gaps FORWARD from this frame's saved mask (hand anchors + frontier are immutable posts). Tick 'whole span' to fill backward too — first-pass bootstrap only.">propagate this fix</button>
       <label style="font-size:12px" title="also fill frames BEFORE the clicked one (whole visible span). Default off: your green-lit past stays untouched."><input type="checkbox" id="propSpanChk"> whole span</label>
