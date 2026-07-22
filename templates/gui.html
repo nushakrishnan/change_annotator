@@ -49,6 +49,8 @@
   .status { font-size: 12px; color: #888; }
   .hint { font-size: 12px; color: #888; margin-top: 6px; }
   .tip { cursor: help; border-bottom: 1px dotted #999; color: #667; }
+  .ident.dirty { outline: 2px solid #e6b800; }   /* yellow = typed, not saved yet   */
+  .ident.saved { outline: 2px solid #2a7; }      /* green flash = saved to server   */
   #brushCursor { position: absolute; border: 2px solid rgba(0,200,255,.9); border-radius: 50%;
                  pointer-events: none; display: none; transform: translate(-50%,-50%); z-index: 5; }
   .pill { display:inline-block; font-size:11px; padding:1px 6px; border-radius:10px; background:#eee; color:#555; margin-left:4px; }
@@ -907,6 +909,8 @@ let groupUnits = {};   // iid -> [keys]  (rebuilt each render; drives group/ungr
 let groupSel = [];     // ordered iid selection for the 'group selected' button
 
 function renderObjects(objs){
+  const a = document.activeElement;                   // never clobber in-progress typing
+  if(a && a.classList && a.classList.contains('ident')){ renderDeferred = true; return; }
   const box = document.getElementById('objects'); box.innerHTML='';
   groupUnits = {};
   const byInst = {};
@@ -952,16 +956,16 @@ function objCard(key, o, member){
   const remaskBtn = (o.ghost || finished) ? '' : `<button onclick="remask('${key}')"
     title="re-segment by concept from the label — pulls in thin legs/base the click-mask drops; keeps the current mask on frames it can't match">label → remask</button>`;
   const metaRow = member ? (remaskBtn && `<div class="row">${remaskBtn}</div>`)
-    : (o.ghost ? '' : (finished
-      ? (o.label ? `<div class="meta">${o.label}</div>` : '')
-      : `
+    : (o.ghost ? '' : `
     <div class="row">
-      <input id="iid_${key}" value="${iid.replace(/"/g, '&quot;')}" placeholder="id" style="width:76px"
-        title="objects sharing the SAME id are one physical object — or select cards and use 'group selected'">
-      <input id="lbl_${key}" value="${(o.label || '').replace(/"/g, '&quot;')}" placeholder="label e.g. chair" style="width:96px">
-      <button onclick="setMeta('${key}')" title="save id + label">save</button>
-      ${remaskBtn}
-    </div>`));
+      <input id="iid_${key}" class="ident" value="${iid.replace(/"/g, '&quot;')}" placeholder="id" style="width:76px"
+        title="objects sharing the SAME id are one physical object — Enter or click away saves (green flash = saved)"
+        oninput="this.classList.add('dirty')" onkeydown="identKey(event)" onblur="identSave('${key}')">
+      <input id="lbl_${key}" class="ident" value="${(o.label || '').replace(/"/g, '&quot;')}" placeholder="label e.g. chair" style="width:96px"
+        title="label — Enter or click away saves (green flash = saved)"
+        oninput="this.classList.add('dirty')" onkeydown="identKey(event)" onblur="identSave('${key}')">
+      ${finished ? '' : remaskBtn}
+    </div>`);
   const deformUI = (o.ghost || finished) ? o.deformability : `<select style="font-size:11px;padding:0"
       onchange="setDeform('${key}', this.value)"
       title="editable — kept in sync across the whole group">
@@ -990,28 +994,28 @@ function groupCard(u){
   const div = document.createElement('div');
   div.className = 'grp';
   div.style.boxShadow = 'inset 4px 0 0 ' + col;
-  const allDone = u.members.every(([, o]) => o.done);   // whole group done ⇒ collapse the head too
-  const head = document.createElement('div'); head.className = 'grp-head';
-  head.innerHTML = allDone ? `
-    <b style="font-size:13px">${iid.replace(/</g, '&lt;')}</b>
-    ${label ? `<span style="font-size:12px;color:#666">· ${label.replace(/</g, '&lt;')}</span>` : ''}
+  const allDone = u.members.every(([, o]) => o.done);   // done ⇒ masks/structure locked,
+  const head = document.createElement('div'); head.className = 'grp-head';   // identity stays editable
+  head.innerHTML = `
+    <input class="giid ident" value="${iid.replace(/"/g, '&quot;')}" style="width:86px"
+      title="group id — the export's object id. Enter or click away saves to EVERY member (green flash = saved)">
+    <input class="glbl ident" value="${label.replace(/"/g, '&quot;')}" placeholder="label e.g. curtain" style="width:96px"
+      title="group label — Enter or click away saves to EVERY member (green flash = saved)">
     <span class="pill" style="background:${col};color:#fff" title="derived from the group: any pre + any post = moved">${first.change_type}</span>
-    <span class="pill">${pre.length} pre · ${post.length} post</span>
+    <span class="pill">${pre.length} pre · ${post.length} post</span>` + (allDone ? `
     <span class="pill">${first.deformability}</span>` : `
-    <input class="giid" value="${iid.replace(/"/g, '&quot;')}" style="width:86px"
-      title="group id — shared by every member; the export uses it as the object id">
-    <input class="glbl" value="${label.replace(/"/g, '&quot;')}" placeholder="label e.g. curtain" style="width:96px">
-    <button class="gsave" title="save id + label to every member">save</button>
-    <span class="pill" style="background:${col};color:#fff" title="derived from the group: any pre + any post = moved">${first.change_type}</span>
-    <span class="pill">${pre.length} pre · ${post.length} post</span>
     <select class="gdeform" style="font-size:11px;padding:0" title="one physical object — applies to every member">
       <option value="rigid" ${first.deformability === 'rigid' ? 'selected' : ''}>rigid</option>
       <option value="deformable" ${first.deformability === 'deformable' ? 'selected' : ''}>deformable</option>
     </select>
-    <button class="gungroup" title="dissolve the group — each member's id reverts to its own; masks untouched">ungroup</button>`;
+    <button class="gungroup" title="dissolve the group — each member's id reverts to its own; masks untouched">ungroup</button>`);
+  for(const el of [head.querySelector('.giid'), head.querySelector('.glbl')]){
+    el.oninput = () => el.classList.add('dirty');
+    el.onkeydown = identKey;
+    el.onblur = () => groupIdentSave(head, keys);
+  }
   if(!allDone){
     attachSelBox(head, iid);
-    head.querySelector('.gsave').onclick = () => saveGroupMeta(head, keys);
     head.querySelector('.gdeform').onchange = (e) => setDeform(keys[0], e.target.value);  // server syncs the group
     head.querySelector('.gungroup').onclick = () => unGroup(iid, keys.length);
   }
@@ -1046,24 +1050,46 @@ function updateGroupBar(){
 async function doGroup(){
   const keys = groupSel.flatMap(iid => groupUnits[iid] || []);
   if(keys.length < 2) return;
-  if(!confirm(`Group ${keys.length} objects as ONE physical object "${groupSel[0]}"?\n\n` +
-    'They will export as a single instance (change type derived from the whole group). ' +
-    'Masks stay untouched and each part remains editable — reversible with ungroup.')) return;
+  // header-only truth: resolve the group's label AT merge time — never silently
+  // inherit whichever member happens to sort first
+  const labels = [...new Set(keys.map(k => (objsCache[k] || {}).label).filter(l => l))];
+  let label = labels[0] || '';
+  if(labels.length > 1){
+    const pick = prompt(`Members have different labels: ${labels.join('  /  ')}\n\nType the label for the whole group:`, labels[0]);
+    if(pick === null) return;                         // cancelled -> abort grouping
+    label = pick.trim();
+  }
+  if(!confirm(`Group ${keys.length} objects as ONE physical object "${groupSel[0]}"`
+    + (label ? ` (label: "${label}")` : '') + `?\n\n`
+    + 'They will export as a single instance (change type derived from the whole group). '
+    + 'Masks stay untouched and each part remains editable — reversible with ungroup.')) return;
   const d = await (await fetch('/api/group', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({keys})})).json();
   if(d.error){ alert(d.error); return; }
+  for(const k of keys){                                // normalize every member's label
+    await fetch('/api/set_meta', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({id: k, label})});
+  }
   groupSel = [];
   refreshObjects();
 }
-async function saveGroupMeta(head, keys){
-  const instance = head.querySelector('.giid').value.trim();
-  const label = head.querySelector('.glbl').value.trim();
+async function groupIdentSave(head, keys){
+  const gi = head.querySelector('.giid'), gl = head.querySelector('.glbl');
+  const instance = gi.value.trim(), label = gl.value.trim();
+  const o = objsCache[keys[0]] || {};
+  if(instance === (o.instance || o.id) && label === (o.label || '')){
+    gi.classList.remove('dirty'); gl.classList.remove('dirty');
+    maybeRunDeferred(); return;                       // nothing changed
+  }
   for(const k of keys){
     const d = await (await fetch('/api/set_meta', {method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({id: k, instance, label})})).json();
-    if(d.error){ alert(d.error); return; }
+    if(d.error){ alert(d.error); refreshObjects(); return; }
+    if(objsCache[k]){ objsCache[k].instance = instance; objsCache[k].label = label; }
   }
-  refreshObjects();
+  flashSaved(gi); flashSaved(gl);
+  renderDeferred = true;                              // re-render once typing is over
+  maybeRunDeferred();
 }
 async function unGroup(iid, n){
   if(!confirm(`Ungroup "${iid}"?\n\nIts ${n} members become separate objects again (ids revert to their own; masks untouched).`)) return;
@@ -1136,21 +1162,56 @@ async function setDeform(key, val){
   refreshObjects();          // re-render so a linked pair's other half shows the synced value
 }
 
-async function setMeta(key){
-  const instance = document.getElementById('iid_' + key).value.trim();
-  const label = document.getElementById('lbl_' + key).value.trim();
-  const st = document.getElementById('st_' + key);
-  const r = await fetch('/api/set_meta', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({id: key, instance, label})});
-  const d = await r.json();
-  if(d.error){ st.textContent = 'error: ' + d.error; return; }
-  st.textContent = 'saved'; refreshObjects();
+// ── identity auto-save: Enter or click-away saves; yellow outline = unsaved
+// typing, green flash = confirmed on the server. No save buttons. ──
+let renderDeferred = false;
+function identKey(e){ if(e.key === 'Enter'){ e.preventDefault(); e.target.blur(); } }
+function flashSaved(el){
+  if(!el) return;
+  el.classList.remove('dirty'); el.classList.add('saved');
+  setTimeout(() => el.classList.remove('saved'), 900);
+}
+function maybeRunDeferred(){
+  setTimeout(() => {
+    const a = document.activeElement;
+    if(renderDeferred && !(a && a.classList && a.classList.contains('ident'))){
+      renderDeferred = false; refreshObjects();
+    }
+  }, 120);
+}
+async function identSave(key){
+  const iidEl = document.getElementById('iid_' + key);
+  const lblEl = document.getElementById('lbl_' + key);
+  if(!iidEl && !lblEl) return;
+  const o = objsCache[key] || {};
+  const instance = (iidEl ? iidEl.value : (o.instance || o.id) || '').trim();
+  const label = (lblEl ? lblEl.value : o.label || '').trim();
+  if(instance === (o.instance || o.id) && label === (o.label || '')){
+    if(iidEl) iidEl.classList.remove('dirty');
+    if(lblEl) lblEl.classList.remove('dirty');
+    maybeRunDeferred(); return;                       // nothing changed
+  }
+  if(o.done && instance !== (o.instance || o.id) && groupUnits[instance]
+     && !(groupUnits[instance] || []).includes(key)){
+    if(!confirm(`"${instance}" already names another object/group — saving would MERGE this done object into it (its change type may change). Continue?`)){
+      if(iidEl) iidEl.value = o.instance || o.id;
+      if(lblEl) lblEl.value = o.label || '';
+      return;
+    }
+  }
+  const d = await (await fetch('/api/set_meta', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({id: key, instance, label})})).json();
+  if(d.error){ alert(d.error); refreshObjects(); return; }
+  if(objsCache[key]){ objsCache[key].instance = d.instance; objsCache[key].label = label; }
+  flashSaved(iidEl); flashSaved(lblEl);
+  renderDeferred = true;                              // re-render once typing is over
+  maybeRunDeferred();
 }
 
 async function remask(key){
   const inp = document.getElementById('lbl_' + key);   // group members have no own input:
   const lbl = (inp ? inp.value : (objsCache[key] || {}).label || '').trim();  // use the group label
-  if(!lbl){ alert('type a label first (e.g. chair, table)' + (inp ? '' : ' — set it in the group header and save')); return; }
+  if(!lbl){ alert('type a label first (e.g. chair, table)' + (inp ? '' : ' — type it in the group header (Enter saves)')); return; }
   if(!guardDone(key)) return;
   if(!confirm(`Are you sure you wish to remask as "${lbl}"?\n\nYour manually added masks may be impacted (frames the concept matches are overwritten in place — there is no undo).`)) return;
   const st = document.getElementById('st_' + key);
