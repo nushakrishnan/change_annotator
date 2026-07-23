@@ -241,8 +241,6 @@ def api_add_seed():
         return jsonify(error="add the object first"), 404
     if OBJECTS[oid].get("ghost"):
         return jsonify(error="ghosts take no seeds -- edit their masks in review mode"), 400
-    if OBJECTS[oid].get("source") == "cloud_diff":
-        return jsonify(error="cloud-diff proposal -- edit its masks in review mode"), 400
     if d.get("state") and d["state"] != OBJECTS[oid]["state"]:
         return jsonify(error=f"seed must be from the {OBJECTS[oid]['state']} state"), 400
     if d.get("mask"):
@@ -272,8 +270,6 @@ def api_propagate():
     if OBJECTS[oid].get("ghost"):
         return jsonify(error="ghost masks are derived -- regenerate with "
                              "point_ghost_prototype.py ghosts"), 400
-    if OBJECTS[oid].get("source") == "cloud_diff":
-        return jsonify(error="cloud-diff proposal already has seeds -- review/edit its masks"), 400
     if OBJECTS[oid].get("done"):
         return jsonify(error="object is marked done — uncheck done to re-propagate"), 400
     job_id = uuid.uuid4().hex[:8]
@@ -631,10 +627,16 @@ def api_geom_mask():
     if oid not in OBJECTS:
         return jsonify(error="unknown object"), 404
     od = G.out_dir(CFG["capture"], oid)
+    # pure diff cluster first (clean on-object lidar); the seed-enriched union
+    # (cluster_enriched.npy, written by re-seeding) covers holes and gives manual
+    # objects geometry too. Sparse-guard failures below retry with the union.
     cpath = od / "cluster.npy"
+    epath = od / "cluster_enriched.npy"
     if not cpath.exists():
-        return jsonify(error="no 3D cluster stored for this object (created by "
-                             "detect-changes runs from now on)"), 404
+        cpath = epath
+    if not cpath.exists():
+        return jsonify(error="no 3D geometry stored for this object — run propagate "
+                             "(re-seed) or detect-changes first"), 404
     state = OBJECTS[oid]["state"]
     with GEOM_LOCK:                                  # impatient double-clicks must not
         if state not in GEOM_CTX:                    # build two renderers concurrently
@@ -652,32 +654,42 @@ def api_geom_mask():
         return jsonify(error="frame not in this state's session"), 404
     cam = sess.sensors[key[1]]
     T = sess.get_pose(key[0], key[1])
-    P = np.load(cpath)
-    p2d, z, vis = project(P, cam, pose=T.inverse())
-    if not vis.any():
-        return jsonify(error="cluster not visible in this frame"), 400
     cam_s, sx, sy = G._scaled_camera(cam, 0.5)
     _, depth = renderer.render_from_capture(T, cam_s)
-    occ_z, occ_ok = sample_depth(p2d[vis] * np.array([sx, sy]), depth)
-    pv = p2d[vis][occ_ok & (z[vis] <= occ_z + 0.05)]
-    if len(pv) < 10:
-        return jsonify(error="cluster occluded in this frame"), 400
     H, W = cam.height, cam.width
-    sil = np.zeros((H, W), np.uint8)
-    for x, y in pv:
-        if 0 <= int(x) < W and 0 <= int(y) < H:
-            cv2.circle(sil, (int(x), int(y)), 9, 255, -1)
-    sil = cv2.morphologyEx(sil, cv2.MORPH_CLOSE, np.ones((31, 31), np.uint8)) > 0
-    sil_px = int(sil.sum())
-    # sparsity guard (validated on the chair): when only a sliver of the cluster
-    # projects, the prior is misleading — refuse rather than produce a confident
-    # wrong mask (frame 301412 case: sil 1085px vs true mask 5929px -> IoU 0.10).
     _, _, _, cur = _mask_entry(oid, name)
     cur_px = cur.get("px", 0) if cur else 0
-    if sil_px < 800 or (cur_px >= 1000 and sil_px < 0.35 * cur_px):
-        return jsonify(error=f"geometry too sparse in this view (silhouette {sil_px}px"
-                             + (f" vs existing {cur_px}px" if cur_px else "")
+    # try the PURE cluster first (clean on-object lidar), then the seed-enriched
+    # union — per-frame fallback so holes the cluster never reached still get a
+    # silhouette while dense frames keep the tighter pure geometry. Sparsity guard
+    # (validated on the chair, frame 301412: sliver -> IoU 0.10) applies per source.
+    sil = pv = None
+    tried = []
+    for cp in dict.fromkeys([cpath, epath]):         # unique, order-preserving
+        if not cp.exists():
+            continue
+        P = np.load(cp)
+        p2d, z, vis = project(P, cam, pose=T.inverse())
+        if not vis.any():
+            tried.append(f"{cp.stem}: not visible"); continue
+        occ_z, occ_ok = sample_depth(p2d[vis] * np.array([sx, sy]), depth)
+        pv_c = p2d[vis][occ_ok & (z[vis] <= occ_z + 0.05)]
+        if len(pv_c) < 10:
+            tried.append(f"{cp.stem}: occluded"); continue
+        sil_c = np.zeros((H, W), np.uint8)
+        for x, y in pv_c:
+            if 0 <= int(x) < W and 0 <= int(y) < H:
+                cv2.circle(sil_c, (int(x), int(y)), 9, 255, -1)
+        sil_c = cv2.morphologyEx(sil_c, cv2.MORPH_CLOSE, np.ones((31, 31), np.uint8)) > 0
+        spx = int(sil_c.sum())
+        if spx < 800 or (cur_px >= 1000 and spx < 0.35 * cur_px):
+            tried.append(f"{cp.stem}: too sparse ({spx}px)"); continue
+        sil, pv = sil_c, pv_c
+        break
+    if sil is None:
+        return jsonify(error="geometry unusable in this view (" + "; ".join(tried)
                              + ") — use smart brush / line here"), 400
+    sil_px = int(sil.sum())
     # geom+SAM: seed SAM from the silhouette (mask_input + core positives + box) so
     # it snaps to the image edge where contrast exists and keeps geometry where not
     mode_used = "geom+SAM"
@@ -718,13 +730,19 @@ def _propagate_job(job_id, oid):
         state = o["state"]
         objdir = oid  # OBJECTS is keyed by '<id>__<state>' = the objdir
         st = CFG["states"][state]
-        # 1) geometry seeds (subprocess of the same env; within-source walk only)
+        # 1) geometry seeds (subprocess of the same env; within-source walk only).
+        # cmd_seeds unions: explicit src_masks + ALL hand masks + cluster.npy if the
+        # object came from cloud diff — the completed geometry covers the holes the
+        # cluster alone missed. Cluster objects use the strict occlusion defaults.
         env = dict(os.environ, PYTHONPATH=LAMARIA_PYTHONPATH)  # scantools on path
-        subprocess.run([str(ANNOTATOR_PY), str(G.__file__), "seeds",
-                        "--capture", CFG["capture"], "--session", st["session"],
-                        "--ref", st["ref"], "--src-name", o["frame"], "--obj", objdir,
-                        "--n", str(CFG["seed"]["n"]), "--min-vis", str(CFG["seed"]["min_vis"]),
-                        "--no-cross"], check=True, env=env)
+        seed_cmd = [str(ANNOTATOR_PY), str(G.__file__), "seeds",
+                    "--capture", CFG["capture"], "--session", st["session"],
+                    "--ref", st["ref"], "--src-name", o["frame"], "--obj", objdir,
+                    "--n", str(CFG["seed"]["n"]), "--min-vis", str(CFG["seed"]["min_vis"]),
+                    "--no-cross"]
+        if (G.out_dir(CFG["capture"], objdir) / "cluster.npy").exists():
+            seed_cmd += ["--occ-scale", "0.5", "--occ-tol", "0.05", "--min-frac", "0.3"]
+        subprocess.run(seed_cmd, check=True, env=env)
         # 2) per-frame SAM masks (in-process, shared model)
         n = _perframe_inproc(objdir, st["session"])
         # 3) collect viz for review (under the workspace, no external dir)

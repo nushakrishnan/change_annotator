@@ -949,9 +949,9 @@ function objCard(key, o, member){
   const masks = o.n_masks ? `<span class="pill">${o.n_masks} masks</span>` : '';
   const seeds = o.n_seeds > 1 ? `<span class="pill">${o.n_seeds} seeds</span>` : '';
   const cd = o.source === 'cloud_diff' ? '<span class="pill">cloud-diff</span>' : '';
-  const seedProp = (o.ghost || o.source === 'cloud_diff' || finished) ? '' : `
-    <button onclick="addSeed('${key}')" title="add the current frame as another seed view (spread-out frames → stronger propagation)">+ seed</button>
-    <button onclick="propagate('${key}')">propagate</button>`;
+  const seedProp = (o.ghost || finished) ? '' : `
+    <button onclick="addSeed('${key}')" title="add the current frame as another seed view — for cloud-diff objects too: seeds + your hand masks + the diff cluster union into one completed 3D object">+ seed</button>
+    <button onclick="propagate('${key}')" title="re-seed from the completed geometry (cluster + hand masks + seeds) and re-run per-frame SAM on geom/empty frames only — hand, propagated and remasked frames survive">propagate</button>`;
   const iid = (o.instance || o.id);
   const remaskBtn = (o.ghost || finished) ? '' : `<button onclick="remask('${key}')"
     title="re-segment by concept from the label — pulls in thin legs/base the click-mask drops; keeps the current mask on frames it can't match">label → remask</button>`;

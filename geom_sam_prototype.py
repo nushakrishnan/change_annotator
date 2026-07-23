@@ -125,16 +125,14 @@ def _segment_refine(model, processor, img_rgb, points, labels, box, prior_mask, 
 
 def index_keep_protected(old_index, seed_names, frontier_ts):
     """Split an existing masks_index before a per-frame regeneration: returns the
-    entries that MUST survive. Kept: src='hand' frames and frames at/behind the
-    verified frontier (co-ground-truth, never regenerated), plus non-'geom'
-    entries (prop/concept/legacy) for frames no longer seeded — dropping those
-    would delete propagation/remask/hand-era work. Stale 'geom' entries for
-    frames that dropped out of the seeds ARE dropped (the geometry now says the
-    object isn't there; exporting them would corrupt GT)."""
+    entries that MUST survive. Tier rule: 'geom' is the STARTING tier — freely
+    regenerated (when seeded) or dropped as stale (when no longer seeded); every
+    higher tier survives: hand + frontier (co-GT, immutable), and prop/concept/
+    legacy (SAM-derived or unknown-provenance work) whether seeded or not."""
     keep = {}
     for name, e in old_index.items():
         prot = e.get("src") == "hand" or int(Path(name).stem) <= frontier_ts
-        if prot or (name not in seed_names and e.get("src") != "geom"):
+        if prot or e.get("src") != "geom":
             keep[name] = e
     return keep
 
@@ -377,26 +375,41 @@ def cmd_seeds(args):
     mesh_path = capo.proc_path(args.ref) / capo.sessions[args.ref].proc.meshes["mesh"]
     renderer = Renderer(read_mesh(mesh_path))
 
-    # lift each seed mask (one or several spread-out frames) onto the SOURCE-state
-    # mesh and UNION the 3D points -> a far more complete object than a single view,
-    # so every downstream frame gets a full, accurate seed.
-    src_masks = _load_src_masks(od, args.src_name)
-    if not src_masks:
-        raise SystemExit(f"no source masks under {od} (src_index.json or src_mask.png)")
+    # lift each seed mask (explicit src_masks PLUS every hand-verified mask — the
+    # annotator's fixes ARE seeds) onto the SOURCE-state mesh, union the 3D points,
+    # and union the object's raw-cloud diff cluster if it has one. The completed
+    # geometry covers frames the cluster alone never projected into (the "whole
+    # 10 seconds unmasked" holes). Union is persisted as cluster_enriched.npy —
+    # cluster.npy stays the PURE diff result.
+    src_masks = {sn: m for sn, m in _load_src_masks(od, args.src_name)}
+    mi_path = od / "masks_index.json"
+    if mi_path.exists():
+        mi = json.load(open(mi_path))
+        for name, e in mi.items():
+            if e.get("src") == "hand" and e.get("session") == args.session and name not in src_masks:
+                hm = cv2.imread(str(od / e["mask_file"]), 0)
+                if hm is not None:
+                    src_masks[name] = hm > 127
     chunks = [c for c in (_lift_mask(m, sn, sess, renderer, compute_rays)
-                          for sn, m in src_masks) if len(c)]
+                          for sn, m in src_masks.items()) if len(c)]
+    cluster_p = od / "cluster.npy"
+    if cluster_p.exists():
+        chunks.append(np.load(cluster_p).astype(np.float64))
     if not chunks:
-        raise SystemExit("no seed points hit the mesh")
+        raise SystemExit(f"no geometry: no source/hand masks under {od} and no cluster.npy")
     pts3d = np.concatenate(chunks, 0)
-    print(f"object 3D points: {len(pts3d)} from {len(chunks)}/{len(src_masks)} seed "
-          f"frame(s) in {args.ref} frame (center {np.median(pts3d, 0).round(2)})")
+    np.save(od / "cluster_enriched.npy", pts3d.astype(np.float32))
+    print(f"object 3D points: {len(pts3d)} from {len(src_masks)} mask(s)"
+          + (f" + cluster({cluster_p.exists()})" if cluster_p.exists() else "")
+          + f" in {args.ref} frame (center {np.median(pts3d, 0).round(2)})")
 
     dbg_root = od / "seed_dbg"
 
     # ── propagate WITHIN the source state (occlusion vs source mesh) ──
     seeds = _seeds_for_session(pts3d, sess, renderer, capo, args.session,
                                args.n, args.min_vis, dbg_root, skip_name=args.src_name,
-                               occ_scale=args.occ_scale)
+                               occ_scale=args.occ_scale, occ_tol=args.occ_tol,
+                               min_frac=args.min_frac)
     print(f"[{args.session}] within-state seeds: {len(seeds)} frames "
           f"(occlusion vs {args.ref})")
     renderer = None  # release before constructing the second renderer
@@ -416,7 +429,8 @@ def cmd_seeds(args):
         renderer_o = Renderer(read_mesh(mesh_o))
         seeds_o = _seeds_for_session(pts3d_other, sess_o, renderer_o, capo_o,
                                      args.other_session, args.n, args.min_vis, dbg_root,
-                                     occ_scale=args.occ_scale)
+                                     occ_scale=args.occ_scale, occ_tol=args.occ_tol,
+                                     min_frac=args.min_frac)
         print(f"[{args.other_session}] cross-state seeds: {len(seeds_o)} frames "
               f"(via {bridge.name}, occlusion vs {args.other_ref})")
         renderer_o = None
@@ -525,6 +539,10 @@ def main():
                                 "N>0 evenly subsamples N frames (quick coarse pass)")
             p.add_argument("--min-vis", type=int, default=10,
                            help="min reprojected object points visible to keep a frame")
+            p.add_argument("--occ-tol", type=float, default=0.10,
+                           help="occlusion depth tolerance (m); 0.05 = strict")
+            p.add_argument("--min-frac", type=float, default=0.0,
+                           help="min fraction of in-frustum points unoccluded to keep a frame")
             p.add_argument("--occ-scale", type=float, default=0.35,
                            help="render occlusion depth at this fraction of full res "
                                 "(speed; the cm-scale tolerance absorbs the error)")
