@@ -10,8 +10,13 @@ One run covers the object's whole visible span:
   - frames BETWEEN two anchors are always proposed (pinned both sides); ones that
     fail the confidence gate are flagged "lowconf" for the preview, not dropped —
     GT needs every visible frame masked, the human judges the flagged ones;
-  - frames OUTSIDE the outermost anchors are extrapolation: propagation stops at
-    the first gate failure on each side (conservative at the unpinned edges);
+  - frames OUTSIDE the outermost anchors are extrapolation. In forward mode the
+    window extends past the last covered frame to the end of the walk (max_span-
+    capped): one click carries the object's whole remaining presence. The run
+    tolerates brief wobble — up to `patience` consecutive misses (gate failure or
+    object momentarily <200px, e.g. motion blur or a passer-by) before stopping;
+    wobble frames that recover are proposed flagged "lowconf", a trailing run
+    that never recovers is dropped;
   - the gate: geometric agreement with the reprojected seed footprint (IoU or
     seed-box coverage) OR temporal consistency with the previous accepted mask.
     Geometry alone is untrustworthy at span starts (misplaced seeds were observed
@@ -86,7 +91,10 @@ def propagate(capture, obj_dir, anchor_name, iou_floor=0.2, max_span=600,
 
     mode="forward" (default): propose ONLY frames AFTER the clicked frame — the
     annotator works forward in time; frames behind them are green-lit and a
-    future fix must never flow back. mode="span" fills the whole span (opt-in
+    future fix must never flow back. Forward reach extends to the end of the
+    walk (max_span-capped), even into frames with no mask/seed coverage yet —
+    the patience stop rule ends the run when the object leaves view or the
+    track degrades for good. mode="span" fills the whole span (opt-in
     bootstrap). `frontier_name`, if given, marks the object's "confirmed up to
     here" frame: frames at-or-before it are NEVER proposed in either mode, and
     the frontier frame's own mask (whatever its src) is fed to the tracker as an
@@ -120,6 +128,12 @@ def propagate(capture, obj_dir, anchor_name, iou_floor=0.2, max_span=600,
     cov = sorted(idx[n] for n in (set(seeds) | set(mi)) if n in idx)
     lo, hi = cov[0], cov[-1]
     a_glob = idx[anchor_name]
+    if mode == "forward":
+        # carry past the last covered frame to the end of the walk — for a
+        # hand-only object cov collapses to the already-masked frames, which
+        # left nothing to propose INTO. The patience stop rule below decides
+        # where the object actually ends; max_span still caps the window.
+        hi = len(names) - 1
     if hi - lo + 1 > max_span:                       # cap huge spans around the click
         lo = max(lo, a_glob - max_span // 2)
         hi = min(hi, a_glob + max_span // 2)
@@ -224,24 +238,44 @@ def propagate(capture, obj_dir, anchor_name, iou_floor=0.2, max_span=600,
             m, geo_ok, temporal_ok = got
             _accept(i, m, geo_ok or temporal_ok)
             prev = m
-    # outside the outermost anchors: extrapolation — stop at first gate failure
-    # (an invisible track at the edge also means the object is gone: stop)
+    # outside the outermost anchors: extrapolation into virgin frames. Tolerate
+    # brief wobble (motion blur, a passer-by): up to `patience` consecutive
+    # misses — a gate failure is buffered and proposed flagged "lowconf" only if
+    # the track recovers; an invisible frame proposes nothing (object out of
+    # view = no mask IS the GT) but doesn't kill the run either. `prev` (the
+    # temporal reference) advances only on gate-passing frames, so recovery is
+    # judged against the last GOOD mask — a smoothly drifting wrong track can't
+    # re-green-light itself. Patience exhausted -> stop, DROP the trailing
+    # failed run (a track that never recovers is garbage).
+    patience = 5
     for rng, a_edge in ((range(anchors[-1] + 1, len(win)), anchors[-1]),
                         (range(anchors[0] - 1, -1, -1), anchors[0])):
         prev = _anchor_mask(a_edge)
+        misses, buffered = 0, []          # buffered: gate-failed (i, m) awaiting recovery
         for i in rng:
             got = _consider(i, prev)
             if got is None:
                 continue
             if got == "invisible":
-                stops.append({"name": win[i], "stopped": "edge-invisible"})
-                break
+                invisible += 1
+                misses += 1
+                if misses > patience:
+                    stops.append({"name": win[i], "stopped": "edge-invisible"})
+                    break
+                continue
             m, geo_ok, temporal_ok = got
-            if not (geo_ok or temporal_ok):
-                stops.append({"name": win[i], "stopped": "edge-gate"})
-                break
-            _accept(i, m, True)
-            prev = m
+            if geo_ok or temporal_ok:
+                for bi, bm in buffered:
+                    _accept(bi, bm, False)
+                buffered, misses = [], 0
+                _accept(i, m, True)
+                prev = m
+            else:
+                misses += 1
+                if misses > patience:
+                    stops.append({"name": win[i], "stopped": "edge-gate"})
+                    break
+                buffered.append((i, m))
 
     meta = {"anchors": len(anchors), "span": len(win), "stops": stops,
             "invisible": invisible}

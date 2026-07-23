@@ -89,7 +89,7 @@
       <button onclick="deleteMask()" id="delBtn" title="shortcut: d">delete mask (d)</button>
       &nbsp; <button onclick="setFrontier()" title="shortcut: g — frames 0…here are confirmed (green band). No machine writer (remask/propagate) touches them; this frame's mask becomes an approved anchor">good up to here (g)</button>
       <button onclick="propagateFix()" id="propBtn"
-        title="fill gaps FORWARD from this frame's saved mask (hand anchors + frontier are immutable posts). Tick 'whole span' to fill backward too — first-pass bootstrap only.">propagate this fix</button>
+        title="fill gaps FORWARD from this frame's saved mask, carrying to the end of the walk while the object stays in view (hand anchors + frontier are immutable posts). Tick 'whole span' to fill backward too — first-pass bootstrap only.">propagate this fix</button>
       <label style="font-size:12px" title="also fill frames BEFORE the clicked one (whole visible span). Default off: your green-lit past stays untouched."><input type="checkbox" id="propSpanChk"> whole span</label>
       <span id="propControls" style="display:none">
         <button onclick="propShowPreview()" title="show the sampled preview grid; scrubbing returns to frames">grid</button>
