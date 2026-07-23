@@ -220,7 +220,7 @@ function showFrame(){
 function resetPoints(){ if(mode==='annotate'){ pos=[]; neg=[]; clearMaskCanvas(); document.getElementById('clickStatus').textContent=''; } }
 
 // ───────── review: scrub one object's propagated masks ─────────
-async function openReview(oid){
+async function openReview(oid, stayFrame){
   const r = await fetch('/api/object_frames?id=' + encodeURIComponent(oid));
   const d = await r.json();
   if(d.error){ alert(d.error); return; }
@@ -232,8 +232,11 @@ async function openReview(oid){
     updateApplyLabel();
   }
   reviewFrontier = (objsCache[oid] || {}).verified_until || null;
+  // stayFrame (e.g. after applying a propagation) keeps the user's place
+  // instead of snapping back to the object's first masked frame
+  const at = stayFrame ? frames.findIndex(f => f.name === stayFrame) : -1;
   const first = frames.findIndex(f => f.has_mask);   // land on the propagated region
-  idx = first >= 0 ? first : 0;
+  idx = at >= 0 ? at : (first >= 0 ? first : 0);
   document.getElementById('annotateBar').style.display = 'none';
   document.getElementById('reviewBar').style.display = '';
   document.getElementById('annotateHint').style.display = 'none';
@@ -420,7 +423,8 @@ async function propApply(){
   propPreview = null; clearPending();
   document.getElementById('coverInfo').textContent =
     `applied ${d.written} propagated masks` + (d.skipped_hand ? ` (${d.skipped_hand} kept)` : '');
-  refreshObjects(); openReview(reviewObj);
+  refreshObjects();
+  openReview(reviewObj, frames[idx] ? frames[idx].name : null);  // stay put
 }
 async function propDiscard(){
   await fetch('/api/propagate_discard', {method:'POST', headers:{'Content-Type':'application/json'},
