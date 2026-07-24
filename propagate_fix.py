@@ -35,6 +35,9 @@ import cv2
 import numpy as np
 
 _TRACKER = None
+# extra anchors sampled from the human-vouched region at/behind the frontier
+# ("good up to here" teaches the tracker, not just protects). 0 disables.
+BLESSED_EXTRA_CAP = 40
 
 
 def load_tracker():
@@ -144,6 +147,26 @@ def propagate(capture, obj_dir, anchor_name, iou_floor=0.2, max_span=600,
     anchor_names = set(hand) | {anchor_name}
     if frontier_name in mi and frontier_name in win:  # blessed frontier mask = anchor
         anchor_names.add(frontier_name)
+    # "good up to here" TEACHES, not just protects: every masked frame at/behind
+    # the frontier is human-vouched (g), whatever its src — feed it to the
+    # tracker as an anchor so fills inherit approved shape/scale, not just the
+    # hand frames'. Sampled to bound tracker memory: the frames nearest the
+    # click teach current appearance, a uniform sweep of the rest teaches the
+    # object from the walk's other viewpoints.
+    blessed = sorted((n for n in win if n in mi and (lo + win.index(n)) <= frontier_glob
+                      and n not in anchor_names),
+                     key=lambda n: abs(win.index(n) - click_local))
+    if blessed and BLESSED_EXTRA_CAP > 0:
+        near = blessed[:10]
+        rest = blessed[10:]
+        step = max(1, len(rest) // max(1, BLESSED_EXTRA_CAP - len(near)))
+        anchor_names |= set(near) | set(rest[::step][:BLESSED_EXTRA_CAP - len(near)])
+    # prevalidate: a broken mask file must drop that anchor, not abort the run
+    # (the clicked anchor stays load-bearing and still errors loudly below)
+    for n in sorted(anchor_names - {anchor_name}):
+        p = od / mi[n]["mask_file"]
+        if cv2.imread(str(p), 0) is None:
+            anchor_names.discard(n)
     anchors = sorted(win.index(n) for n in anchor_names)
 
     def _writable(i):
