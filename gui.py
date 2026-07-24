@@ -487,12 +487,10 @@ def _propagate_fix_job(job_id, oid, frame, mode):
                                 msg="nothing to fill (span already hand-covered?)")
             return
         mi = json.load(open(od / "masks_index.json"))
-        # geometry snap: reconcile each proposal with the object's projected 3D
-        # footprint — trims RGB bleed (shadow, same-coloured neighbour), restores
-        # shaved extent (tracker scale-lag; measured 56k px proposed vs ~600k
-        # truth on box_stack), flags heavy corrections orange. Deformables and
-        # geometry-less objects stand down (snap == {}-skipped).
-        snap = _geom_snap_results(oid, results, flags, cb)
+        # NOTE: proposals are the tracker's own masks, untouched. A geometry
+        # "snap" stage that auto-corrected them was tried and rolled back
+        # (2026-07-24): partial clusters/lifted shells clamped SAM's pose-driven
+        # evolution. Geometry never modifies propagation output.
         # shrink guard: replacing an existing mask with one under 60% of its size
         # is a suspicious downgrade — flag orange, the human decides at preview.
         n_shrink = 0
@@ -516,14 +514,13 @@ def _propagate_fix_job(job_id, oid, frame, mode):
             f = flags.get(n, {})
             if f.get("lowconf"):
                 cv2.rectangle(t, (0, 0), (329, 329), (0, 220, 255), 8)
-            elif f.get("geo") or f.get("shrink"):
+            elif f.get("shrink"):
                 cv2.rectangle(t, (0, 0), (329, 329), (0, 128, 255), 6)
             elif f.get("legacy"):
                 cv2.rectangle(t, (0, 0), (329, 329), (255, 200, 0), 5)
             cv2.rectangle(t, (0, 0), (330, 20), (0, 0, 0), -1)
             tag = ("  LOWCONF" if f.get("lowconf") else
-                   "  SHRINK" if f.get("shrink") else
-                   "  GEO" if f.get("geo") else "")
+                   "  SHRINK" if f.get("shrink") else "")
             cv2.putText(t, Path(n).stem[-8:] + tag,
                         (4, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1)
             tiles.append(t)
@@ -538,9 +535,7 @@ def _propagate_fix_job(job_id, oid, frame, mode):
         n_leg = sum(1 for f in flags.values() if f.get("legacy"))
         JOBS[job_id].update(status="done", n=len(results), n_lowconf=n_low,
                             n_legacy=n_leg, anchors=meta["anchors"], span=meta["span"],
-                            snap_corrected=snap.get("corrected", 0),
-                            n_geo=sum(1 for f in flags.values() if f.get("geo")),
-                            n_shrink=n_shrink, snap_skip=snap.get("skipped"),
+                            n_shrink=n_shrink,
                             invisible=meta.get("invisible", 0),
                             stops=[s["stopped"] for s in meta["stops"]],
                             preview=f"/results/{oid}/{prev}")
@@ -726,90 +721,6 @@ def _sam_refine_geom(img, seed, clip):
     with LOCK:
         refined = G._segment_refine(MODEL, PROC, img, pos, [1] * len(pos), box, seed)
     return refined & clip
-
-
-def _geom_snap_mask(mask, sil):
-    """Reconcile ONE machine proposal with the projected 3D silhouette. SAM owns
-    the mask's evolution — geometry only vetoes and rescues, never reshapes a
-    healthy mask (a blanket core-fill was tried and squashed the tracker's
-    pose-driven evolution into a carried-forward stamp):
-      - TRIM mask pixels outside the BAND (dilated silhouette): shadow bleed,
-        same-coloured-neighbour spill — ONLY when the silhouette is comparable
-        to the mask (>=80% of its area). A diff cluster proves where the object
-        IS, never where it ISN'T: a partial cluster (cd_pre_02: 5.7k pts vs
-        65k-px masks) must not clip proposals back to its own patch;
-      - FILL from CORE (eroded silhouette) ONLY as collapse rescue, when the
-        proposal is under half the silhouette (tracker scale-lag: 56k px
-        proposed vs ~600k truth on box_stack).
-    Returns (corrected, ratio, why); why="contradiction" = mask and geometry
-    barely overlap — more likely a bad pose or a moved object than a bad mask,
-    so flag it, don't cut it."""
-    m = mask.astype(bool)
-    band = cv2.dilate(sil.astype(np.uint8), np.ones((71, 71), np.uint8)) > 0
-    if m.any() and (m & band).sum() < 0.2 * m.sum():
-        return mask, 0.0, "contradiction"
-    corrected = m
-    if sil.sum() >= 0.8 * m.sum():                   # covers the object -> may
-        corrected = m & band                         # claim absence (trim bleed)
-    if m.sum() < 0.5 * sil.sum():                    # collapse rescue only
-        core = cv2.erode(sil.astype(np.uint8), np.ones((21, 21), np.uint8)) > 0
-        corrected = corrected | core
-    ratio = float((corrected ^ m).sum()) / max(1, int(m.sum()))
-    return corrected, ratio, None
-
-
-def _geom_snap_results(oid, results, flags, say):
-    """Geometry-snap pass over propagate-this-fix proposals (correct+flag mode).
-    Mutates `results` masks in place and sets flags[n]["geo"] on heavy
-    corrections / contradictions. Stands down wholesale for deformable objects
-    (scan-time shape != walk-time shape) and per-frame when the projection is
-    sparse or occluded. Corrected masks get a SAM refine seeded by the snapped
-    binary so the final boundary is image-driven inside the geometry envelope."""
-    if (OBJECTS.get(oid) or {}).get("deformability") == "deformable":
-        return {"skipped": "deformable object"}
-    od = G.out_dir(CFG["capture"], oid)
-    # PURE diff cluster only: real on-object lidar. The lift-enriched union
-    # (cluster_enriched.npy) is a view-dependent shell of the hand masks — fine
-    # for seeding, too stale to shape tracker output (measured on
-    # cardboard_boxes: proposals froze into the hand-mask stamp).
-    if not (od / "cluster.npy").exists():
-        return {"skipped": "no pure cluster"}
-    sid = CFG["states"][OBJECTS[oid]["state"]]["session"]
-    n_corr = n_flag = n_skip = 0
-    names = sorted(results)
-    for i, n in enumerate(names):
-        if i % 20 == 0:
-            say(f"geometry snap {i}/{len(names)} …")
-        sil, _, err = _project_silhouette(oid, n, cur_px=int(results[n].sum()),
-                                          pure_only=True)
-        if sil is None:
-            n_skip += 1
-            continue
-        corrected, ratio, why = _geom_snap_mask(results[n], sil)
-        if why == "contradiction":
-            flags.setdefault(n, {})["geo"] = True
-            n_flag += 1
-            continue
-        if ratio <= 0.02:                            # agreement — leave untouched
-            continue
-        try:
-            bgr = cv2.imread(str(Path(CFG["capture"]) / "sessions" / sid
-                                 / "raw_data" / n))
-            img = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-            clip = cv2.dilate(sil.astype(np.uint8), np.ones((61, 61), np.uint8)) > 0
-            refined = _sam_refine_geom(img, corrected, clip)
-            inter = (refined & corrected).sum()
-            union = (refined | corrected).sum()
-            if refined.sum() >= 200 and union and inter / union >= 0.5:
-                corrected = refined
-        except Exception:                            # refine is cosmetic — keep snap
-            pass
-        results[n] = corrected
-        n_corr += 1
-        if ratio > 0.15:                             # heavy correction — human look
-            flags.setdefault(n, {})["geo"] = True
-            n_flag += 1
-    return {"corrected": n_corr, "flagged": n_flag, "no_geom": n_skip}
 
 
 @app.route("/api/geom_mask", methods=["POST"])
