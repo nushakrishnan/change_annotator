@@ -63,6 +63,7 @@ JOBS = {}             # job_id -> {status, ...}   (JSON-serializable ONLY: api_j
 PROP_PENDING = {}     # job_id -> {frame_name: bool mask} awaiting human confirm (numpy, NOT in JOBS)
 PROP_FLAGS = {}       # job_id -> {frame_name: {"lowconf","legacy"}} for the pending review UI
 GEOM_CTX = {}         # state -> (capo, sess, renderer) cache for the geom-mask button
+GEOM_KEYMAP = {}      # state -> {frame name: image key} (key_pairs scan is O(session))
 GEOM_LOCK = threading.Lock()
 
 
@@ -486,7 +487,22 @@ def _propagate_fix_job(job_id, oid, frame, mode):
                                 msg="nothing to fill (span already hand-covered?)")
             return
         mi = json.load(open(od / "masks_index.json"))
+        # geometry snap: reconcile each proposal with the object's projected 3D
+        # footprint — trims RGB bleed (shadow, same-coloured neighbour), restores
+        # shaved extent (tracker scale-lag; measured 56k px proposed vs ~600k
+        # truth on box_stack), flags heavy corrections orange. Deformables and
+        # geometry-less objects stand down (snap == {}-skipped).
+        snap = _geom_snap_results(oid, results, flags, cb)
+        # shrink guard: replacing an existing mask with one under 60% of its size
+        # is a suspicious downgrade — flag orange, the human decides at preview.
+        n_shrink = 0
+        for n in results:
+            e = mi.get(n)
+            if e and e.get("px") and int(results[n].sum()) < 0.6 * e["px"]:
+                flags.setdefault(n, {})["shrink"] = True
+                n_shrink += 1
         # preview grid: up to 24 sampled frames; YELLOW border = low-confidence fill,
+        # ORANGE = geometry disagreed / suspicious shrink vs the existing mask,
         # CYAN = overwrites a legacy (pre-provenance) mask. Hand frames never appear.
         names = sorted(results)
         sel = names[::max(1, len(names) // 24)][:24]
@@ -500,10 +516,15 @@ def _propagate_fix_job(job_id, oid, frame, mode):
             f = flags.get(n, {})
             if f.get("lowconf"):
                 cv2.rectangle(t, (0, 0), (329, 329), (0, 220, 255), 8)
+            elif f.get("geo") or f.get("shrink"):
+                cv2.rectangle(t, (0, 0), (329, 329), (0, 128, 255), 6)
             elif f.get("legacy"):
                 cv2.rectangle(t, (0, 0), (329, 329), (255, 200, 0), 5)
             cv2.rectangle(t, (0, 0), (330, 20), (0, 0, 0), -1)
-            cv2.putText(t, Path(n).stem[-8:] + ("  LOWCONF" if f.get("lowconf") else ""),
+            tag = ("  LOWCONF" if f.get("lowconf") else
+                   "  SHRINK" if f.get("shrink") else
+                   "  GEO" if f.get("geo") else "")
+            cv2.putText(t, Path(n).stem[-8:] + tag,
                         (4, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1)
             tiles.append(t)
         while len(tiles) % 4:
@@ -517,6 +538,9 @@ def _propagate_fix_job(job_id, oid, frame, mode):
         n_leg = sum(1 for f in flags.values() if f.get("legacy"))
         JOBS[job_id].update(status="done", n=len(results), n_lowconf=n_low,
                             n_legacy=n_leg, anchors=meta["anchors"], span=meta["span"],
+                            snap_corrected=snap.get("corrected", 0),
+                            n_geo=sum(1 for f in flags.values() if f.get("geo")),
+                            n_shrink=n_shrink, snap_skip=snap.get("skipped"),
                             invisible=meta.get("invisible", 0),
                             stops=[s["stopped"] for s in meta["stops"]],
                             preview=f"/results/{oid}/{prev}")
@@ -616,27 +640,20 @@ def api_propagate_discard():
 
 
 # ───────────────── geom mask (dense lidar-cluster silhouette) ─────────────────
-@app.route("/api/geom_mask", methods=["POST"])
-def api_geom_mask():
-    """Project the object's raw-cloud diff cluster into the frame -> dense
-    silhouette as a starting mask. For objects where visual cues offer no hint
-    (curtain vs wall, thin desk vs clutter) the lidar silhouette needs none.
-    Measured on the dlab desk: ~2x the signal of the mesh-lift path."""
-    d = request.get_json()
-    oid, name = d["id"], d["frame"]
-    if oid not in OBJECTS:
-        return jsonify(error="unknown object"), 404
+def _project_silhouette(oid, name, cur_px=0):
+    """Project the object's stored 3D geometry into frame `name` -> dense bool
+    silhouette (or None). Pure diff cluster first (clean on-object lidar); the
+    seed-enriched union (cluster_enriched.npy, written by re-seeding) covers
+    holes and gives manual objects geometry too — per-frame fallback, sparse-
+    guard failures retry with the union. Returns (sil, n_points, error_msg)."""
     od = G.out_dir(CFG["capture"], oid)
-    # pure diff cluster first (clean on-object lidar); the seed-enriched union
-    # (cluster_enriched.npy, written by re-seeding) covers holes and gives manual
-    # objects geometry too. Sparse-guard failures below retry with the union.
     cpath = od / "cluster.npy"
     epath = od / "cluster_enriched.npy"
     if not cpath.exists():
         cpath = epath
     if not cpath.exists():
-        return jsonify(error="no 3D geometry stored for this object — run propagate "
-                             "(re-seed) or detect-changes first"), 404
+        return None, 0, ("no 3D geometry stored for this object — run propagate "
+                         "(re-seed) or detect-changes first")
     state = OBJECTS[oid]["state"]
     with GEOM_LOCK:                                  # impatient double-clicks must not
         if state not in GEOM_CTX:                    # build two renderers concurrently
@@ -648,21 +665,20 @@ def api_geom_mask():
             GEOM_CTX[state] = (capo, sess, Renderer(read_mesh(mesh)))
     from scantools.utils.geometry import project, sample_depth
     capo, sess, renderer = GEOM_CTX[state]
-    key = next((k for k in sess.images.key_pairs()
-                if str(sess.images[k[0], k[1]]) == name), None)
+    km = GEOM_KEYMAP.setdefault(state, {})
+    if not km:
+        for k in sess.images.key_pairs():
+            km[str(sess.images[k[0], k[1]])] = k
+    key = km.get(name)
     if key is None:
-        return jsonify(error="frame not in this state's session"), 404
+        return None, 0, "frame not in this state's session"
     cam = sess.sensors[key[1]]
     T = sess.get_pose(key[0], key[1])
     cam_s, sx, sy = G._scaled_camera(cam, 0.5)
     _, depth = renderer.render_from_capture(T, cam_s)
     H, W = cam.height, cam.width
-    _, _, _, cur = _mask_entry(oid, name)
-    cur_px = cur.get("px", 0) if cur else 0
-    # try the PURE cluster first (clean on-object lidar), then the seed-enriched
-    # union — per-frame fallback so holes the cluster never reached still get a
-    # silhouette while dense frames keep the tighter pure geometry. Sparsity guard
-    # (validated on the chair, frame 301412: sliver -> IoU 0.10) applies per source.
+    # sparsity guard (validated on the chair, frame 301412: sliver -> IoU 0.10)
+    # applies per source.
     sil = pv = None
     tried = []
     for cp in dict.fromkeys([cpath, epath]):         # unique, order-preserving
@@ -687,35 +703,125 @@ def api_geom_mask():
         sil, pv = sil_c, pv_c
         break
     if sil is None:
-        return jsonify(error="geometry unusable in this view (" + "; ".join(tried)
-                             + ") — use smart brush / line here"), 400
-    sil_px = int(sil.sum())
-    # geom+SAM: seed SAM from the silhouette (mask_input + core positives + box) so
-    # it snaps to the image edge where contrast exists and keeps geometry where not
+        return None, 0, ("geometry unusable in this view (" + "; ".join(tried)
+                         + ") — use smart brush / line here")
+    return sil, len(pv), None
+
+
+def _sam_refine_geom(img, seed, clip):
+    """SAM refine seeded by a geometry-derived mask (mask_input + core positives
+    + box) so the boundary snaps to the image edge where contrast exists and
+    keeps geometry where not; clipped to the envelope (anti-runaway). May raise."""
+    core = cv2.erode(seed.astype(np.uint8), np.ones((21, 21), np.uint8)) > 0
+    ys, xs = np.where(core if core.any() else seed)
+    sel = np.linspace(0, len(xs) - 1, 5).astype(int)
+    pos = [[float(xs[k]), float(ys[k])] for k in sel]
+    ys2, xs2 = np.where(seed)
+    box = [float(xs2.min()) - 40, float(ys2.min()) - 40,
+           float(xs2.max()) + 40, float(ys2.max()) + 40]
+    with LOCK:
+        refined = G._segment_refine(MODEL, PROC, img, pos, [1] * len(pos), box, seed)
+    return refined & clip
+
+
+def _geom_snap_mask(mask, sil):
+    """Reconcile ONE machine proposal with the projected 3D silhouette.
+    Three zones: CORE (silhouette eroded — almost certainly object), BAND
+    (dilated — boundary uncertainty, RGB keeps the final say), OUTSIDE (the
+    object physically is not here). Trim mask pixels OUTSIDE the band (shadow
+    bleed, same-coloured neighbour); fill CORE pixels the mask missed (tracker
+    scale-lag / shaved low-contrast edges). Returns (corrected, ratio, why):
+    why="contradiction" = mask and geometry barely overlap — more likely a bad
+    pose or a moved object than a bad mask, so flag it, don't cut it."""
+    m = mask.astype(bool)
+    band = cv2.dilate(sil.astype(np.uint8), np.ones((71, 71), np.uint8)) > 0
+    core = cv2.erode(sil.astype(np.uint8), np.ones((21, 21), np.uint8)) > 0
+    if m.any() and (m & band).sum() < 0.2 * m.sum():
+        return mask, 0.0, "contradiction"
+    corrected = (m & band) | core
+    ratio = float((corrected ^ m).sum()) / max(1, int(m.sum()))
+    return corrected, ratio, None
+
+
+def _geom_snap_results(oid, results, flags, say):
+    """Geometry-snap pass over propagate-this-fix proposals (correct+flag mode).
+    Mutates `results` masks in place and sets flags[n]["geo"] on heavy
+    corrections / contradictions. Stands down wholesale for deformable objects
+    (scan-time shape != walk-time shape) and per-frame when the projection is
+    sparse or occluded. Corrected masks get a SAM refine seeded by the snapped
+    binary so the final boundary is image-driven inside the geometry envelope."""
+    if (OBJECTS.get(oid) or {}).get("deformability") == "deformable":
+        return {"skipped": "deformable object"}
+    od = G.out_dir(CFG["capture"], oid)
+    if not (od / "cluster.npy").exists() and not (od / "cluster_enriched.npy").exists():
+        return {"skipped": "no geometry"}
+    sid = CFG["states"][OBJECTS[oid]["state"]]["session"]
+    n_corr = n_flag = n_skip = 0
+    names = sorted(results)
+    for i, n in enumerate(names):
+        if i % 20 == 0:
+            say(f"geometry snap {i}/{len(names)} …")
+        sil, _, err = _project_silhouette(oid, n, cur_px=int(results[n].sum()))
+        if sil is None:
+            n_skip += 1
+            continue
+        corrected, ratio, why = _geom_snap_mask(results[n], sil)
+        if why == "contradiction":
+            flags.setdefault(n, {})["geo"] = True
+            n_flag += 1
+            continue
+        if ratio <= 0.02:                            # agreement — leave untouched
+            continue
+        try:
+            bgr = cv2.imread(str(Path(CFG["capture"]) / "sessions" / sid
+                                 / "raw_data" / n))
+            img = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            clip = cv2.dilate(sil.astype(np.uint8), np.ones((61, 61), np.uint8)) > 0
+            refined = _sam_refine_geom(img, corrected, clip)
+            inter = (refined & corrected).sum()
+            union = (refined | corrected).sum()
+            if refined.sum() >= 200 and union and inter / union >= 0.5:
+                corrected = refined
+        except Exception:                            # refine is cosmetic — keep snap
+            pass
+        results[n] = corrected
+        n_corr += 1
+        if ratio > 0.15:                             # heavy correction — human look
+            flags.setdefault(n, {})["geo"] = True
+            n_flag += 1
+    return {"corrected": n_corr, "flagged": n_flag, "no_geom": n_skip}
+
+
+@app.route("/api/geom_mask", methods=["POST"])
+def api_geom_mask():
+    """Project the object's raw-cloud diff cluster into the frame -> dense
+    silhouette as a starting mask. For objects where visual cues offer no hint
+    (curtain vs wall, thin desk vs clutter) the lidar silhouette needs none.
+    Measured on the dlab desk: ~2x the signal of the mesh-lift path."""
+    d = request.get_json()
+    oid, name = d["id"], d["frame"]
+    if oid not in OBJECTS:
+        return jsonify(error="unknown object"), 404
+    _, _, _, cur = _mask_entry(oid, name)
+    sil, npts, err = _project_silhouette(oid, name, cur.get("px", 0) if cur else 0)
+    if sil is None:
+        return jsonify(error=err), (400 if "unusable" in err else 404)
+    state = OBJECTS[oid]["state"]
     mode_used = "geom+SAM"
     out = sil
     try:
         bgr = cv2.imread(str(Path(CFG["capture"]) / "sessions"
                           / CFG["states"][state]["session"] / "raw_data" / name))
         img = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        core = cv2.erode(sil.astype(np.uint8), np.ones((21, 21), np.uint8)) > 0
-        ys, xs = np.where(core if core.any() else sil)
-        sel = np.linspace(0, len(xs) - 1, 5).astype(int)
-        pos = [[float(xs[k]), float(ys[k])] for k in sel]
-        ys2, xs2 = np.where(sil)
-        box = [float(xs2.min()) - 40, float(ys2.min()) - 40,
-               float(xs2.max()) + 40, float(ys2.max()) + 40]
-        with LOCK:
-            refined = G._segment_refine(MODEL, PROC, img, pos, [1] * len(pos), box, sil)
         clip = cv2.dilate(sil.astype(np.uint8), np.ones((61, 61), np.uint8)) > 0
-        refined = refined & clip                     # anti-runaway bound
+        refined = _sam_refine_geom(img, sil, clip)
         if refined.sum() >= 200:
             out = refined
         else:
             mode_used = "raw silhouette (SAM returned ~empty)"
     except Exception as e:                           # SAM hiccup -> raw silhouette
         mode_used = f"raw silhouette (refine failed: {e})"
-    return jsonify(mask=_mask_png_b64(out), px=int(out.sum()), pts=int(len(pv)),
+    return jsonify(mask=_mask_png_b64(out), px=int(out.sum()), pts=int(npts),
                    mode=mode_used)
 
 

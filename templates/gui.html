@@ -380,7 +380,9 @@ async function propagateFix(){
     updateApplyLabel();
     if(reviewObj === obj){
       st.textContent = `${j.anchors} anchor(s) → ${j.n} filled`
+        + (j.snap_corrected ? ` · ${j.snap_corrected} geometry-corrected` : '')
         + (j.n_lowconf ? ` · ${j.n_lowconf} lowconf (yellow)` : '')
+        + ((j.n_geo || j.n_shrink) ? ` · ${(j.n_geo||0) + (j.n_shrink||0)} geo/shrink (orange)` : '')
         + (j.invisible ? ` · ${j.invisible} not visible (unmasked)` : '')
         + ' — scrub: red=proposed, green=current · v=veto · then apply';
       document.getElementById('propControls').style.display = '';
