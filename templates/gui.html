@@ -34,6 +34,16 @@
   .obj.f-done.f-reviewed { border-color: #2a7; background: #d8f0de; }
   .obj.reviewing { border-color: #2a7; box-shadow: 0 0 0 2px #2a72; }
   .obj h4 { margin: 0 0 4px; font-size: 14px; padding-right: 118px; }  /* room for the flags */
+  /* two lanes, mirroring a group card's PRE|POST columns: ungrouped objects sit in
+     their state's half; group cards span both (they hold their own split) */
+  #objects { display: grid; grid-template-columns: 1fr 1fr; column-gap: 8px;
+             grid-auto-flow: row dense; align-items: start; }
+  #objects > .obj.lane-pre { grid-column: 1; }
+  #objects > .obj.lane-post { grid-column: 2; }
+  #objects > .grp { grid-column: 1 / -1; }
+  .lane-head { grid-column: 1 / -1; display: grid; grid-template-columns: 1fr 1fr;
+               font-size: 11px; font-weight: 600; color: #888; text-align: center;
+               border-bottom: 1px solid #ddd; padding: 2px 0; }
   .obj .meta { font-size: 12px; color: #666; }
   .obj img { max-width: 100%; margin-top: 6px; border: 1px solid #eee; }
   /* group container: several GUI objects = ONE physical object (shared instance id) */
@@ -917,7 +927,8 @@ let groupSel = [];     // ordered iid selection for the 'group selected' button
 function renderObjects(objs){
   const a = document.activeElement;                   // never clobber in-progress typing
   if(a && a.classList && a.classList.contains('ident')){ renderDeferred = true; return; }
-  const box = document.getElementById('objects'); box.innerHTML='';
+  const box = document.getElementById('objects');
+  box.innerHTML = '<div class="lane-head"><span>PRE</span><span>POST</span></div>';
   groupUnits = {};
   const byInst = {};
   Object.entries(objs).forEach(([k, o]) => {
@@ -945,7 +956,9 @@ function renderObjects(objs){
 function objCard(key, o, member){
   const finished = !!o.done;   // done ⇒ collapse working controls; uncheck to get them back
   const div = document.createElement('div'); div.dataset.oid = key;
-  div.className = 'obj' + (o.done ? ' f-done' : '') + (o.reviewed ? ' f-reviewed' : '');
+  const lane = member ? '' : (o.state === 'pre' ? ' lane-pre'
+                              : o.state === 'post' ? ' lane-post' : '');
+  div.className = 'obj' + lane + (o.done ? ' f-done' : '') + (o.reviewed ? ' f-reviewed' : '');
   const flags = `<span class="flags">
     <label title="annotator: masks for this object are finished"><input type="checkbox"
       ${o.done ? 'checked' : ''} onchange="setFlag('${key}','done',this.checked,this)"> done</label>
@@ -980,7 +993,8 @@ function objCard(key, o, member){
     </select>`;
   const metaLine = member ? '' : `<div class="meta">${o.change_type} · ${deformUI}</div>`;
   const title = member ? o.id : `${o.ghost ? '👻 ' : ''}${iid} · ${o.state}`;
-  div.innerHTML = `${flags}<h4>${title} ${cd} ${seeds} ${masks}</h4>
+  div.innerHTML = `${flags}<h4 ondblclick="editIdentFrom(this,'${key}')"
+    title="the bold name is the object's instance id (+ state) — double-click to edit it; the label box below is the semantic name">${title} ${cd} ${seeds} ${masks}</h4>
     ${metaLine}${metaRow}${seedProp}
     <button onclick="openReview('${key}')" ${o.n_masks ? '' : 'disabled'}>review / edit</button>
     ${finished ? '' : `<button onclick="deleteObject('${key}')" class="del" title="remove this object — its seeds/masks are moved to .trash (recoverable on disk)">delete</button>`}
@@ -1037,10 +1051,21 @@ function groupCard(u){
   return div;
 }
 
+// double-click on the bold name -> edit the id in place: single cards focus
+// their own id box; in-group members focus the group header's (it owns identity)
+function editIdentFrom(el, key){
+  const own = document.getElementById('iid_' + key);
+  if(own){ own.focus(); own.select(); return; }
+  const g = el.closest('.grp');
+  const gi = g && g.querySelector('.giid');
+  if(gi){ gi.focus(); gi.select(); }
+}
+
 // ── grouping actions ──
 function attachSelBox(host, iid){
   const cb = document.createElement('input');
   cb.type = 'checkbox'; cb.className = 'selbox';
+  cb.ondblclick = e => e.stopPropagation();   // dblclick-to-edit lives on the h4
   cb.title = 'select, then use "group selected" to merge into one physical object';
   cb.checked = groupSel.includes(iid);
   cb.onchange = () => { groupSel = groupSel.filter(x => x !== iid); if(cb.checked) groupSel.push(iid); updateGroupBar(); };
