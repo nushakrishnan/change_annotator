@@ -382,6 +382,7 @@ async function propagateFix(){
       st.textContent = `${j.anchors} anchor(s) → ${j.n} filled`
         + (j.n_lowconf ? ` · ${j.n_lowconf} lowconf (yellow)` : '')
         + (j.n_shrink ? ` · ${j.n_shrink} shrink-flagged (orange)` : '')
+        + (j.resumes ? ` · ${j.resumes} re-acquired after track loss` : '')
         + (j.invisible ? ` · ${j.invisible} not visible (unmasked)` : '')
         + ' — scrub: red=proposed, green=current · v=veto · then apply';
       document.getElementById('propControls').style.display = '';

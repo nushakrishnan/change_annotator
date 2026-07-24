@@ -12,11 +12,11 @@ One run covers the object's whole visible span:
     GT needs every visible frame masked, the human judges the flagged ones;
   - frames OUTSIDE the outermost anchors are extrapolation. In forward mode the
     window extends past the last covered frame to the end of the walk (max_span-
-    capped): one click carries the object's whole remaining presence. The run
-    tolerates brief wobble — up to `patience` consecutive misses (gate failure or
-    object momentarily <200px, e.g. motion blur or a passer-by) before stopping;
-    wobble frames that recover are proposed flagged "lowconf", a trailing run
-    that never recovers is dropped;
+    capped): one click carries the object's whole remaining presence, INCLUDING
+    across off-screen gaps between visits (invisible frames propose nothing and
+    never stop the run). The run tolerates brief wobble — up to `patience`
+    consecutive gate failures before stopping; wobble frames that recover are
+    proposed flagged "lowconf", a trailing run that never recovers is dropped;
   - the gate: geometric agreement with the reprojected seed footprint (IoU or
     seed-box coverage) OR temporal consistency with the previous accepted mask.
     Geometry alone is untrustworthy at span starts (misplaced seeds were observed
@@ -74,16 +74,31 @@ def _box_iou_cover(a, b):
 
 def _gate(m, prev, seed, iou_floor):
     """(geo_ok, temporal_ok) for a proposed mask vs the seed footprint and the
-    previous accepted mask (which chains back to a human anchor)."""
+    previous accepted mask (which chains back to a human anchor). temporal_ok
+    may be the string "exit" (truthy): the mask shrinks IN PLACE while touching
+    the image border — the object is leaving the frame, not the track drifting;
+    partial masks during the exit are valid GT (proposed flagged lowconf), and
+    stopping there was measured to strand every visit after the first
+    (cardboard_boxes: edge-gate death at t=12.0s, five visits unreached)."""
     if m.sum() < 200:
         return False, False
     geo_ok = False
     if seed is not None:
+        bx = seed["box"]
+        if (bx[2] - bx[0]) * (bx[3] - bx[1]) > 0.4 * m.size:
+            seed = None       # frame-sized box (legacy degenerate seeds) is no
+    if seed is not None:      # evidence — fall back to temporal-only
         g_iou, g_cover = _box_iou_cover(_mask_bbox(m), seed["box"])
         geo_ok = max(g_iou, g_cover) >= iou_floor
-    t_iou, _ = _box_iou_cover(_mask_bbox(m), _mask_bbox(prev))
+    bm, bp = _mask_bbox(m), _mask_bbox(prev)
+    t_iou, _ = _box_iou_cover(bm, bp)
     ratio = int(m.sum()) / max(1, int(prev.sum()))
     temporal_ok = t_iou >= 0.4 and 0.4 <= ratio <= 2.5
+    if not temporal_ok and bm and bp and ratio <= 1.0:
+        _, cover_m = _box_iou_cover(bp, bm)          # how much of m sits in prev's box
+        border = m[0].any() or m[-1].any() or m[:, 0].any() or m[:, -1].any()
+        if cover_m >= 0.8 and border:
+            temporal_ok = "exit"
     return geo_ok, temporal_ok
 
 
@@ -259,47 +274,71 @@ def propagate(capture, obj_dir, anchor_name, iou_floor=0.2, max_span=600,
                 invisible += 1
                 continue
             m, geo_ok, temporal_ok = got
-            _accept(i, m, geo_ok or temporal_ok)
+            _accept(i, m, geo_ok or temporal_ok is True)   # "exit" passes, flagged
             prev = m
-    # outside the outermost anchors: extrapolation into virgin frames. Tolerate
-    # brief wobble (motion blur, a passer-by): up to `patience` consecutive
-    # misses — a gate failure is buffered and proposed flagged "lowconf" only if
-    # the track recovers; an invisible frame proposes nothing (object out of
-    # view = no mask IS the GT) but doesn't kill the run either. `prev` (the
-    # temporal reference) advances only on gate-passing frames, so recovery is
-    # judged against the last GOOD mask — a smoothly drifting wrong track can't
+    # outside the outermost anchors: extrapolation into virgin frames. Invisible
+    # frames (object out of view, <200px) propose nothing — no mask IS the GT —
+    # and NEVER stop the run: a walk revisits an object many times, and the fill
+    # must bridge the off-screen gaps between visits just like the between-
+    # anchor path does (stopping at the first gap was measured to kill the run
+    # at t=11.9s on cardboard_boxes with five more visits ahead). Gate failures
+    # are the only stop signal: up to `patience` consecutive ones are buffered
+    # and proposed flagged "lowconf" if the track recovers. `prev` (the temporal
+    # reference) advances only on gate-passing frames, so recovery is judged
+    # against the last GOOD mask — a smoothly drifting wrong track can't
     # re-green-light itself. Patience exhausted -> stop, DROP the trailing
     # failed run (a track that never recovers is garbage).
+    # patience exhausted no longer ABORTS the walk: the run goes "lost" —
+    # proposes nothing — and RESUMES when the seed geometry re-acquires the
+    # object on 2 consecutive frames (a single fluke match must not restart
+    # it). This is what lets one click span a multi-visit walk even when the
+    # tracker jumps to a wrong object at a visit boundary (measured: red
+    # printer at t=11.5s on cardboard_boxes): the wrong stretch is dropped,
+    # the next visit still gets filled. No trustworthy seeds ahead -> lost
+    # stays lost, which equals the old stop.
     patience = 5
+    resumes = []
     for rng, a_edge in ((range(anchors[-1] + 1, len(win)), anchors[-1]),
                         (range(anchors[0] - 1, -1, -1), anchors[0])):
         prev = _anchor_mask(a_edge)
         misses, buffered = 0, []          # buffered: gate-failed (i, m) awaiting recovery
+        lost, pend = False, None          # pend: first geo-confirmed frame while lost
         for i in rng:
             got = _consider(i, prev)
             if got is None:
                 continue
             if got == "invisible":
                 invisible += 1
-                misses += 1
-                if misses > patience:
-                    stops.append({"name": win[i], "stopped": "edge-invisible"})
-                    break
+                pend = None               # an off-screen gap breaks a confirmation pair
                 continue
             m, geo_ok, temporal_ok = got
+            if lost:
+                if geo_ok:
+                    if pend is None:
+                        pend = (i, m)
+                    else:                 # 2nd consecutive geo pass -> resume
+                        _accept(pend[0], pend[1], True)
+                        _accept(i, m, True)
+                        prev = m
+                        lost, pend = False, None
+                        resumes.append(win[i])
+                else:
+                    pend = None
+                continue
             if geo_ok or temporal_ok:
                 for bi, bm in buffered:
                     _accept(bi, bm, False)
                 buffered, misses = [], 0
-                _accept(i, m, True)
+                _accept(i, m, geo_ok or temporal_ok is True)  # "exit" -> lowconf
                 prev = m
             else:
                 misses += 1
                 if misses > patience:
                     stops.append({"name": win[i], "stopped": "edge-gate"})
-                    break
+                    lost, buffered, misses = True, [], 0
+                    continue
                 buffered.append((i, m))
 
     meta = {"anchors": len(anchors), "span": len(win), "stops": stops,
-            "invisible": invisible}
+            "invisible": invisible, "resumes": resumes}
     return results, flags, meta

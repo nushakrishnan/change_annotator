@@ -311,6 +311,11 @@ def _seeds_for_session(pts3d, sess, renderer, capo, sid, n, min_vis, dbg_root,
         cen = pv.mean(0)
         x0, y0 = pv.min(0)
         x1, y1 = pv.max(0)
+        # a projected spread covering most of the frame carries no localization
+        # signal (degenerate geometry): as a SAM prompt it produces wall-smear
+        # masks and as a gate reference it vetoes correct ones — emit no seed
+        if (x1 - x0) * (y1 - y0) > 0.4 * cam_o.width * cam_o.height:
+            continue
         seeds[name] = {"session": sid,
                        "points": [[float(cen[0]), float(cen[1])]], "labels": [1],
                        "box": [float(x0), float(y0), float(x1), float(y1)],
@@ -365,6 +370,50 @@ def _load_src_masks(od, fallback_src_name):
     return [(fallback_src_name, m > 127)] if m is not None else []
 
 
+def _consensus_filter(chunks, centers, cluster=None, voxel=0.03, sep=0.5):
+    """Multi-view consensus for mesh-lifted mask points. A ray through a mesh
+    hole lands on the surface BEHIND the object — a view-specific artifact
+    (measured on cardboard_boxes: 50k lifted points smeared across the room,
+    room-sized seed boxes); the true object surface is hit from every view
+    that sees it. Keep lifted points only in voxels supported by >=2 view
+    GROUPS — source frames whose camera centers are > `sep` apart, so
+    consecutive frames (near-identical viewpoint, identical wall-hits) cannot
+    corroborate each other — or in voxels holding pure-cluster points (real
+    lidar evidence blesses its voxel). One view group and no cluster: nothing
+    to corroborate against, keep everything (caller warns).
+    Returns (points, n_view_groups, kept_fraction)."""
+    gids, reps = [], []
+    for c in centers:                     # greedy viewpoint grouping
+        for gi, r in enumerate(reps):
+            if np.linalg.norm(c - r) < sep:
+                gids.append(gi)
+                break
+        else:
+            reps.append(c)
+            gids.append(len(reps) - 1)
+    n_groups = len(reps)
+    total = sum(len(c) for c in chunks)
+    if not total:
+        return np.zeros((0, 3)), n_groups, 1.0
+    if n_groups < 2 and cluster is None:
+        return np.concatenate(chunks, 0), n_groups, 1.0
+    votes = {}
+    for gi, c in zip(gids, chunks):
+        for k in set(map(tuple, np.floor(c / voxel).astype(np.int64))):
+            votes.setdefault(k, set()).add(gi)
+    good = {k for k, v in votes.items() if len(v) >= 2}
+    if cluster is not None and len(cluster):
+        good |= set(map(tuple, np.floor(cluster / voxel).astype(np.int64)))
+    kept = []
+    for c in chunks:
+        kk = np.floor(c / voxel).astype(np.int64)
+        keep = np.fromiter((tuple(q) in good for q in kk), bool, len(c))
+        if keep.any():
+            kept.append(c[keep])
+    pts = np.concatenate(kept, 0) if kept else np.zeros((0, 3))
+    return pts, n_groups, len(pts) / total
+
+
 def cmd_seeds(args):
     from scantools.proc.rendering import Renderer, compute_rays
     from scantools.utils.io import read_mesh
@@ -390,18 +439,30 @@ def cmd_seeds(args):
                 hm = cv2.imread(str(od / e["mask_file"]), 0)
                 if hm is not None:
                     src_masks[name] = hm > 127
-    chunks = [c for c in (_lift_mask(m, sn, sess, renderer, compute_rays)
-                          for sn, m in src_masks.items()) if len(c)]
+    name2key = {str(sess.images[k[0], k[1]]): k for k in sess.images.key_pairs()}
+    lifted, centers = [], []
+    for sn, m in src_masks.items():
+        c = _lift_mask(m, sn, sess, renderer, compute_rays)
+        k = name2key.get(sn)
+        if len(c) and k is not None:
+            lifted.append(c)
+            centers.append(np.asarray(sess.get_pose(k[0], k[1]).t, float))
     cluster_p = od / "cluster.npy"
-    if cluster_p.exists():
-        chunks.append(np.load(cluster_p).astype(np.float64))
-    if not chunks:
+    cluster = np.load(cluster_p).astype(np.float64) if cluster_p.exists() else None
+    if not lifted and cluster is None:
         raise SystemExit(f"no geometry: no source/hand masks under {od} and no cluster.npy")
+    pts_l, n_groups, kept = _consensus_filter(lifted, centers, cluster)
+    chunks = ([pts_l] if len(pts_l) else []) + ([cluster] if cluster is not None else [])
     pts3d = np.concatenate(chunks, 0)
     np.save(od / "cluster_enriched.npy", pts3d.astype(np.float32))
     print(f"object 3D points: {len(pts3d)} from {len(src_masks)} mask(s)"
           + (f" + cluster({cluster_p.exists()})" if cluster_p.exists() else "")
           + f" in {args.ref} frame (center {np.median(pts3d, 0).round(2)})")
+    print(f"lift consensus: {n_groups} view group(s), kept {kept:.0%} of lifted points")
+    if n_groups < 2 and cluster is None:
+        print("  WARN: single viewpoint and no diff cluster — lifted geometry is "
+              "unverifiable (mesh holes leak to surfaces behind the object); "
+              "add a seed/hand mask from a different position to enable consensus")
 
     dbg_root = od / "seed_dbg"
 

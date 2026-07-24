@@ -536,6 +536,7 @@ def _propagate_fix_job(job_id, oid, frame, mode):
         JOBS[job_id].update(status="done", n=len(results), n_lowconf=n_low,
                             n_legacy=n_leg, anchors=meta["anchors"], span=meta["span"],
                             n_shrink=n_shrink,
+                            resumes=len(meta.get("resumes", [])),
                             invisible=meta.get("invisible", 0),
                             stops=[s["stopped"] for s in meta["stops"]],
                             preview=f"/results/{oid}/{prev}")
