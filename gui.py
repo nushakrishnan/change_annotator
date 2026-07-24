@@ -734,7 +734,10 @@ def _geom_snap_mask(mask, sil):
     healthy mask (a blanket core-fill was tried and squashed the tracker's
     pose-driven evolution into a carried-forward stamp):
       - TRIM mask pixels outside the BAND (dilated silhouette): shadow bleed,
-        same-coloured-neighbour spill — the object physically is not there;
+        same-coloured-neighbour spill — ONLY when the silhouette is comparable
+        to the mask (>=80% of its area). A diff cluster proves where the object
+        IS, never where it ISN'T: a partial cluster (cd_pre_02: 5.7k pts vs
+        65k-px masks) must not clip proposals back to its own patch;
       - FILL from CORE (eroded silhouette) ONLY as collapse rescue, when the
         proposal is under half the silhouette (tracker scale-lag: 56k px
         proposed vs ~600k truth on box_stack).
@@ -745,7 +748,9 @@ def _geom_snap_mask(mask, sil):
     band = cv2.dilate(sil.astype(np.uint8), np.ones((71, 71), np.uint8)) > 0
     if m.any() and (m & band).sum() < 0.2 * m.sum():
         return mask, 0.0, "contradiction"
-    corrected = m & band
+    corrected = m
+    if sil.sum() >= 0.8 * m.sum():                   # covers the object -> may
+        corrected = m & band                         # claim absence (trim bleed)
     if m.sum() < 0.5 * sil.sum():                    # collapse rescue only
         core = cv2.erode(sil.astype(np.uint8), np.ones((21, 21), np.uint8)) > 0
         corrected = corrected | core
