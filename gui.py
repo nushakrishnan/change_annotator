@@ -640,15 +640,19 @@ def api_propagate_discard():
 
 
 # ───────────────── geom mask (dense lidar-cluster silhouette) ─────────────────
-def _project_silhouette(oid, name, cur_px=0):
+def _project_silhouette(oid, name, cur_px=0, pure_only=False):
     """Project the object's stored 3D geometry into frame `name` -> dense bool
     silhouette (or None). Pure diff cluster first (clean on-object lidar); the
     seed-enriched union (cluster_enriched.npy, written by re-seeding) covers
     holes and gives manual objects geometry too — per-frame fallback, sparse-
-    guard failures retry with the union. Returns (sil, n_points, error_msg)."""
+    guard failures retry with the union. pure_only skips that fallback (the
+    lift-enriched shell must never SHAPE masks — geom-snap). Returns
+    (sil, n_points, error_msg)."""
     od = G.out_dir(CFG["capture"], oid)
     cpath = od / "cluster.npy"
     epath = od / "cluster_enriched.npy"
+    if pure_only:
+        epath = cpath
     if not cpath.exists():
         cpath = epath
     if not cpath.exists():
@@ -725,20 +729,26 @@ def _sam_refine_geom(img, seed, clip):
 
 
 def _geom_snap_mask(mask, sil):
-    """Reconcile ONE machine proposal with the projected 3D silhouette.
-    Three zones: CORE (silhouette eroded — almost certainly object), BAND
-    (dilated — boundary uncertainty, RGB keeps the final say), OUTSIDE (the
-    object physically is not here). Trim mask pixels OUTSIDE the band (shadow
-    bleed, same-coloured neighbour); fill CORE pixels the mask missed (tracker
-    scale-lag / shaved low-contrast edges). Returns (corrected, ratio, why):
-    why="contradiction" = mask and geometry barely overlap — more likely a bad
-    pose or a moved object than a bad mask, so flag it, don't cut it."""
+    """Reconcile ONE machine proposal with the projected 3D silhouette. SAM owns
+    the mask's evolution — geometry only vetoes and rescues, never reshapes a
+    healthy mask (a blanket core-fill was tried and squashed the tracker's
+    pose-driven evolution into a carried-forward stamp):
+      - TRIM mask pixels outside the BAND (dilated silhouette): shadow bleed,
+        same-coloured-neighbour spill — the object physically is not there;
+      - FILL from CORE (eroded silhouette) ONLY as collapse rescue, when the
+        proposal is under half the silhouette (tracker scale-lag: 56k px
+        proposed vs ~600k truth on box_stack).
+    Returns (corrected, ratio, why); why="contradiction" = mask and geometry
+    barely overlap — more likely a bad pose or a moved object than a bad mask,
+    so flag it, don't cut it."""
     m = mask.astype(bool)
     band = cv2.dilate(sil.astype(np.uint8), np.ones((71, 71), np.uint8)) > 0
-    core = cv2.erode(sil.astype(np.uint8), np.ones((21, 21), np.uint8)) > 0
     if m.any() and (m & band).sum() < 0.2 * m.sum():
         return mask, 0.0, "contradiction"
-    corrected = (m & band) | core
+    corrected = m & band
+    if m.sum() < 0.5 * sil.sum():                    # collapse rescue only
+        core = cv2.erode(sil.astype(np.uint8), np.ones((21, 21), np.uint8)) > 0
+        corrected = corrected | core
     ratio = float((corrected ^ m).sum()) / max(1, int(m.sum()))
     return corrected, ratio, None
 
@@ -753,15 +763,20 @@ def _geom_snap_results(oid, results, flags, say):
     if (OBJECTS.get(oid) or {}).get("deformability") == "deformable":
         return {"skipped": "deformable object"}
     od = G.out_dir(CFG["capture"], oid)
-    if not (od / "cluster.npy").exists() and not (od / "cluster_enriched.npy").exists():
-        return {"skipped": "no geometry"}
+    # PURE diff cluster only: real on-object lidar. The lift-enriched union
+    # (cluster_enriched.npy) is a view-dependent shell of the hand masks — fine
+    # for seeding, too stale to shape tracker output (measured on
+    # cardboard_boxes: proposals froze into the hand-mask stamp).
+    if not (od / "cluster.npy").exists():
+        return {"skipped": "no pure cluster"}
     sid = CFG["states"][OBJECTS[oid]["state"]]["session"]
     n_corr = n_flag = n_skip = 0
     names = sorted(results)
     for i, n in enumerate(names):
         if i % 20 == 0:
             say(f"geometry snap {i}/{len(names)} …")
-        sil, _, err = _project_silhouette(oid, n, cur_px=int(results[n].sum()))
+        sil, _, err = _project_silhouette(oid, n, cur_px=int(results[n].sum()),
+                                          pure_only=True)
         if sil is None:
             n_skip += 1
             continue
