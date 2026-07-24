@@ -34,16 +34,6 @@
   .obj.f-done.f-reviewed { border-color: #2a7; background: #d8f0de; }
   .obj.reviewing { border-color: #2a7; box-shadow: 0 0 0 2px #2a72; }
   .obj h4 { margin: 0 0 4px; font-size: 14px; padding-right: 118px; }  /* room for the flags */
-  /* two lanes, mirroring a group card's PRE|POST columns: ungrouped objects sit in
-     their state's half; group cards span both (they hold their own split) */
-  #objects { display: grid; grid-template-columns: 1fr 1fr; column-gap: 8px;
-             grid-auto-flow: row dense; align-items: start; }
-  #objects > .obj.lane-pre { grid-column: 1; }
-  #objects > .obj.lane-post { grid-column: 2; }
-  #objects > .grp { grid-column: 1 / -1; }
-  .lane-head { grid-column: 1 / -1; display: grid; grid-template-columns: 1fr 1fr;
-               font-size: 11px; font-weight: 600; color: #888; text-align: center;
-               border-bottom: 1px solid #ddd; padding: 2px 0; }
   .obj .meta { font-size: 12px; color: #666; }
   .obj img { max-width: 100%; margin-top: 6px; border: 1px solid #eee; }
   /* group container: several GUI objects = ONE physical object (shared instance id) */
@@ -927,8 +917,7 @@ let groupSel = [];     // ordered iid selection for the 'group selected' button
 function renderObjects(objs){
   const a = document.activeElement;                   // never clobber in-progress typing
   if(a && a.classList && a.classList.contains('ident')){ renderDeferred = true; return; }
-  const box = document.getElementById('objects');
-  box.innerHTML = '<div class="lane-head"><span>PRE</span><span>POST</span></div>';
+  const box = document.getElementById('objects'); box.innerHTML='';
   groupUnits = {};
   const byInst = {};
   Object.entries(objs).forEach(([k, o]) => {
@@ -956,9 +945,7 @@ function renderObjects(objs){
 function objCard(key, o, member){
   const finished = !!o.done;   // done ⇒ collapse working controls; uncheck to get them back
   const div = document.createElement('div'); div.dataset.oid = key;
-  const lane = member ? '' : (o.state === 'pre' ? ' lane-pre'
-                              : o.state === 'post' ? ' lane-post' : '');
-  div.className = 'obj' + lane + (o.done ? ' f-done' : '') + (o.reviewed ? ' f-reviewed' : '');
+  div.className = 'obj' + (o.done ? ' f-done' : '') + (o.reviewed ? ' f-reviewed' : '');
   const flags = `<span class="flags">
     <label title="annotator: masks for this object are finished"><input type="checkbox"
       ${o.done ? 'checked' : ''} onchange="setFlag('${key}','done',this.checked,this)"> done</label>
