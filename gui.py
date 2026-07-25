@@ -764,7 +764,8 @@ def api_job(job_id):
 
 def _propagate_job(job_id, oid):
     try:
-        o = OBJECTS[oid]
+        _snapshot_workspace("prereseed")   # geom regeneration has no preview gate —
+        o = OBJECTS[oid]                   # a cheap hardlink snapshot is the undo
         state = o["state"]
         objdir = oid  # OBJECTS is keyed by '<id>__<state>' = the objdir
         st = CFG["states"][state]
@@ -812,6 +813,17 @@ def _perframe_inproc(objdir, default_session):
     old_index = json.load(open(mi_path)) if mi_path.exists() else {}
     f_ts = G.frontier_ts((OBJECTS.get(objdir) or {}).get("verified_until"))
     mask_index = G.index_keep_protected(old_index, set(seeds), f_ts)
+
+    def _live_protected(name):
+        """Protection must hold at WRITE time, not job-start time: this loop
+        runs for minutes, during which the annotator may hand-save this very
+        frame or advance the frontier past it. The job-start snapshot must
+        never authorize a write over fresher co-GT."""
+        le = (json.load(open(mi_path)) if mi_path.exists() else {}).get(name)
+        f_now = G.frontier_ts((OBJECTS.get(objdir) or {}).get("verified_until"))
+        return (le and le.get("src") == "hand") or int(Path(name).stem) <= f_now
+
+    new_entries = {}
     tiles = []
     for name, s in seeds.items():
         if name in mask_index:                    # protected — do not regenerate
@@ -824,14 +836,31 @@ def _perframe_inproc(objdir, default_session):
                                   box=s["box"], multimask=False)
         mask = masks[0].astype(bool)
         flat = name.replace("/", "_")
+        if _live_protected(name):                 # re-check right before the PNG write
+            continue
         cv2.imwrite(str(masks_dir / flat), (mask * 255).astype(np.uint8))
-        mask_index[name] = {"session": sid, "mask_file": f"masks/{flat}",
-                            "px": int(mask.sum()), "src": "geom"}
+        new_entries[name] = {"session": sid, "mask_file": f"masks/{flat}",
+                             "px": int(mask.sum()), "src": "geom"}
         ov = bgr.copy()
         ov[mask] = (0.45 * ov[mask] + 0.55 * np.array([0, 0, 255])).astype(np.uint8)
         x0, y0, x1, y1 = [int(v) for v in s["box"]]
         cv2.rectangle(ov, (x0, y0), (x1, y1), (0, 255, 0), 1)
         tiles.append(cv2.resize(ov, (242, 242)))
+    # final write: MERGE onto the LIVE index — never dump the job-start copy,
+    # or hand saves / frontier moves made during the job would be reverted.
+    live = json.load(open(mi_path)) if mi_path.exists() else {}
+    f_now = G.frontier_ts((OBJECTS.get(objdir) or {}).get("verified_until"))
+    for name in list(live):                       # stale-geom cleanup, live-guarded
+        e = live[name]
+        if (e.get("src") == "geom" and name not in seeds
+                and int(Path(name).stem) > f_now):
+            del live[name]
+    for name, e in new_entries.items():
+        le = live.get(name)
+        if (le and le.get("src") == "hand") or int(Path(name).stem) <= f_now:
+            continue
+        live[name] = e
+    mask_index = live
     json.dump(mask_index, open(od / "masks_index.json", "w"), indent=1)
     if tiles:
         while len(tiles) % 4:

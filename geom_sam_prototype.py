@@ -542,6 +542,14 @@ def cmd_perframe(args):
                             box=s["box"], multimask=False)
         mask = masks[0].astype(bool)
         if args.save_masks:
+            # write-time protection re-check: a GUI session may have hand-saved
+            # this frame or advanced the frontier while this loop ran — the
+            # startup snapshot must not authorize overwriting fresher co-GT
+            live_e = (json.load(open(mi_path)) if mi_path.exists() else {}).get(name)
+            gobj_l = json.load(open(gobj_path)) if gobj_path.exists() else {}
+            f_now = frontier_ts(gobj_l.get(args.obj, {}).get("verified_until"))
+            if (live_e and live_e.get("src") == "hand") or int(Path(name).stem) <= f_now:
+                continue
             flat = name.replace("/", "_")
             cv2.imwrite(str(masks_dir / flat), (mask * 255).astype(np.uint8))
             mask_index[name] = {"session": sid, "mask_file": f"masks/{flat}", "src": "geom",
@@ -571,6 +579,22 @@ def cmd_perframe(args):
         rows = [np.concatenate(tiles[i:i + 4], 1) for i in range(0, len(tiles), 4)]
         cv2.imwrite(str(od / "result_contact.png"), np.concatenate(rows, 0))
     if args.save_masks:
+        # MERGE onto the live index — dumping the startup copy would revert any
+        # hand saves / frontier moves made (e.g. by a GUI session) mid-run
+        live = json.load(open(mi_path)) if mi_path.exists() else {}
+        gobj_l = json.load(open(gobj_path)) if gobj_path.exists() else {}
+        f_now = frontier_ts(gobj_l.get(args.obj, {}).get("verified_until"))
+        for name in list(live):                    # stale-geom cleanup, live-guarded
+            e = live[name]
+            if (e.get("src") == "geom" and name not in seeds
+                    and int(Path(name).stem) > f_now):
+                del live[name]
+        for name, e in mask_index.items():
+            le = live.get(name)
+            if (le and le.get("src") == "hand") or int(Path(name).stem) <= f_now:
+                continue
+            live[name] = e
+        mask_index = live
         json.dump(mask_index, open(od / "masks_index.json", "w"), indent=1)
     print(f"per-frame: {len(frames)} frames"
           + (f", {len(mask_index)} masks saved" if args.save_masks else "")
