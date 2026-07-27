@@ -119,7 +119,7 @@
     <button class="toolbtn" data-tool="smart" onclick="setTool('smart')" title="smart brush: rough scribble to INCLUDE (shift-drag to EXCLUDE); SAM refines the mask to the object edge on release">smart brush</button>
     <button class="toolbtn" data-tool="line" onclick="setTool('line')" title="line: click the start then end of a thin part (leg/cable) to fill a straight stroke at brush width; keep clicking to chain a polyline; Esc/Enter finishes">line</button>
     <button class="toolbtn" data-tool="linefill" onclick="setTool('linefill')" title="line fill: same as line, but when a chained segment closes a loop (on itself or against the existing mask) the enclosed area fills automatically; ctrl-z reverts segment+fill; Esc/Enter finishes">line fill</button>
-    <button class="toolbtn" data-tool="eline" onclick="setTool('eline')" title="erase line: click start then end to erase a straight square-edged stroke at brush width; keep clicking to chain; Esc/Enter finishes">erase line</button>
+    <button class="toolbtn" data-tool="eline" onclick="setTool('eline')" title="erase line: click start then end to erase a straight stroke at brush width; keep clicking to chain; Esc/Enter finishes">erase line</button>
     <button class="toolbtn" data-tool="efill" onclick="setTool('efill')" title="erase fill: same as erase line, but when a cut splits the mask, the smaller piece(s) are deleted automatically — carve off the unnecessary part and the island vanishes; ctrl-z reverts cut+deletion; Esc/Enter finishes">erase fill</button>
     <button class="toolbtn" data-tool="geombrush" onclick="setTool('geombrush')" title="geom brush: paint over a WRONG region — only inside your stroke the mask is replaced by the lidar-geometry(+SAM) answer; the rest stays untouched. Review→edit mode, needs a stored cluster (cloud-diff objects).">geom brush</button>
     &nbsp; size <input type="range" id="brushSize" min="3" max="250" value="40" style="vertical-align:middle" oninput="brushSize=+this.value">
@@ -597,7 +597,6 @@ viewport.addEventListener('mousemove', (e) => {
   const d = (tool === 'smart') ? 16 : 2 * brushSize * scale;   // smart = small pointer dot
   c.style.width = d + 'px'; c.style.height = d + 'px';
   c.style.left = (e.clientX - vr.left) + 'px'; c.style.top = (e.clientY - vr.top) + 'px';
-  c.style.borderRadius = (tool === 'eline' || tool === 'efill') ? '0' : '50%';  // square eraser
   c.style.borderColor = (tool === 'erase' || tool === 'eline' || tool === 'efill' || (tool === 'smart' && e.shiftKey))
       ? 'rgba(255,80,80,.9)'
       : tool === 'geombrush' ? 'rgba(160,80,255,.9)'   // purple = geometry fix
@@ -846,9 +845,10 @@ function doLine(e, erase){
       (erase ? 'erase line' : 'line') + ': click the end point (chains; Esc/Enter finishes)'; return false; }
   pushUndo();
   if(erase){ maskCtx.globalCompositeOperation = 'destination-out';
-             maskCtx.strokeStyle = '#000'; maskCtx.lineCap = 'square'; }
+             maskCtx.strokeStyle = '#000'; }
   else { maskCtx.globalCompositeOperation = 'source-over';
-         maskCtx.strokeStyle = 'rgba(255,0,0,0.51)'; maskCtx.lineCap = 'round'; }
+         maskCtx.strokeStyle = 'rgba(255,0,0,0.51)'; }
+  maskCtx.lineCap = 'round';
   maskCtx.lineWidth = 2 * brushSize;
   maskCtx.beginPath(); maskCtx.moveTo(lineStart[0], lineStart[1]); maskCtx.lineTo(x, y); maskCtx.stroke();
   maskCtx.globalCompositeOperation = 'source-over';
