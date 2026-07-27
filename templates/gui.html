@@ -119,6 +119,8 @@
     <button class="toolbtn" data-tool="smart" onclick="setTool('smart')" title="smart brush: rough scribble to INCLUDE (shift-drag to EXCLUDE); SAM refines the mask to the object edge on release">smart brush</button>
     <button class="toolbtn" data-tool="line" onclick="setTool('line')" title="line: click the start then end of a thin part (leg/cable) to fill a straight stroke at brush width; keep clicking to chain a polyline; Esc/Enter finishes">line</button>
     <button class="toolbtn" data-tool="linefill" onclick="setTool('linefill')" title="line fill: same as line, but when a chained segment closes a loop (on itself or against the existing mask) the enclosed area fills automatically; ctrl-z reverts segment+fill; Esc/Enter finishes">line fill</button>
+    <button class="toolbtn" data-tool="eline" onclick="setTool('eline')" title="erase line: click start then end to erase a straight square-edged stroke at brush width; keep clicking to chain; Esc/Enter finishes">erase line</button>
+    <button class="toolbtn" data-tool="efill" onclick="setTool('efill')" title="erase fill: same as erase line, but when a cut splits the mask, the smaller piece(s) are deleted automatically — carve off the unnecessary part and the island vanishes; ctrl-z reverts cut+deletion; Esc/Enter finishes">erase fill</button>
     <button class="toolbtn" data-tool="geombrush" onclick="setTool('geombrush')" title="geom brush: paint over a WRONG region — only inside your stroke the mask is replaced by the lidar-geometry(+SAM) answer; the rest stays untouched. Review→edit mode, needs a stored cluster (cloud-diff objects).">geom brush</button>
     &nbsp; size <input type="range" id="brushSize" min="3" max="250" value="40" style="vertical-align:middle" oninput="brushSize=+this.value">
   </div>
@@ -537,7 +539,7 @@ document.addEventListener('keydown', (e) => {
   // plain z = the fix loop: enter edit, and once editing, save. (ctrl/cmd+z stays undo, handled above)
   else if((e.key === 'z' || e.key === 'Z') && !e.ctrlKey && !e.metaKey && mode === 'review'){
     e.preventDefault(); editing ? saveEdit() : startEdit(); }
-  else if((e.key === 'Escape' || e.key === 'Enter') && (tool === 'line' || tool === 'linefill')){ e.preventDefault(); endLine(); document.getElementById('clickStatus').textContent = 'line finished'; }
+  else if((e.key === 'Escape' || e.key === 'Enter') && (tool === 'line' || tool === 'linefill' || tool === 'eline' || tool === 'efill')){ e.preventDefault(); endLine(); document.getElementById('clickStatus').textContent = 'line finished'; }
   else if((e.key === 'v' || e.key === 'V') && mode === 'review' && pendingMap){ e.preventDefault(); toggleVeto(); }
   else if((e.key === 'g' || e.key === 'G') && mode === 'review' && !editing){ e.preventDefault(); setFrontier(); }
   else if((e.key === 'q' || e.key === 'Q') && !e.repeat){ e.preventDefault(); peek(true); }   // hold q = peek original
@@ -588,14 +590,15 @@ viewport.addEventListener('wheel', (e) => {
 // brush-size cursor preview (shows where/how big you'll paint before you click)
 viewport.addEventListener('mousemove', (e) => {
   const c = document.getElementById('brushCursor');
-  const painty = (tool === 'brush' || tool === 'erase' || tool === 'smart' || tool === 'line' || tool === 'linefill' || tool === 'geombrush');
+  const painty = (tool === 'brush' || tool === 'erase' || tool === 'smart' || tool === 'line' || tool === 'linefill' || tool === 'geombrush' || tool === 'eline' || tool === 'efill');
   if(!maskEditable() || !painty){ c.style.display = 'none'; return; }
   const vr = viewport.getBoundingClientRect(), r = view.getBoundingClientRect();
   const scale = r.width / (view.naturalWidth || r.width);
   const d = (tool === 'smart') ? 16 : 2 * brushSize * scale;   // smart = small pointer dot
   c.style.width = d + 'px'; c.style.height = d + 'px';
   c.style.left = (e.clientX - vr.left) + 'px'; c.style.top = (e.clientY - vr.top) + 'px';
-  c.style.borderColor = (tool === 'erase' || (tool === 'smart' && e.shiftKey))
+  c.style.borderRadius = (tool === 'eline' || tool === 'efill') ? '0' : '50%';  // square eraser
+  c.style.borderColor = (tool === 'erase' || tool === 'eline' || tool === 'efill' || (tool === 'smart' && e.shiftKey))
       ? 'rgba(255,80,80,.9)'
       : tool === 'geombrush' ? 'rgba(160,80,255,.9)'   // purple = geometry fix
       : 'rgba(0,200,255,.9)';                          // red = removing/exclude, cyan = adding
@@ -695,7 +698,7 @@ viewport.addEventListener('mousedown', (e) => {
       'geom brush works in review → edit mode (x), on an object with a stored cluster'; return; }
     if(!view.complete) return;
     gesture = 'geombrush'; down = true; ensureMaskSize(); pushUndo(); gbPts = []; gbFeedback(e);
-  } else if(e.button === 0 && (tool === 'line' || tool === 'linefill') && maskEditable()){  // click tools
+  } else if(e.button === 0 && (tool === 'line' || tool === 'linefill' || tool === 'eline' || tool === 'efill') && maskEditable()){  // click tools
     gesture = tool; down = true; moved = false; sx = e.clientX; sy = e.clientY;
   } else if(e.button === 0 && (tool === 'brush' || tool === 'erase') && maskEditable()){
     gesture = 'paint'; down = true; lastPt = null; ensureMaskSize(); pushUndo(); paintAt(e);
@@ -710,7 +713,7 @@ window.addEventListener('mousemove', (e) => {
   if(gesture === 'paint'){ paintAt(e); return; }
   if(gesture === 'smart'){ addScribble(e); return; }
   if(gesture === 'geombrush'){ gbFeedback(e); return; }
-  if(gesture === 'line' || gesture === 'linefill'){ if(Math.hypot(e.clientX - sx, e.clientY - sy) > 4) moved = true; return; }
+  if(gesture === 'line' || gesture === 'linefill' || gesture === 'eline' || gesture === 'efill'){ if(Math.hypot(e.clientX - sx, e.clientY - sy) > 4) moved = true; return; }
   const dx = e.clientX - sx, dy = e.clientY - sy;
   if(!moved && Math.hypot(dx, dy) > 4) moved = true;
   if(moved){ panX = spx + dx; panY = spy + dy; applyTransform(); }
@@ -722,6 +725,8 @@ window.addEventListener('mouseup', (e) => {
   if(gesture === 'smart') refineSmart();
   if(gesture === 'line' && !moved) doLine(e);         // line = stroke only, no auto-fill
   if(gesture === 'linefill' && !moved && doLine(e)) autoFillEnclosed();  // closing segment fills the loop
+  if(gesture === 'eline' && !moved) doLine(e, true);  // erase line = square-edged cut only
+  if(gesture === 'efill' && !moved && doLine(e, true)) autoDropIsolated();  // cut splits mask -> drop islands
   if(gesture === 'paint' && tool === 'brush') autoFillEnclosed();
   if(gesture === 'geombrush') applyGeomBrush();
   gesture = null; lastPt = null;
@@ -830,21 +835,88 @@ function borderReach(a, W, H){
 
 // line tool: 1st click sets the start; each next click fills a thick straight
 // stroke (brush width) from the previous point, chaining into a polyline.
-function doLine(e){
+// erase=true cuts instead (square caps: a crisp rectangular carve, no round bulges).
+function doLine(e, erase){
   let [x, y] = evToNatural(e);
   x = Math.max(0, Math.min(view.naturalWidth - 1, x));    // clamp: line may be aimed off-frame
   y = Math.max(0, Math.min(view.naturalHeight - 1, y));
   ensureMaskSize();
   if(lineStart === null){ lineStart = [x, y];
-    document.getElementById('clickStatus').textContent = 'line: click the end point (chains; Esc/Enter finishes)'; return false; }
+    document.getElementById('clickStatus').textContent =
+      (erase ? 'erase line' : 'line') + ': click the end point (chains; Esc/Enter finishes)'; return false; }
   pushUndo();
-  maskCtx.globalCompositeOperation = 'source-over';
-  maskCtx.strokeStyle = 'rgba(255,0,0,0.51)'; maskCtx.lineWidth = 2 * brushSize; maskCtx.lineCap = 'round';
+  if(erase){ maskCtx.globalCompositeOperation = 'destination-out';
+             maskCtx.strokeStyle = '#000'; maskCtx.lineCap = 'square'; }
+  else { maskCtx.globalCompositeOperation = 'source-over';
+         maskCtx.strokeStyle = 'rgba(255,0,0,0.51)'; maskCtx.lineCap = 'round'; }
+  maskCtx.lineWidth = 2 * brushSize;
   maskCtx.beginPath(); maskCtx.moveTo(lineStart[0], lineStart[1]); maskCtx.lineTo(x, y); maskCtx.stroke();
+  maskCtx.globalCompositeOperation = 'source-over';
   lineStart = [x, y];   // chain
-  return true;          // painted a segment -> mouseup runs the auto-fill check
+  return true;          // painted a segment -> mouseup runs the auto-fill/drop check
 }
 function endLine(){ lineStart = null; }
+
+// erase-fill companion of autoFillEnclosed: when THIS cut splits a mask
+// component, keep the largest piece and delete the rest — carve off the
+// unnecessary part and the island vanishes. An erase stroke only removes
+// pixels, so every surviving pixel keeps its pre-stroke component identity:
+// label components before and after, group after-pieces by their before-label,
+// and erase every piece in a group except the biggest. Pre-existing SEPARATE
+// components (an object split by an occluder) are separate groups — untouched.
+// Mutates the canvas after doLine's pushUndo, so ctrl-z reverts cut + deletion.
+function autoDropIsolated(){
+  const W = maskCanvas.width, H = maskCanvas.height;
+  const before = undoStack[undoStack.length - 1];
+  if(!before || before.width !== W || before.height !== H) return;
+  const im = maskCtx.getImageData(0, 0, W, H), a = im.data;
+  const labBefore = labelComponents(before.data, W, H);
+  const labAfter = labelComponents(a, W, H);
+  // per after-piece: size + owning before-component (uniform across the piece)
+  const size = new Map(), owner = new Map();
+  for(let p = 0; p < W * H; p++){
+    const l = labAfter.lab[p];
+    if(!l) continue;
+    size.set(l, (size.get(l) || 0) + 1);
+    if(!owner.has(l)) owner.set(l, labBefore.lab[p]);
+  }
+  const keep = new Map();                      // before-label -> biggest after-piece
+  for(const [l, s] of size){
+    const o = owner.get(l);
+    if(!keep.has(o) || s > size.get(keep.get(o))) keep.set(o, l);
+  }
+  let n = 0, k = 0;
+  const dropped = new Set();
+  for(const [l] of size){
+    if(keep.get(owner.get(l)) !== l){ dropped.add(l); k++; }
+  }
+  if(!dropped.size) return;
+  for(let p = 0; p < W * H; p++){
+    if(dropped.has(labAfter.lab[p])){ a[p * 4 + 3] = 0; n++; }
+  }
+  maskCtx.putImageData(im, 0, 0);
+  document.getElementById('clickStatus').textContent =
+    `erase fill: dropped ${k} island(s), ${n.toLocaleString()} px`;
+}
+// 4-connected component labeling over painted (alpha>0) pixels
+function labelComponents(a, W, H){
+  const lab = new Int32Array(W * H);
+  let next = 0;
+  const stack = [];
+  for(let s = 0; s < W * H; s++){
+    if(lab[s] || a[s * 4 + 3] === 0) continue;
+    lab[s] = ++next; stack.push(s);
+    while(stack.length){
+      const p = stack.pop(), x = p % W;
+      const tryP = (q) => { if(!lab[q] && a[q * 4 + 3] !== 0){ lab[q] = next; stack.push(q); } };
+      if(x > 0) tryP(p - 1);
+      if(x < W - 1) tryP(p + 1);
+      if(p >= W) tryP(p - W);
+      if(p < W * (H - 1)) tryP(p + W);
+    }
+  }
+  return {lab, count: next};
+}
 
 // ───────────────────────── click to segment (SAM) ─────────────────────────
 async function handleClick(e){
