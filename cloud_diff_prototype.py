@@ -63,19 +63,32 @@ def _load_cloud(capture, ref, voxel, verbose=True):
     return P
 
 
-def _cluster(P, eps, min_points, min_cluster, verbose, tag):
-    """DBSCAN -> list of (M,3) clusters with >= min_cluster points, largest first."""
+def _cluster(P, eps, min_points, min_cluster, verbose, tag, core=None, core_min=0):
+    """DBSCAN -> list of (M,3) clusters with >= min_cluster points, largest first.
+    With `core` (bool per point, hysteresis): a cluster must ALSO contain >=
+    core_min confidently-changed points — band points (weak diff evidence, e.g.
+    an object's contact side carved to near-zero distance by the surface it
+    touches) may fatten a real object's cluster but can never form one alone."""
     import open3d as o3d
     if len(P) == 0:
         return []
     pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(P))
     lab = np.asarray(pcd.cluster_dbscan(eps=eps, min_points=min_points))
-    clusters = [P[lab == c] for c in (range(lab.max() + 1) if lab.max() >= 0 else [])]
-    clusters = sorted((c for c in clusters if len(c) >= min_cluster), key=len, reverse=True)
+    out = []
+    for c in (range(lab.max() + 1) if lab.max() >= 0 else []):
+        m = lab == c
+        if m.sum() < min_cluster:
+            continue
+        nc = int(core[m].sum()) if core is not None else -1
+        if core is not None and nc < core_min:
+            continue
+        out.append((P[m], nc))
+    out.sort(key=lambda t: len(t[0]), reverse=True)
     if verbose:
-        kept = ", ".join(str(len(c)) for c in clusters) or "none"
-        print(f"    [{tag}] -> {len(clusters)} clusters >= {min_cluster} pts: [{kept}]")
-    return clusters
+        kept = ", ".join(f"{len(c)}" + (f"({nc} core)" if nc >= 0 else "")
+                         for c, nc in out) or "none"
+        print(f"    [{tag}] -> {len(out)} clusters >= {min_cluster} pts: [{kept}]")
+    return [c for c, _ in out]
 
 
 def _signature(pts):
@@ -111,19 +124,33 @@ def _floor_plane(P, tol, verbose, tag):
     return None
 
 
+def _floor_keep(pts, plane, tol):
+    """Bool mask: True where a point is NOT within `tol` of the floor plane."""
+    if plane is None or len(pts) == 0:
+        return np.ones(len(pts), bool)
+    return np.abs(pts @ plane[:3] + plane[3]) > tol
+
+
 def _drop_floor(pts, plane, tol):
     """Drop points within `tol` of the floor plane (objects float free of the ground;
     legs above the plane survive). No-op if plane is None."""
-    if plane is None or len(pts) == 0:
-        return pts
-    return pts[np.abs(pts @ plane[:3] + plane[3]) > tol]
+    return pts[_floor_keep(pts, plane, tol)]
 
 
 def detect(capture, pre_ref, post_ref, bridge_path, *, tau=0.10, voxel=0.02,
            eps=0.10, min_points=10, min_cluster=500, overlap_margin=0.0,
-           remove_floor=True, floor_tol=0.04, verbose=True):
+           remove_floor=True, floor_tol=0.04, tau_lo=None, core_min=None,
+           verbose=True):
     """Two-way cloud diff -> {'old_clusters','new_clusters'} (each cluster's points
-    in its NATIVE state's world frame: old in pre/ref, new in post/ref)."""
+    in its NATIVE state's world frame: old in pre/ref, new in post/ref).
+
+    Hysteresis (tau_lo < tau): candidates are extracted at the LOW threshold and
+    clustered; a cluster survives only if it holds >= core_min points above the
+    HIGH threshold. This annexes an object's contact side — a tray flat on a
+    table has its whole underside within tau of the table and used to be carved
+    down to a sub-min_cluster fragment — while band-only noise (registration
+    ripple) has no confident core and still dies. tau_lo=None -> tau/3;
+    tau_lo=tau reproduces the plain single-threshold diff exactly."""
     from scipy.spatial import cKDTree
 
     P1 = _load_cloud(capture, pre_ref, voxel, verbose)        # pre (ref) frame
@@ -143,19 +170,33 @@ def detect(capture, pre_ref, post_ref, bridge_path, *, tau=0.10, voxel=0.02,
 
     d_old = cKDTree(P2o).query(P1o, workers=-1)[0]
     d_new = cKDTree(P1o).query(P2o, workers=-1)[0]
-    old = P1o[d_old > tau]                                    # old location, pre frame
-    new = G._apply_T(T.inverse(), P2o[d_new > tau])           # new location -> post frame
+    if tau_lo is None:
+        tau_lo = tau / 3.0
+    tau_lo = min(tau_lo, tau)
+    if core_min is None:
+        core_min = max(min_points, 50)
+    sel_o, sel_n = d_old > tau_lo, d_new > tau_lo
+    old = P1o[sel_o]                                          # old location, pre frame
+    core_o = d_old[sel_o] > tau
+    new = G._apply_T(T.inverse(), P2o[sel_n])                 # new location -> post frame
+    core_n = d_new[sel_n] > tau
     if remove_floor:                                          # float objects free of the ground
         n0o, n0n = len(old), len(new)
-        old = _drop_floor(old, plane1, floor_tol)             # old in pre frame  -> plane1
-        new = _drop_floor(new, plane2, floor_tol)             # new in post frame -> plane2
+        k = _floor_keep(old, plane1, floor_tol)               # old in pre frame  -> plane1
+        old, core_o = old[k], core_o[k]
+        k = _floor_keep(new, plane2, floor_tol)               # new in post frame -> plane2
+        new, core_n = new[k], core_n[k]
         if verbose:
             print(f"  floor dropped from changed set: old {n0o:,}->{len(old):,}  "
                   f"new {n0n:,}->{len(new):,}")
     if verbose:
-        print(f"  changed points  old(pre)={len(old):,}  new(post)={len(new):,} (tau={tau} m)")
-    return {"old_clusters": _cluster(old, eps, min_points, min_cluster, verbose, "old/pre"),
-            "new_clusters": _cluster(new, eps, min_points, min_cluster, verbose, "new/post")}
+        print(f"  changed points  old(pre)={len(old):,} ({int(core_o.sum()):,} core)  "
+              f"new(post)={len(new):,} ({int(core_n.sum()):,} core)  "
+              f"(tau={tau} m, tau_lo={tau_lo:.3f} m)")
+    return {"old_clusters": _cluster(old, eps, min_points, min_cluster, verbose,
+                                     "old/pre", core=core_o, core_min=core_min),
+            "new_clusters": _cluster(new, eps, min_points, min_cluster, verbose,
+                                     "new/post", core=core_n, core_min=core_min)}
 
 
 def _candidates_from_diff(res, prefix):
@@ -206,6 +247,7 @@ def _seed(cands, states, ctx, n, min_vis, occ_scale, dbg_root, occ_tol=0.10, min
 # ───────────────────────────── propose ─────────────────────────────
 def propose(capture, states, bridge_path, *, tau=0.10, voxel=0.02, eps=0.10,
             min_points=10, min_cluster=500, remove_floor=True, floor_tol=0.04,
+            tau_lo=None, core_min=None,
             gate_n=150, min_vis=5, occ_scale=0.5, occ_tol=0.05, min_frac=0.3,
             min_frames=3, prefix="cd", progress=None, verbose=True):
     """Full proposer up to (not including) SAM: diff -> per-cluster candidates ->
@@ -220,7 +262,8 @@ def propose(capture, states, bridge_path, *, tau=0.10, voxel=0.02, eps=0.10,
     res = detect(capture, states["pre"]["ref"], states["post"]["ref"], bridge_path,
                  tau=tau, voxel=voxel, eps=eps, min_points=min_points,
                  min_cluster=min_cluster, remove_floor=remove_floor,
-                 floor_tol=floor_tol, verbose=verbose)
+                 floor_tol=floor_tol, tau_lo=tau_lo, core_min=core_min,
+                 verbose=verbose)
     cands = _candidates_from_diff(res, prefix)
     say(f"{len(cands)} raw candidates; building geometry contexts …")
     ctx = _ctx_for_states(capture, states, cands)
@@ -268,7 +311,8 @@ def cmd_diff(a):
     res = detect(a.capture, a.pre_ref, a.post_ref,
                  _bridge(a.capture, a.pre_ref, a.post_ref, a.bridge),
                  tau=a.tau, voxel=a.voxel, eps=a.eps, min_points=a.min_points,
-                 min_cluster=a.min_cluster, remove_floor=not a.keep_floor, floor_tol=a.floor_tol)
+                 min_cluster=a.min_cluster, remove_floor=not a.keep_floor,
+                 floor_tol=a.floor_tol, tau_lo=a.tau_lo, core_min=a.core_min)
     cands = _candidates_from_diff(res, a.prefix)
     root = Path(a.capture) / "changes" / "cloud_diff"
     root.mkdir(parents=True, exist_ok=True)
@@ -285,7 +329,8 @@ def cmd_attention(a):
     res = detect(a.capture, a.pre_ref, a.post_ref,
                  _bridge(a.capture, a.pre_ref, a.post_ref, a.bridge),
                  tau=a.tau, voxel=a.voxel, eps=a.eps, min_points=a.min_points,
-                 min_cluster=a.min_cluster, remove_floor=not a.keep_floor, floor_tol=a.floor_tol)
+                 min_cluster=a.min_cluster, remove_floor=not a.keep_floor,
+                 floor_tol=a.floor_tol, tau_lo=a.tau_lo, core_min=a.core_min)
     cands = _candidates_from_diff(res, a.prefix)
     ctx = _ctx_for_states(a.capture, _states(a), cands)
     _seed(cands, _states(a), ctx, a.n, a.min_vis, a.occ_scale,
@@ -306,6 +351,7 @@ def cmd_propose(a):
                   tau=a.tau, voxel=a.voxel, eps=a.eps, min_points=a.min_points,
                   min_cluster=a.min_cluster,
                   remove_floor=not a.keep_floor, floor_tol=a.floor_tol,
+                  tau_lo=a.tau_lo, core_min=a.core_min,
                   gate_n=a.gate_n, min_vis=a.min_vis,
                   occ_scale=a.occ_scale, min_frames=a.min_frames, prefix=a.prefix,
                   progress=lambda s: print("  ·", s, flush=True))
@@ -337,6 +383,14 @@ def main():
         p.add_argument("--eps", type=float, default=0.10)
         p.add_argument("--min-points", type=int, default=10)
         p.add_argument("--min-cluster", type=int, default=500)
+        p.add_argument("--tau-lo", type=float, default=None,
+                       help="hysteresis low threshold (m): candidates above this "
+                            "cluster together but need >= core-min points above "
+                            "--tau to survive. Default tau/3; set equal to --tau "
+                            "to disable")
+        p.add_argument("--core-min", type=int, default=None,
+                       help="confident (d > tau) points a cluster must contain "
+                            "(default max(min-points, 50))")
         p.add_argument("--keep-floor", action="store_true",
                        help="do NOT remove the floor plane before clustering (default: remove it)")
         p.add_argument("--floor-tol", type=float, default=0.04,
