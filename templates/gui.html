@@ -196,6 +196,7 @@ let reviewFrontier = null;                                  // "confirmed up to 
 let gbPts = [];                                             // geom-brush stroke points
 let geomCache = {obj: null, frame: null, img: null, mode: null};   // per-frame geom+SAM result
 let undoStack = [];        // canvas snapshots for ctrl-z (one per brush stroke / SAM apply)
+let redoStack = [];        // undone snapshots for ctrl-y / ctrl-shift-z redo
 
 function curState(){ return document.querySelector('input[name=state]:checked').value; }
 function frameName(i){ return mode === 'review' ? frames[i].name : frames[i]; }
@@ -532,6 +533,8 @@ document.addEventListener('keydown', (e) => {
   const t = document.activeElement.tagName;
   if(t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT') return;
   if((e.key === 'z' || e.key === 'Z') && (e.ctrlKey || e.metaKey) && !e.shiftKey){ e.preventDefault(); undoMask(); }
+  else if(((e.key === 'y' || e.key === 'Y') && (e.ctrlKey || e.metaKey)) ||
+          ((e.key === 'z' || e.key === 'Z') && (e.ctrlKey || e.metaKey) && e.shiftKey)){ e.preventDefault(); redoMask(); }
   else if(e.key === 'ArrowRight'){ e.preventDefault(); gotoIdx(idx + 1); }
   else if(e.key === 'ArrowLeft'){ e.preventDefault(); gotoIdx(idx - 1); }
   else if((e.key === 'd' || e.key === 'D') && mode === 'review' && !editing){ e.preventDefault(); deleteMask(true); }
@@ -621,20 +624,27 @@ function ensureMaskSize(){
 }
 function clearMaskCanvas(){ ensureMaskSize(); maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height); resetUndo(); }
 // ── undo history (ctrl-z): snapshot the mask canvas before each mutating move ──
-function resetUndo(){ undoStack = []; }
+function resetUndo(){ undoStack = []; redoStack = []; }
 function pushUndo(){
   ensureMaskSize();
   try { undoStack.push(maskCtx.getImageData(0, 0, maskCanvas.width, maskCanvas.height)); }
   catch(err){ return; }                                   // e.g. canvas not yet sized
   if(undoStack.length > 20) undoStack.shift();            // cap memory (full-res snapshots)
+  redoStack = [];                                         // a new edit forks history
 }
-function undoMask(){
-  if(!maskEditable() || !undoStack.length) return;
-  const s = undoStack.pop();
+function _swapSnapshot(from, to){
+  if(!maskEditable() || !from.length) return;
+  const s = from[from.length - 1];
   ensureMaskSize();
   if(s.width !== maskCanvas.width || s.height !== maskCanvas.height) return;   // frame changed
+  from.pop();
+  try { to.push(maskCtx.getImageData(0, 0, maskCanvas.width, maskCanvas.height)); }
+  catch(err){}
+  if(to.length > 20) to.shift();
   maskCtx.putImageData(s, 0, 0);
 }
+function undoMask(){ _swapSnapshot(undoStack, redoStack); }
+function redoMask(){ _swapSnapshot(redoStack, undoStack); }
 function showMask(on){ maskCanvas.style.display = on ? 'block' : 'none'; }
 function loadMaskFromUrl(url){
   const im = new Image();
