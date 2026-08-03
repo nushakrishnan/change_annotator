@@ -321,13 +321,14 @@ function renderMaskmap(){
 }
 
 // a DONE object is finished GT — protect it from fat-finger edits: every mutating
-// action must pass this gate, which requires typing 'review' to proceed.
+// action must pass this gate, which requires typing 'r' (or 'review') to proceed.
 function guardDone(key){
   const o = objsCache[key] || {};
   if(!o.done) return true;
   const t = prompt("are you a reviewer of this object? otherwise, be really careful not to " +
-                   "edit a done object. type in 'review' to continue editing");
-  return (t || '').trim().toLowerCase() === 'review';
+                   "edit a done object. type 'r' to continue editing");
+  const v = (t || '').trim().toLowerCase();
+  return v === 'r' || v === 'review';
 }
 
 function startEdit(){
