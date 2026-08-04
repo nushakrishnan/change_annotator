@@ -297,7 +297,7 @@ def _cloud_diff_job(job_id, opts):
         cb = lambda s: JOBS[job_id].update(msg=s)
         proposals = CD.propose(
             cap, states, str(bridge),
-            tau=float(opts.get("tau", 0.10)),
+            tau=float(opts.get("tau", 0.05)),
             min_cluster=int(opts.get("min_cluster", 500)),
             # min_frames counts visibility on a ~150-frame SUBSAMPLE, so keep it
             # low (~5) or small objects (chair/coffee table, seen in tens of

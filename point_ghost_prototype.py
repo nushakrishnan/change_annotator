@@ -45,7 +45,6 @@ import numpy as np
 
 import change_mask as CM
 import geom_sam_prototype as G
-import mono_footprint_prototype as M
 
 VOTE_SCALE = 0.5           # 2560x1920 -> 1280x960 for point voting; below this,
                            # thin structure (chair tube frames) is 2-4 px wide and
@@ -112,6 +111,14 @@ def _load_cloud(capture, ref, voxel, verbose):
 
 
 # ─────────────────────── stage 1: objects (select+mesh) ───────────────────────
+def _K(cam):
+    """Pinhole intrinsics (fx, fy, cx, cy) of a scantools Camera. (Inlined from
+    the retired mono_footprint prototype, which was never committed.)"""
+    p = list(cam.projection_params)
+    return (p[0], p[0], p[1], p[2]) if cam.model_name == "SIMPLE_PINHOLE" \
+        else tuple(p[:4])
+
+
 def _project(P, T, cam):
     """(idx, u, v, z) of the points that land in front of the camera (z > 0.2)
     and inside the image; idx indexes back into P."""
@@ -121,7 +128,7 @@ def _project(P, T, cam):
     z = pc[:, 2]
     m = z > 0.2
     idx = np.nonzero(m)[0]
-    fx, fy, cx, cy = M._K(cam)
+    fx, fy, cx, cy = _K(cam)
     u = np.rint(fx * pc[m, 0] / z[m] + cx - 0.5).astype(np.int64)
     v = np.rint(fy * pc[m, 1] / z[m] + cy - 0.5).astype(np.int64)
     zi = z[m]
