@@ -636,6 +636,70 @@ def api_propagate_discard():
 
 
 # ───────────────── geom mask (dense lidar-cluster silhouette) ─────────────────
+def _geom_ctx(state):
+    """(capo, sess, renderer) for a state's mesh, built once (GEOM_LOCK guards
+    the build: impatient double-clicks must not build two renderers)."""
+    with GEOM_LOCK:
+        if state not in GEOM_CTX:
+            from scantools.proc.rendering import Renderer
+            from scantools.utils.io import read_mesh
+            st = CFG["states"][state]
+            capo, sess = G._session(CFG["capture"], st["session"], st["ref"])
+            mesh = capo.proc_path(st["ref"]) / capo.sessions[st["ref"]].proc.meshes["mesh"]
+            GEOM_CTX[state] = (capo, sess, Renderer(read_mesh(mesh)))
+    return GEOM_CTX[state]
+
+
+def _frame_key(state, sess, name):
+    """Image key for a frame name (per-state cache; key_pairs scan is O(session))."""
+    km = GEOM_KEYMAP.setdefault(state, {})
+    if not km:
+        for k in sess.images.key_pairs():
+            km[str(sess.images[k[0], k[1]])] = k
+    return km.get(name)
+
+
+DEPTH_EDGES = {}      # (state, frame) -> png bytes: mesh depth-discontinuity outline
+
+
+@app.route("/api/depth_edges")
+def api_depth_edges():
+    """Thin cyan outline of mesh depth discontinuities for a frame — geometry is
+    immune to exposure, so black furniture and shadowed edges that vanish in RGB
+    are still crisp. Display-only overlay; nothing downstream sees it."""
+    state, name = request.args["state"], request.args["frame"]
+    key = (state, name)
+    if key not in DEPTH_EDGES:
+        capo, sess, renderer = _geom_ctx(state)
+        k = _frame_key(state, sess, name)
+        if k is None:
+            return jsonify(error="frame not in this state's session"), 404
+        cam = sess.sensors[k[1]]
+        T = sess.get_pose(k[0], k[1])
+        cam_s, sx, sy = G._scaled_camera(cam, 0.5)
+        _, depth = renderer.render_from_capture(T, cam_s)
+        d = np.asarray(depth, np.float32)
+        valid = d > 0
+        gx = np.abs(np.diff(d, axis=1, prepend=d[:, :1]))
+        gy = np.abs(np.diff(d, axis=0, prepend=d[:1]))
+        rel = np.maximum(gx, gy) / np.maximum(d, 0.3)     # depth-relative step
+        edge = ((rel > 0.04) & valid).astype(np.uint8) * 255
+        edge = cv2.dilate(edge, np.ones((2, 2), np.uint8))
+        H, W = cam.height, cam.width
+        edge = cv2.resize(edge, (W, H), interpolation=cv2.INTER_NEAREST)
+        rgba = np.zeros((H, W, 4), np.uint8)
+        rgba[..., 0] = 255                                 # BGRA: cyan outline
+        rgba[..., 1] = 255
+        rgba[..., 3] = edge
+        ok, buf = cv2.imencode(".png", rgba)
+        if not ok:
+            return jsonify(error="encode failed"), 500
+        while len(DEPTH_EDGES) > 300:                      # LRU-ish cap (~small PNGs)
+            DEPTH_EDGES.pop(next(iter(DEPTH_EDGES)))
+        DEPTH_EDGES[key] = buf.tobytes()
+    return Response(DEPTH_EDGES[key], mimetype="image/png")
+
+
 def _project_silhouette(oid, name, cur_px=0, pure_only=False):
     """Project the object's stored 3D geometry into frame `name` -> dense bool
     silhouette (or None). Pure diff cluster first (clean on-object lidar); the
@@ -655,21 +719,9 @@ def _project_silhouette(oid, name, cur_px=0, pure_only=False):
         return None, 0, ("no 3D geometry stored for this object — run propagate "
                          "(re-seed) or detect-changes first")
     state = OBJECTS[oid]["state"]
-    with GEOM_LOCK:                                  # impatient double-clicks must not
-        if state not in GEOM_CTX:                    # build two renderers concurrently
-            from scantools.proc.rendering import Renderer
-            from scantools.utils.io import read_mesh
-            st = CFG["states"][state]
-            capo, sess = G._session(CFG["capture"], st["session"], st["ref"])
-            mesh = capo.proc_path(st["ref"]) / capo.sessions[st["ref"]].proc.meshes["mesh"]
-            GEOM_CTX[state] = (capo, sess, Renderer(read_mesh(mesh)))
     from scantools.utils.geometry import project, sample_depth
-    capo, sess, renderer = GEOM_CTX[state]
-    km = GEOM_KEYMAP.setdefault(state, {})
-    if not km:
-        for k in sess.images.key_pairs():
-            km[str(sess.images[k[0], k[1]])] = k
-    key = km.get(name)
+    capo, sess, renderer = _geom_ctx(state)
+    key = _frame_key(state, sess, name)
     if key is None:
         return None, 0, "frame not in this state's session"
     cam = sess.sensors[key[1]]

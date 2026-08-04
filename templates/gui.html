@@ -15,6 +15,7 @@
      #view and #maskCanvas share identical intrinsic size + rules, so they stay aligned. */
   #view { display: block; max-width: 100%; max-height: 100%; width: auto; height: auto; transform-origin: top left; cursor: crosshair; }
   #maskCanvas { position: absolute; top: 0; left: 0; max-width: 100%; max-height: 100%; width: auto; height: auto; transform-origin: top left; pointer-events: none; }
+  #edgeOverlay { position: absolute; top: 0; left: 0; max-width: 100%; max-height: 100%; width: auto; height: auto; transform-origin: top left; pointer-events: none; display: none; }
   #toolBar { font-size: 13px; }
   .toolbtn.active { background: #2a7; color: #fff; border-color: #2a7; }
   .row { margin: 8px 0; }
@@ -124,7 +125,7 @@
     <button class="toolbtn" data-tool="geombrush" onclick="setTool('geombrush')" title="geom brush: paint over a WRONG region — only inside your stroke the mask is replaced by the lidar-geometry(+SAM) answer; the rest stays untouched. Review→edit mode, needs a stored cluster (cloud-diff objects).">geom brush</button>
     &nbsp; size <input type="range" id="brushSize" min="3" max="250" value="40" style="vertical-align:middle" oninput="brushSize=+this.value">
   </div>
-  <div id="viewport"><img id="view" src=""><canvas id="maskCanvas"></canvas><div id="brushCursor"></div></div>
+  <div id="viewport"><img id="view" src=""><img id="edgeOverlay" src=""><canvas id="maskCanvas"></canvas><div id="brushCursor"></div></div>
   <div class="hint" id="annotateHint"><b>point</b>: click=positive, shift-click=negative · <b>brush/erase</b>: drag to paint (brush auto-fills areas the stroke closes off) · <b>ctrl-z</b> undo · <b>scroll</b> zoom · <b>middle-drag</b> pan · <b>fit</b> resets · <b>← / →</b> scrub</div>
   <div class="status" id="clickStatus"></div>
 </div>
@@ -515,6 +516,31 @@ function gotoIdx(i){
   if(editing){ editing = false; setEditUI(false); }
   endLine();                                    // a new frame starts a fresh line
   mode === 'review' ? showReview() : showFrame();
+  updateEdgeOverlay();
+}
+
+// ── low-exposure aids: i cycles view filters (display-only — SAM, the mask
+// canvas and everything saved see the ORIGINAL pixels); e toggles the mesh
+// depth-edge outline, the one signal immune to exposure (black furniture keeps
+// a crisp geometric silhouette no matter how dark the RGB is).
+let viewFx = 0;
+const VIEW_FX = ['', 'brightness(1.9) contrast(1.12)', 'invert(1)'];
+const VIEW_FX_NAME = ['normal', 'shadow lift', 'inverted'];
+function cycleFx(){
+  viewFx = (viewFx + 1) % VIEW_FX.length;
+  view.style.filter = VIEW_FX[viewFx];
+  document.getElementById('clickStatus').textContent =
+    'view: ' + VIEW_FX_NAME[viewFx] + ' (i cycles — display only)';
+}
+let edgesOn = false;
+const edgeImg = document.getElementById('edgeOverlay');
+function updateEdgeOverlay(){
+  if(!edgesOn || !frames.length){ edgeImg.style.display = 'none'; return; }
+  const st = (mode === 'review') ? reviewState : curState();
+  edgeImg.onload = () => { edgeImg.style.display = 'block'; };
+  edgeImg.onerror = () => { edgeImg.style.display = 'none'; };
+  edgeImg.src = '/api/depth_edges?state=' + encodeURIComponent(st)
+              + '&frame=' + encodeURIComponent(frameName(idx));
 }
 slider.addEventListener('input', () => gotoIdx(parseInt(slider.value)));
 
@@ -545,6 +571,11 @@ document.addEventListener('keydown', (e) => {
   else if((e.key === 'Escape' || e.key === 'Enter') && (tool === 'line' || tool === 'linefill' || tool === 'eline' || tool === 'efill')){ e.preventDefault(); endLine(); document.getElementById('clickStatus').textContent = 'line finished'; }
   else if((e.key === 'v' || e.key === 'V') && mode === 'review' && pendingMap){ e.preventDefault(); toggleVeto(); }
   else if((e.key === 'g' || e.key === 'G') && mode === 'review' && !editing){ e.preventDefault(); setFrontier(); }
+  else if((e.key === 'i' || e.key === 'I') && !e.ctrlKey && !e.metaKey){ e.preventDefault(); cycleFx(); }
+  else if((e.key === 'e' || e.key === 'E') && !e.ctrlKey && !e.metaKey){ e.preventDefault();
+    edgesOn = !edgesOn; updateEdgeOverlay();
+    document.getElementById('clickStatus').textContent =
+      'depth edges: ' + (edgesOn ? 'ON — cyan = mesh silhouettes (exposure-immune; first use per state loads the mesh, ~1 min)' : 'off'); }
   else if((e.key === 'q' || e.key === 'Q') && !e.repeat){ e.preventDefault(); peek(true); }   // hold q = peek original
 });
 document.addEventListener('keyup', (e) => { if(e.key === 'q' || e.key === 'Q') peek(false); });
@@ -578,6 +609,7 @@ function applyTransform(){
   panY = Math.min(0, Math.max(H * (1 - zoom), panY));
   const t = `translate(${panX}px, ${panY}px) scale(${zoom})`;
   view.style.transform = t; maskCanvas.style.transform = t;   // mask layer tracks the image
+  edgeImg.style.transform = t;                                // depth-edge layer too
 }
 function resetView(){ zoom = 1; panX = 0; panY = 0; applyTransform(); }
 viewport.addEventListener('wheel', (e) => {
