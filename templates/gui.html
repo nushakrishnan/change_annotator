@@ -115,6 +115,7 @@
   <div class="row" id="toolBar">
     tool:
     <button class="toolbtn active" data-tool="point" onclick="setTool('point')">point (SAM)</button>
+    <button class="toolbtn" data-tool="msam" onclick="setTool('msam')" title="multi-SAM: every click segments INDEPENDENTLY (no shared context, so ball 2 can't overflow ball 1) and unions onto the mask — stamp 10 separate things into ONE object ('blob1'). shift-click un-sams a stamped thing; ctrl-z reverts one stamp">multi-SAM</button>
     <button class="toolbtn" data-tool="brush" onclick="setTool('brush')" title="brush: drag to paint; when a stroke closes off an area (against the existing mask or by looping on itself) the enclosed area fills automatically; ctrl-z reverts stroke+fill together">brush</button>
     <button class="toolbtn" data-tool="erase" onclick="setTool('erase')">erase</button>
     <button class="toolbtn" data-tool="smart" onclick="setTool('smart')" title="smart brush: rough scribble to INCLUDE (shift-drag to EXCLUDE); SAM refines the mask to the object edge on release">smart brush</button>
@@ -650,7 +651,7 @@ function setTool(t){
   document.querySelectorAll('.toolbtn').forEach(b => b.classList.toggle('active', b.dataset.tool === t));
   if(t !== 'point'){ pos = []; neg = []; }                  // brushing starts a fresh SAM interaction
   endLine();                                                // switching tools finishes any open line
-  view.style.cursor = (t === 'point') ? 'crosshair' : 'cell';
+  view.style.cursor = (t === 'point' || t === 'msam') ? 'crosshair' : 'cell';
 }
 function ensureMaskSize(){
   if(view.naturalWidth && (maskCanvas.width !== view.naturalWidth || maskCanvas.height !== view.naturalHeight)){
@@ -678,6 +679,16 @@ function loadMaskFromUrl(url){
   const im = new Image();
   im.onload = () => { ensureMaskSize(); maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
                       maskCtx.drawImage(im, 0, 0, maskCanvas.width, maskCanvas.height); };
+  im.src = url;
+}
+// multi-SAM stamp: draw WITHOUT clearing — union by default, subtract carves
+// (the PNG's alpha covers only the mask, so destination-out erases exactly it)
+function stampMaskFromUrl(url, subtract){
+  const im = new Image();
+  im.onload = () => { ensureMaskSize();
+    maskCtx.globalCompositeOperation = subtract ? 'destination-out' : 'source-over';
+    maskCtx.drawImage(im, 0, 0, maskCanvas.width, maskCanvas.height);
+    maskCtx.globalCompositeOperation = 'source-over'; };
   im.src = url;
 }
 function setFrame(src, afterLoad){ view.onload = () => { ensureMaskSize(); if(afterLoad) afterLoad(); }; view.src = src; }
@@ -741,7 +752,7 @@ viewport.addEventListener('mousedown', (e) => {
   } else if(e.button === 0 && (tool === 'brush' || tool === 'erase') && maskEditable()){
     gesture = 'paint'; down = true; lastPt = null; ensureMaskSize(); pushUndo(); paintAt(e);
   } else {                                                            // middle, or point/pan
-    gesture = (e.button === 0 && tool === 'point' && maskEditable()) ? 'point' : 'pan';
+    gesture = (e.button === 0 && (tool === 'point' || tool === 'msam') && maskEditable()) ? 'point' : 'pan';
     down = true; moved = false; sx = e.clientX; sy = e.clientY; spx = panX; spy = panY;
     if(e.button === 1) e.preventDefault();
   }
@@ -963,6 +974,25 @@ async function handleClick(e){
   if(mode === 'review' && !editing) return;       // review browse = read-only
   const [x, y] = evToNatural(e);
   if(!inFrame(x, y)) return;                      // SAM point prompts must be in-frame
+  if(tool === 'msam'){
+    // multi-SAM: every click is its OWN fresh SAM interaction (one positive
+    // point, no accumulated context — so a second ball can't stretch the first
+    // ball's mask into an overflow bridge) and the result UNIONS onto the
+    // canvas. shift-click subtracts (un-sam a stamped thing). Many separate
+    // things become ONE object at save time — 'blob1' is legal GT.
+    const url = (mode === 'review') ? '/api/edit_click' : '/api/click';
+    const body = (mode === 'review')
+      ? {id: reviewObj, frame: frames[idx].name, points: [[x, y]], neg: []}
+      : {state: curState(), frame: frameName(idx), points: [[x, y]], neg: []};
+    const resp = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    const d = await resp.json();
+    if(d.error){ document.getElementById('clickStatus').textContent = d.error; return; }
+    pushUndo();                                   // ctrl-z reverts THIS stamp only
+    stampMaskFromUrl(d.mask, e.shiftKey);
+    document.getElementById('clickStatus').textContent =
+      `multi-SAM: ${e.shiftKey ? 'subtracted' : 'stamped'} ${d.px} px (score ${d.score.toFixed(3)}) — keep clicking; each click is independent`;
+    return;
+  }
   (e.shiftKey ? neg : pos).push([x, y]);
   if(pos.length === 0) return;
   const url = (mode === 'review') ? '/api/edit_click' : '/api/click';
