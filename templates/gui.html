@@ -175,6 +175,10 @@
   <div id="objects"></div>
   <hr>
   <div class="row"><button onclick="exportSegments()">export segments.json</button> <span class="status" id="exportStatus"></span></div>
+  <hr>
+  <div class="row"><button onclick="nukeWorkspace()" style="background:#b30000;color:#fff;border-color:#7a0000"
+    title="start this workspace over: every object, mask, seed, frontier and snapshot is moved aside on disk (recoverable by hand) and the object list goes blank">☢ nuke workspace</button>
+    <span class="status" id="nukeStatus"></span></div>
 </div>
 
 <script>
@@ -1143,6 +1147,25 @@ function groupCard(u){
   });
   div.append(head, cols);
   return div;
+}
+
+// ☢ nuke: wipe the whole workspace (moved aside on disk, recoverable by hand).
+// The typed 'proceed' is forwarded and re-checked SERVER-side — nothing else
+// can trigger the endpoint.
+async function nukeWorkspace(){
+  const t = prompt("☢ NUKE THIS WORKSPACE ☢\n\nEvery object, mask, seed, frontier and " +
+                   "snapshot in this workspace will be moved aside on disk and the " +
+                   "object list starts blank.\n\nType 'proceed' to nuke:");
+  if((t || '').trim().toLowerCase() !== 'proceed') return;
+  const r = await fetch('/api/nuke_workspace', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify({confirm: t.trim()})});
+  const d = await r.json();
+  if(d.error){ alert(d.error); return; }
+  clearPending();
+  if(mode === 'review') exitReview();
+  document.getElementById('nukeStatus').textContent =
+    'nuked — old workspace moved to ' + d.moved_to;
+  refreshObjects();
 }
 
 // double-click on the bold name -> edit the id in place: single cards focus

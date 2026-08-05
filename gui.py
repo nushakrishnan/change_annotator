@@ -294,6 +294,28 @@ def api_cloud_diff():
     return jsonify(job_id=job_id)
 
 
+@app.route("/api/nuke_workspace", methods=["POST"])
+def api_nuke_workspace():
+    """Start this workspace over: EVERY object, mask, seed, cluster, frontier and
+    snapshot is moved aside to <workspace>.nuked_<stamp> (same filesystem, atomic
+    rename — recoverable by hand: `mv` it back). Requires confirm='proceed',
+    enforced server-side too so nothing can trigger it programmatically."""
+    d = request.get_json() or {}
+    if (d.get("confirm") or "").strip().lower() != "proceed":
+        return jsonify(error="type 'proceed' to confirm the nuke"), 400
+    ws = G.out_dir(CFG["capture"])
+    dst = ws.with_name(ws.name + f".nuked_{time.strftime('%Y%m%d_%H%M%S')}")
+    if ws.exists():
+        os.replace(ws, dst)
+    ws.mkdir(parents=True, exist_ok=True)
+    OBJECTS.clear()
+    PROP_PENDING.clear()
+    PROP_FLAGS.clear()
+    _save_working()
+    print(f"workspace NUKED -> {dst}", flush=True)
+    return jsonify(ok=True, moved_to=str(dst))
+
+
 def _snapshot_workspace(tag):
     """Hardlink snapshot of the whole workspace (masks + indexes + gui_objects)
     into <workspace>/snapshots/<stamp>_<tag>/ — near-zero disk/time. Restore with:
