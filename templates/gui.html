@@ -145,13 +145,11 @@
   <hr>
   <div class="row">
     <button onclick="cloudDiff()" id="cdBtn"
-      title="diff the two NavVis clouds, keep changes the Aria glasses looked at, and add them as reviewable objects">🔍 detect changes (cloud diff)</button>
+      title="ONE pass: geometric cloud diff (cd_* proposals) + change fields + DINOv3 texture diff on static surfaces (tex_* proposals) — everything arrives as reviewable objects">🔍 detect changes (cloud diff + texture diff)</button>
     <button onclick="computeFields()"
       title="diff the scans ONCE into per-state point fields: certified-STATIC (matched geometry = evidence of no change) and machine-CHANGED candidates (ungated). Powers the scene view's green/magenta layers (u key) and coverage stats.">🧾 compute change fields</button>
     <input id="tauLo" type="number" step="0.005" placeholder="tau-lo m" style="width:66px"
       title="hysteresis low threshold in metres for the fields: geometry differing by MORE than this is purple, matching within it is green. Empty = tau/3 = 0.033 m. Lower = more sensitive purple (more noise); higher = calmer purple (misses subtler changes).">
-    <button onclick="textureCheck()"
-      title="DINOv3 appearance check on geometrically-STATIC surfaces (needs fields): poster/screen/banner content swaps the lidar can't see are detected by cross-state feature comparison and arrive as tex_NN proposals with masks, reviewable like cloud-diff objects. Runs several minutes.">🎨 texture check</button>
     <span class="status" id="fieldsStatus"></span>
     <span class="status" id="cdStatus"></span>
   </div>
@@ -1658,6 +1656,7 @@ async function cloudDiff(){
     min_frames:  parseInt(document.getElementById('cdMinFrames').value)    || 5,
     remove_floor: document.getElementById('cdRemoveFloor').checked,
     strict_occ: document.getElementById('cdStrictOcc').checked,
+    tau_lo: (v => isNaN(v) ? null : v)(parseFloat(document.getElementById('tauLo').value)),
   };
   const r = await fetch('/api/cloud_diff', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
   const {job_id} = await r.json();

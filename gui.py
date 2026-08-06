@@ -373,8 +373,33 @@ def _cloud_diff_job(job_id, opts):
                                     f"{key} ({n_frames} frames) …")
             _perframe_inproc(key, session)
         _save_working()
+        # ── combined pipeline: ensure change fields, then TEXTURE diff ──
+        # (appearance changes on geometrically-static surfaces; proposals are
+        # named tex_NN__<state>, distinct from the cd_* geometric ones)
+        fdir = G.out_dir(CFG["capture"]) / "fields"
+        if not (fdir / "static_pre.npy").exists():
+            JOBS[job_id].update(msg="computing change fields …")
+            CD.compute_fields(cap, pre_ref, post_ref, fdir,
+                              tau=float(opts.get("tau", 0.10)),
+                              tau_lo=opts.get("tau_lo") or None,
+                              progress=lambda s: JOBS[job_id].update(msg="fields: " + s))
+            SCENE_SPLATS.clear()
+        tex = []
+        try:
+            import appearance_check as AC
+            tex = AC.run(cap, states, G.out_dir(CFG["capture"]),
+                         progress=lambda s: JOBS[job_id].update(msg="texture: " + s))
+        except Exception as te:                      # texture is additive, never fatal
+            JOBS[job_id].update(msg=f"texture diff failed (non-fatal): {te}")
+        for i, (key, session, entry, n_frames) in enumerate(tex, 1):
+            OBJECTS[key] = entry
+            JOBS[job_id].update(msg=f"segmenting texture proposal {i}/{len(tex)}: {key} …")
+            _perframe_inproc(key, session)
+        if tex:
+            _save_working()
         JOBS[job_id].update(status="done", n_proposals=len(proposals),
-                            keys=[k for k, *_ in proposals])
+                            n_texture=len(tex),
+                            keys=[k for k, *_ in proposals] + [k for k, *_ in tex])
     except Exception as e:
         JOBS[job_id].update(status="error", error=str(e))
 
