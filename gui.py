@@ -729,14 +729,18 @@ def _fields_job(job_id):
                 pts = pts[rng.choice(len(pts), cap_n, replace=False)]
             return pts.astype(_np.float32)
 
-        # static: matched within tau_lo (floor INCLUDED — the floor IS static);
-        # changed: hysteresis candidates, floor dropped (registration ripple)
-        _np.save(out / "static_pre.npy", keep(P1[d1 <= tau_lo]))
+        # static: matched within tau_lo, PLUS the floor plane unconditionally —
+        # the floor is static by definition, and its registration ripple (often
+        # > tau_lo) must not leave naked holes between green and magenta;
+        # changed: hysteresis candidates, floor dropped (same ripple)
+        _np.save(out / "static_pre.npy",
+                 keep(P1[(d1 <= tau_lo) | ~CD._floor_keep(P1, plane1, 0.04)]))
         ch1 = P1[d1 > tau_lo]
         _np.save(out / "changed_pre.npy",
                  keep(ch1[CD._floor_keep(ch1, plane1, 0.04)]))
         P2n = G._apply_T(T.inverse(), P2in1)             # back to post native frame
-        _np.save(out / "static_post.npy", keep(P2n[d2 <= tau_lo]))
+        _np.save(out / "static_post.npy",
+                 keep(P2n[(d2 <= tau_lo) | ~CD._floor_keep(P2n, plane2, 0.04)]))
         ch2 = P2n[d2 > tau_lo]
         _np.save(out / "changed_post.npy",
                  keep(ch2[CD._floor_keep(ch2, plane2, 0.04)]))

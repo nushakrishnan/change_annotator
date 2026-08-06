@@ -662,6 +662,9 @@ let peeking = false, peekSrc = null;
 function peek(on){
   if(on === peeking) return;
   peeking = on;
+  // q = the CLEAN original: also blank the scene-view and depth-edge layers
+  sceneImg.style.visibility = on ? 'hidden' : 'visible';
+  edgeImg.style.visibility = on ? 'hidden' : 'visible';
   if(mode === 'review' && !editing){          // browse mode: mask is baked into /api/overlay
     if(on){ peekSrc = view.src; view.src = '/frame?state=' + reviewState +
               '&name=' + encodeURIComponent(frames[idx].name); }
