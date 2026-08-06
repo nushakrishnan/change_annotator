@@ -16,6 +16,7 @@
   #view { display: block; max-width: 100%; max-height: 100%; width: auto; height: auto; transform-origin: top left; cursor: crosshair; }
   #maskCanvas { position: absolute; top: 0; left: 0; max-width: 100%; max-height: 100%; width: auto; height: auto; transform-origin: top left; pointer-events: none; }
   #edgeOverlay { position: absolute; top: 0; left: 0; max-width: 100%; max-height: 100%; width: auto; height: auto; transform-origin: top left; pointer-events: none; display: none; }
+  #sceneOverlay { position: absolute; top: 0; left: 0; max-width: 100%; max-height: 100%; width: auto; height: auto; transform-origin: top left; pointer-events: none; display: none; }
   #toolBar { font-size: 13px; }
   .toolbtn.active { background: #2a7; color: #fff; border-color: #2a7; }
   .row { margin: 8px 0; }
@@ -126,7 +127,7 @@
     <button class="toolbtn" data-tool="geombrush" onclick="setTool('geombrush')" title="geom brush: paint over a WRONG region — only inside your stroke the mask is replaced by the lidar-geometry(+SAM) answer; the rest stays untouched. Review→edit mode, needs a stored cluster (cloud-diff objects).">geom brush</button>
     &nbsp; size <input type="range" id="brushSize" min="3" max="250" value="40" style="vertical-align:middle" oninput="brushSize=+this.value">
   </div>
-  <div id="viewport"><img id="view" src=""><img id="edgeOverlay" src=""><canvas id="maskCanvas"></canvas><div id="brushCursor"></div></div>
+  <div id="viewport"><img id="view" src=""><img id="edgeOverlay" src=""><img id="sceneOverlay" src=""><canvas id="maskCanvas"></canvas><div id="brushCursor"></div></div>
   <div class="hint" id="annotateHint"><b>point</b>: click=positive, shift-click=negative · <b>brush/erase</b>: drag to paint (brush auto-fills areas the stroke closes off) · <b>ctrl-z</b> undo · <b>scroll</b> zoom · <b>middle-drag</b> pan · <b>fit</b> resets · <b>← / →</b> scrub</div>
   <div class="status" id="clickStatus"></div>
 </div>
@@ -144,6 +145,9 @@
   <div class="row">
     <button onclick="cloudDiff()" id="cdBtn"
       title="diff the two NavVis clouds, keep changes the Aria glasses looked at, and add them as reviewable objects">🔍 detect changes (cloud diff)</button>
+    <button onclick="computeFields()"
+      title="diff the scans ONCE into per-state point fields: certified-STATIC (matched geometry = evidence of no change) and machine-CHANGED candidates (ungated). Powers the scene view's green/magenta layers (u key) and coverage stats.">🧾 compute change fields</button>
+    <span class="status" id="fieldsStatus"></span>
     <span class="status" id="cdStatus"></span>
   </div>
   <div class="row" style="font-size:12px">
@@ -522,6 +526,7 @@ function gotoIdx(i){
   endLine();                                    // a new frame starts a fresh line
   mode === 'review' ? showReview() : showFrame();
   updateEdgeOverlay();
+  if(sceneView) updateSceneView();
 }
 
 // ── low-exposure aids: i cycles view filters (display-only — SAM, the mask
@@ -539,6 +544,72 @@ function cycleFx(){
 }
 let edgesOn = false;
 const edgeImg = document.getElementById('edgeOverlay');
+// ── scene view (u): 0 off · 1 RED union of ALL objects' masks · 2 +GREEN
+// certified-static · 3 +MAGENTA machine-changed. While on, clicking IDENTIFIES
+// the owning object (card highlighted) instead of segmenting/painting.
+let sceneView = 0;
+const sceneImg = document.getElementById('sceneOverlay');
+const SCENE_NAME = ['off', 'all masks (red)', '+ certified static (green)',
+                    '+ machine-changed (magenta)'];
+function cycleSceneView(){
+  sceneView = (sceneView + 1) % 4;
+  updateSceneView();
+}
+async function updateSceneView(){
+  if(!sceneView || !frames.length){ sceneImg.style.display = 'none';
+    if(!sceneView) document.getElementById('clickStatus').textContent = 'scene view: off';
+    return; }
+  const st = (mode === 'review') ? reviewState : curState();
+  sceneImg.onload = () => { sceneImg.style.display = 'block'; };
+  sceneImg.onerror = async () => { sceneImg.style.display = 'none';
+    document.getElementById('clickStatus').textContent =
+      'scene view: ' + (sceneView >= 2 ? "green/magenta need 'compute change fields' (cloud panel)"
+                                       : 'no masks on this frame yet'); };
+  sceneImg.src = '/api/scene_overlay?state=' + encodeURIComponent(st)
+               + '&frame=' + encodeURIComponent(frameName(idx)) + '&mode=' + sceneView
+               + '&t=' + Date.now();
+  let cov = '';
+  if(sceneView >= 2){
+    const r = await fetch('/api/scene_coverage?state=' + encodeURIComponent(st)
+                          + '&frame=' + encodeURIComponent(frameName(idx)));
+    const d = await r.json();
+    if(!d.error) cov = ` · annotated ${d.annotated}% · static ${d.static}% · `
+                     + `unclaimed ${d.unclaimed}% · no-evidence ${d.no_evidence}%`;
+  }
+  document.getElementById('clickStatus').textContent =
+    'scene view: ' + SCENE_NAME[sceneView] + cov + ' — click a red region to identify its object';
+}
+async function whoIsHereClick(e){
+  const [x, y] = evToNatural(e);
+  if(!inFrame(x, y)) return;
+  const st = (mode === 'review') ? reviewState : curState();
+  const r = await fetch('/api/who_is_here', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({state: st, frame: frameName(idx), x: Math.round(x), y: Math.round(y)})});
+  const d = await r.json();
+  document.querySelectorAll('.obj.reviewing, .grp.reviewing')
+    .forEach(el => el.classList.remove('reviewing'));
+  if(!d.keys || !d.keys.length){
+    document.getElementById('clickStatus').textContent =
+      'scene view: no object owns this pixel'; return; }
+  d.keys.forEach((k, i) => {
+    const el = document.querySelector(`[data-oid="${k}"]`);
+    if(el){ el.classList.add('reviewing'); if(i === 0) el.scrollIntoView({block: 'center'}); }
+  });
+  document.getElementById('clickStatus').textContent =
+    'here: ' + d.keys.join(', ') + ' — its card is highlighted (delete there removes it from the union)';
+}
+async function computeFields(){
+  const st = document.getElementById('fieldsStatus');
+  st.textContent = 'computing change fields …';
+  const r = await fetch('/api/compute_fields', {method:'POST', headers:{'Content-Type':'application/json'}, body: '{}'});
+  const d = await r.json();
+  const poll = setInterval(async () => {
+    const j = await (await fetch('/api/job/' + d.job_id)).json();
+    st.textContent = j.status === 'running' ? (j.msg || '…')
+                   : j.status === 'error' ? ('fields error: ' + j.error) : (j.msg || 'fields ready');
+    if(j.status !== 'running'){ clearInterval(poll); if(sceneView) updateSceneView(); }
+  }, 1500);
+}
 function updateEdgeOverlay(){
   if(!edgesOn || !frames.length){ edgeImg.style.display = 'none'; return; }
   const st = (mode === 'review') ? reviewState : curState();
@@ -576,6 +647,7 @@ document.addEventListener('keydown', (e) => {
   else if((e.key === 'Escape' || e.key === 'Enter') && (tool === 'line' || tool === 'linefill' || tool === 'eline' || tool === 'efill')){ e.preventDefault(); endLine(); document.getElementById('clickStatus').textContent = 'line finished'; }
   else if((e.key === 'v' || e.key === 'V') && mode === 'review' && pendingMap){ e.preventDefault(); toggleVeto(); }
   else if((e.key === 'g' || e.key === 'G') && mode === 'review' && !editing){ e.preventDefault(); setFrontier(); }
+  else if((e.key === 'u' || e.key === 'U') && !e.ctrlKey && !e.metaKey){ e.preventDefault(); cycleSceneView(); }
   else if((e.key === 'i' || e.key === 'I') && !e.ctrlKey && !e.metaKey){ e.preventDefault(); cycleFx(); }
   else if((e.key === 'e' || e.key === 'E') && !e.ctrlKey && !e.metaKey){ e.preventDefault();
     edgesOn = !edgesOn; updateEdgeOverlay();
@@ -615,6 +687,7 @@ function applyTransform(){
   const t = `translate(${panX}px, ${panY}px) scale(${zoom})`;
   view.style.transform = t; maskCanvas.style.transform = t;   // mask layer tracks the image
   edgeImg.style.transform = t;                                // depth-edge layer too
+  sceneImg.style.transform = t;                               // scene-view layer too
 }
 function resetView(){ zoom = 1; panX = 0; panY = 0; applyTransform(); }
 viewport.addEventListener('wheel', (e) => {
@@ -737,7 +810,10 @@ let down = false, moved = false, sx = 0, sy = 0, spx = 0, spy = 0;
 // and only its overlap paints — the canvas clips out-of-bounds strokes naturally
 viewport.addEventListener('mousedown', (e) => {
   if(e.button !== 0 && e.button !== 1) return;
-  if(e.button === 0 && tool === 'smart' && maskEditable()){          // smart brush: collect scribble
+  if(e.button === 0 && sceneView > 0){               // scene view: clicks IDENTIFY, never paint
+    gesture = 'scene'; down = true; moved = false; sx = e.clientX; sy = e.clientY;
+    spx = panX; spy = panY;
+  } else if(e.button === 0 && tool === 'smart' && maskEditable()){   // smart brush: collect scribble
     if(!view.complete){ document.getElementById('clickStatus').textContent =
       'frame still loading — smart brush would use a stale mask as prior'; return; }
     ensureMaskSize();
@@ -763,6 +839,9 @@ window.addEventListener('mousemove', (e) => {
   if(gesture === 'smart'){ addScribble(e); return; }
   if(gesture === 'geombrush'){ gbFeedback(e); return; }
   if(gesture === 'line' || gesture === 'linefill' || gesture === 'eline' || gesture === 'efill'){ if(Math.hypot(e.clientX - sx, e.clientY - sy) > 4) moved = true; return; }
+  if(gesture === 'scene'){ const dx = e.clientX - sx, dy = e.clientY - sy;
+    if(!moved && Math.hypot(dx, dy) > 4) moved = true;
+    if(moved){ panX = spx + dx; panY = spy + dy; applyTransform(); } return; }
   const dx = e.clientX - sx, dy = e.clientY - sy;
   if(!moved && Math.hypot(dx, dy) > 4) moved = true;
   if(moved){ panX = spx + dx; panY = spy + dy; applyTransform(); }
@@ -770,6 +849,7 @@ window.addEventListener('mousemove', (e) => {
 window.addEventListener('mouseup', (e) => {
   if(!down) return;
   down = false;
+  if(gesture === 'scene' && !moved) whoIsHereClick(e);
   if(gesture === 'point' && !moved) handleClick(e);
   if(gesture === 'smart') refineSmart();
   if(gesture === 'line' && !moved) doLine(e);         // line = stroke only, no auto-fill

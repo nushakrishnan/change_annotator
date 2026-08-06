@@ -682,6 +682,209 @@ def _frame_key(state, sess, name):
 
 
 DEPTH_EDGES = {}      # (state, frame) -> png bytes: mesh depth-discontinuity outline
+SCENE_SPLATS = {}     # (state, frame) -> (static bool HxW, changed bool HxW) projections
+
+
+@app.route("/api/compute_fields", methods=["POST"])
+def api_compute_fields():
+    """Background job: diff the two scans ONCE and persist, per state, the
+    CERTIFIED-STATIC point field (matched within tau_lo both ways — geometric
+    evidence of NO change; matching is far more reliable than change detection)
+    and the CHANGED-CANDIDATE field (full hysteresis set, unclustered, no size
+    or attention gates — everything the lidar suspects). These feed the scene
+    view's green/magenta layers and the coverage stats."""
+    job_id = uuid.uuid4().hex[:8]
+    JOBS[job_id] = {"status": "running", "msg": "loading clouds …"}
+    threading.Thread(target=_fields_job, args=(job_id,), daemon=True).start()
+    return jsonify(job_id=job_id)
+
+
+def _fields_job(job_id):
+    try:
+        import numpy as _np
+        from scipy.spatial import cKDTree
+        cap = Path(CFG["capture"])
+        pre_ref = CFG["states"]["pre"]["ref"]
+        post_ref = CFG["states"]["post"]["ref"]
+        bridge = CD._bridge(str(cap), pre_ref, post_ref, None)
+        tau, tau_lo, voxel = 0.10, 0.10 / 3.0, 0.02
+        cb = lambda s: JOBS[job_id].update(msg=s)
+        cb(f"loading {pre_ref} …")
+        P1 = CD._load_cloud(str(cap), pre_ref, voxel, verbose=False)
+        cb(f"loading {post_ref} …")
+        P2 = CD._load_cloud(str(cap), post_ref, voxel, verbose=False)
+        T = G._load_T(bridge)
+        P2in1 = G._apply_T(T, P2)
+        cb("differencing (two-way NN) …")
+        d1 = cKDTree(P2in1).query(P1, workers=-1)[0]
+        d2 = cKDTree(P1).query(P2in1, workers=-1)[0]
+        plane1 = CD._floor_plane(P1, 0.04, False, pre_ref)
+        plane2 = CD._floor_plane(P2, 0.04, False, post_ref)
+        out = G.out_dir(CFG["capture"]) / "fields"
+        out.mkdir(parents=True, exist_ok=True)
+        rng = _np.random.default_rng(0)
+
+        def keep(pts, cap_n=800_000):
+            if len(pts) > cap_n:
+                pts = pts[rng.choice(len(pts), cap_n, replace=False)]
+            return pts.astype(_np.float32)
+
+        # static: matched within tau_lo (floor INCLUDED — the floor IS static);
+        # changed: hysteresis candidates, floor dropped (registration ripple)
+        _np.save(out / "static_pre.npy", keep(P1[d1 <= tau_lo]))
+        ch1 = P1[d1 > tau_lo]
+        _np.save(out / "changed_pre.npy",
+                 keep(ch1[CD._floor_keep(ch1, plane1, 0.04)]))
+        P2n = G._apply_T(T.inverse(), P2in1)             # back to post native frame
+        _np.save(out / "static_post.npy", keep(P2n[d2 <= tau_lo]))
+        ch2 = P2n[d2 > tau_lo]
+        _np.save(out / "changed_post.npy",
+                 keep(ch2[CD._floor_keep(ch2, plane2, 0.04)]))
+        SCENE_SPLATS.clear()                             # stale projections
+        JOBS[job_id].update(status="done",
+                            msg=f"fields written -> {out} (tau_lo={tau_lo:.3f})")
+    except Exception as e:
+        JOBS[job_id].update(status="error", error=str(e))
+
+
+def _union_mask(state, frame):
+    """Union of every object's saved mask on this frame (bool full-res or None)."""
+    u = None
+    for key, o in OBJECTS.items():
+        if o.get("state") != state or o.get("ghost"):
+            continue
+        od = G.out_dir(CFG["capture"], key)
+        mi_path = od / "masks_index.json"
+        if not mi_path.exists():
+            continue
+        e = json.load(open(mi_path)).get(frame)
+        if not e:
+            continue
+        m = cv2.imread(str(od / e["mask_file"]), 0)
+        if m is None:
+            continue
+        u = (m > 127) if u is None else (u | (m > 127))
+    return u
+
+
+def _scene_splats(state, frame):
+    """(static bool, changed bool) projections for a frame, occlusion-tested,
+    cached. Raises FileNotFoundError until compute_fields has run."""
+    key = (state, frame)
+    if key in SCENE_SPLATS:
+        return SCENE_SPLATS[key]
+    fdir = G.out_dir(CFG["capture"]) / "fields"
+    sp = fdir / f"static_{state}.npy"
+    chp = fdir / f"changed_{state}.npy"
+    if not sp.exists() or not chp.exists():
+        raise FileNotFoundError("fields not computed")
+    from scantools.utils.geometry import project, sample_depth
+    capo, sess, renderer = _geom_ctx(state)
+    k = _frame_key(state, sess, frame)
+    if k is None:
+        raise KeyError("frame not in session")
+    cam = sess.sensors[k[1]]
+    T = sess.get_pose(k[0], k[1])
+    cam_s, sx, sy = G._scaled_camera(cam, 0.5)
+    _, depth = renderer.render_from_capture(T, cam_s)
+    H, W = cam.height, cam.width
+    outs = []
+    for p in (sp, chp):
+        P = np.load(p)
+        p2d, z, vis = project(P.astype(np.float64), cam, pose=T.inverse())
+        m = np.zeros((H // 2, W // 2), np.uint8)
+        if vis.any():
+            occ_z, occ_ok = sample_depth(p2d[vis] * np.array([sx, sy]), depth)
+            pv = p2d[vis][occ_ok & (z[vis] <= occ_z + 0.05)] / 2.0
+            pv = pv[(pv[:, 0] >= 0) & (pv[:, 0] < W // 2)
+                    & (pv[:, 1] >= 0) & (pv[:, 1] < H // 2)].astype(np.int32)
+            m[pv[:, 1], pv[:, 0]] = 255
+            m = cv2.dilate(m, np.ones((5, 5), np.uint8))
+            m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+        outs.append(cv2.resize(m, (W, H), interpolation=cv2.INTER_NEAREST) > 0)
+    while len(SCENE_SPLATS) > 200:
+        SCENE_SPLATS.pop(next(iter(SCENE_SPLATS)))
+    SCENE_SPLATS[key] = (outs[0], outs[1])
+    return SCENE_SPLATS[key]
+
+
+@app.route("/api/scene_overlay")
+def api_scene_overlay():
+    """Scene-view overlay PNG. mode 1: RED = union of all annotated masks;
+    mode 2: + GREEN certified-static; mode 3: + MAGENTA machine-changed
+    candidates. Uncoloured pixels in mode 3 = no lidar evidence OR missed
+    change — the completeness check, visually."""
+    state, frame = request.args["state"], request.args["frame"]
+    mode = int(request.args.get("mode", 1))
+    u = _union_mask(state, frame)
+    static = changed = None
+    if mode >= 2:
+        try:
+            static, changed = _scene_splats(state, frame)
+        except FileNotFoundError:
+            return jsonify(error="run 'compute change fields' first (cloud panel)"), 404
+        except KeyError:
+            return jsonify(error="frame not in this state's session"), 404
+    if u is None and static is None:
+        return jsonify(error="nothing to show on this frame"), 404
+    ref = u if u is not None else static
+    H, W = ref.shape
+    rgba = np.zeros((H, W, 4), np.uint8)
+    if static is not None:                               # green: certified static
+        s = static & ~(u if u is not None else False)
+        rgba[s] = (60, 200, 60, 70)
+    if mode >= 3 and changed is not None:                # magenta: unclaimed change
+        c = changed & ~(u if u is not None else False)
+        if static is not None:
+            c = c & ~static
+        rgba[c] = (200, 0, 220, 110)
+    if u is not None:                                    # red: annotated union (wins)
+        rgba[u] = (0, 0, 255, 100)
+    ok, buf = cv2.imencode(".png", rgba)
+    return Response(buf.tobytes(), mimetype="image/png")
+
+
+@app.route("/api/scene_coverage")
+def api_scene_coverage():
+    """Coverage stats for the scene view status line."""
+    state, frame = request.args["state"], request.args["frame"]
+    u = _union_mask(state, frame)
+    try:
+        static, changed = _scene_splats(state, frame)
+    except Exception:
+        return jsonify(error="fields not computed"), 404
+    H, W = static.shape
+    tot = H * W
+    ub = u if u is not None else np.zeros((H, W), bool)
+    unclaimed = changed & ~ub & ~static
+    none = ~ub & ~static & ~changed
+    return jsonify(annotated=round(100 * ub.mean(), 1),
+                   static=round(100 * (static & ~ub).mean(), 1),
+                   unclaimed=round(100 * unclaimed.mean(), 1),
+                   no_evidence=round(100 * none.mean(), 1))
+
+
+@app.route("/api/who_is_here", methods=["POST"])
+def api_who_is_here():
+    """Which object(s) own this pixel on this frame — scene-view click-to-identify."""
+    d = request.get_json()
+    state, frame = d["state"], d["frame"]
+    x, y = int(d["x"]), int(d["y"])
+    hits = []
+    for key, o in OBJECTS.items():
+        if o.get("state") != state or o.get("ghost"):
+            continue
+        od = G.out_dir(CFG["capture"], key)
+        mi_path = od / "masks_index.json"
+        if not mi_path.exists():
+            continue
+        e = json.load(open(mi_path)).get(frame)
+        if not e:
+            continue
+        m = cv2.imread(str(od / e["mask_file"]), 0)
+        if m is not None and 0 <= y < m.shape[0] and 0 <= x < m.shape[1] and m[y, x] > 127:
+            hits.append(key)
+    return jsonify(keys=hits)
 
 
 @app.route("/api/depth_edges")
