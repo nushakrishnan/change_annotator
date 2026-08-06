@@ -147,6 +147,8 @@
       title="diff the two NavVis clouds, keep changes the Aria glasses looked at, and add them as reviewable objects">🔍 detect changes (cloud diff)</button>
     <button onclick="computeFields()"
       title="diff the scans ONCE into per-state point fields: certified-STATIC (matched geometry = evidence of no change) and machine-CHANGED candidates (ungated). Powers the scene view's green/magenta layers (u key) and coverage stats.">🧾 compute change fields</button>
+    <input id="tauLo" type="number" step="0.005" placeholder="tau-lo m" style="width:66px"
+      title="hysteresis low threshold in metres for the fields: geometry differing by MORE than this is purple, matching within it is green. Empty = tau/3 = 0.033 m. Lower = more sensitive purple (more noise); higher = calmer purple (misses subtler changes).">
     <button onclick="textureCheck()"
       title="DINOv3 appearance check on geometrically-STATIC surfaces (needs fields): poster/screen/banner content swaps the lidar can't see are detected by cross-state feature comparison and arrive as tex_NN proposals with masks, reviewable like cloud-diff objects. Runs several minutes.">🎨 texture check</button>
     <span class="status" id="fieldsStatus"></span>
@@ -585,6 +587,19 @@ async function whoIsHereClick(e){
   const [x, y] = evToNatural(e);
   if(!inFrame(x, y)) return;
   const st = (mode === 'review') ? reviewState : curState();
+  if(e.shiftKey){                                   // shift-click = CLAIM purple
+    if(mode !== 'review'){ document.getElementById('clickStatus').textContent =
+      'claim purple: open the TARGET object in review first — shift-click merges the blob into it'; return; }
+    const r0 = await fetch('/api/claim_purple', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({id: reviewObj, frame: frameName(idx), x: Math.round(x), y: Math.round(y)})});
+    const d0 = await r0.json();
+    if(d0.error){ document.getElementById('clickStatus').textContent = 'claim purple: ' + d0.error; return; }
+    document.getElementById('clickStatus').textContent =
+      `claim purple: +${d0.added.toLocaleString()} px merged into ${reviewObj} (src=prop) — total ${d0.px.toLocaleString()} px`;
+    frames[idx].has_mask = true; frames[idx].px = d0.px;
+    showReview(); updateSceneView();
+    return;
+  }
   const r = await fetch('/api/who_is_here', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({state: st, frame: frameName(idx), x: Math.round(x), y: Math.round(y)})});
   const d = await r.json();
@@ -620,7 +635,9 @@ async function textureCheck(){
 async function computeFields(){
   const st = document.getElementById('fieldsStatus');
   st.textContent = 'computing change fields …';
-  const r = await fetch('/api/compute_fields', {method:'POST', headers:{'Content-Type':'application/json'}, body: '{}'});
+  const tl = parseFloat(document.getElementById('tauLo').value);
+  const r = await fetch('/api/compute_fields', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({tau_lo: isNaN(tl) ? null : tl})});
   const d = await r.json();
   const poll = setInterval(async () => {
     const j = await (await fetch('/api/job/' + d.job_id)).json();

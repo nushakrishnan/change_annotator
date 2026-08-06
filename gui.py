@@ -721,17 +721,19 @@ def api_compute_fields():
     and the CHANGED-CANDIDATE field (full hysteresis set, unclustered, no size
     or attention gates — everything the lidar suspects). These feed the scene
     view's green/magenta layers and the coverage stats."""
+    d = request.get_json() or {}
+    tau_lo = d.get("tau_lo") or None                 # None -> tau/3 (0.033 m)
     job_id = uuid.uuid4().hex[:8]
     JOBS[job_id] = {"status": "running", "msg": "loading clouds …"}
-    threading.Thread(target=_fields_job, args=(job_id,), daemon=True).start()
+    threading.Thread(target=_fields_job, args=(job_id, tau_lo), daemon=True).start()
     return jsonify(job_id=job_id)
 
 
-def _fields_job(job_id):
+def _fields_job(job_id, tau_lo=None):
     try:
         out = G.out_dir(CFG["capture"]) / "fields"
         n = CD.compute_fields(CFG["capture"], CFG["states"]["pre"]["ref"],
-                              CFG["states"]["post"]["ref"], out,
+                              CFG["states"]["post"]["ref"], out, tau_lo=tau_lo,
                               progress=lambda s: JOBS[job_id].update(msg=s))
         SCENE_SPLATS.clear()                             # stale projections
         JOBS[job_id].update(status="done",
@@ -859,6 +861,72 @@ def api_scene_coverage():
 
 
 SEED_BOXES = {}       # key -> (seeds.json mtime, {frame: box}) for who-is-here fallback
+
+
+@app.route("/api/claim_purple", methods=["POST"])
+def api_claim_purple():
+    """Merge the UNCLAIMED-CHANGE (purple) connected component at (x,y) into an
+    existing object's mask on this frame — shift-click in scene view while
+    reviewing the target. SAM-refined inside the component's envelope; the
+    result is written as src='prop' (survives re-seed, freely improvable).
+    Co-GT rules hold: hand frames, at/behind-frontier frames and done objects
+    refuse."""
+    d = request.get_json()
+    oid, frame = d["id"], d["frame"]
+    x, y = int(d["x"]), int(d["y"])
+    if oid not in OBJECTS:
+        return jsonify(error="unknown object"), 404
+    o = OBJECTS[oid]
+    if o.get("done"):
+        return jsonify(error="object is done — uncheck to edit"), 400
+    if int(Path(frame).stem) <= G.frontier_ts(o.get("verified_until")):
+        return jsonify(error="frame is at/behind the frontier"), 400
+    state = o["state"]
+    try:
+        static, changed = _scene_splats(state, frame)
+    except Exception:
+        return jsonify(error="fields not computed"), 404
+    u = _union_mask(state, frame)
+    free = changed & ~(u if u is not None else False)
+    if not (0 <= y < free.shape[0] and 0 <= x < free.shape[1]) or not free[y, x]:
+        return jsonify(error="no unclaimed purple at this pixel"), 400
+    ncomp, lab = cv2.connectedComponents(free.astype(np.uint8))
+    comp = lab == lab[y, x]
+    od = G.out_dir(CFG["capture"], oid)
+    mi_path = od / "masks_index.json"
+    mi = json.load(open(mi_path)) if mi_path.exists() else {}
+    e = mi.get(frame)
+    if e and e.get("src") == "hand":
+        return jsonify(error="this frame's mask is hand co-GT — edit it manually"), 400
+    sid = e["session"] if e else CFG["states"][state]["session"]
+    # SAM-refine the blobby splat to the image edge, bounded to its envelope
+    add = comp
+    try:
+        bgr = cv2.imread(str(Path(CFG["capture"]) / "sessions" / sid / "raw_data" / frame))
+        img = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        clip = cv2.dilate(comp.astype(np.uint8), np.ones((61, 61), np.uint8)) > 0
+        r = _sam_refine_geom(img, comp, clip)
+        inter, union = (r & comp).sum(), (r | comp).sum()
+        if r.sum() >= 200 and union and inter / union >= 0.3:
+            add = r
+    except Exception:
+        pass
+    cur = None
+    if e:
+        m0 = cv2.imread(str(od / e["mask_file"]), 0)
+        cur = (m0 > 127) if m0 is not None else None
+    merged = add if cur is None else (cur | add)
+    flat = frame.replace("/", "_")
+    (od / "masks").mkdir(exist_ok=True)
+    if e and (od / e["mask_file"]).exists():         # backup before overwrite
+        bak = od / "masks" / ".bak_claim"
+        bak.mkdir(parents=True, exist_ok=True)
+        shutil.copy(od / e["mask_file"], bak / flat)
+    cv2.imwrite(str(od / "masks" / flat), (merged * 255).astype(np.uint8))
+    mi[frame] = {"session": sid, "mask_file": f"masks/{flat}",
+                 "px": int(merged.sum()), "src": "prop"}
+    json.dump(mi, open(mi_path, "w"), indent=1)
+    return jsonify(ok=True, added=int(add.sum()), px=int(merged.sum()))
 
 
 @app.route("/api/who_is_here", methods=["POST"])
