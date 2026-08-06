@@ -685,6 +685,34 @@ DEPTH_EDGES = {}      # (state, frame) -> png bytes: mesh depth-discontinuity ou
 SCENE_SPLATS = {}     # (state, frame) -> (static bool HxW, changed bool HxW) projections
 
 
+@app.route("/api/texture_check", methods=["POST"])
+def api_texture_check():
+    """DINOv3 appearance check on geometrically-static surfaces: poster/screen/
+    banner content changes the lidar can't see become tex_NN proposals with
+    seeds + SAM masks, reviewable like cloud-diff objects."""
+    _snapshot_workspace("pretexture")
+    job_id = uuid.uuid4().hex[:8]
+    JOBS[job_id] = {"status": "running", "msg": "starting texture check …"}
+    threading.Thread(target=_texture_job, args=(job_id,), daemon=True).start()
+    return jsonify(job_id=job_id)
+
+
+def _texture_job(job_id):
+    try:
+        import appearance_check as AC
+        proposals = AC.run(CFG["capture"], CFG["states"], G.out_dir(CFG["capture"]),
+                           progress=lambda s: JOBS[job_id].update(msg=s))
+        for i, (key, session, entry, n_frames) in enumerate(proposals, 1):
+            OBJECTS[key] = entry
+            JOBS[job_id].update(msg=f"segmenting texture proposal {i}/{len(proposals)}: {key} …")
+            _perframe_inproc(key, session)
+        _save_working()
+        JOBS[job_id].update(status="done", n_proposals=len(proposals),
+                            keys=[k for k, *_ in proposals])
+    except (Exception, SystemExit) as e:
+        JOBS[job_id].update(status="error", error=str(e))
+
+
 @app.route("/api/compute_fields", methods=["POST"])
 def api_compute_fields():
     """Background job: diff the two scans ONCE and persist, per state, the

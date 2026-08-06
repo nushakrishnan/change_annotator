@@ -147,6 +147,8 @@
       title="diff the two NavVis clouds, keep changes the Aria glasses looked at, and add them as reviewable objects">🔍 detect changes (cloud diff)</button>
     <button onclick="computeFields()"
       title="diff the scans ONCE into per-state point fields: certified-STATIC (matched geometry = evidence of no change) and machine-CHANGED candidates (ungated). Powers the scene view's green/magenta layers (u key) and coverage stats.">🧾 compute change fields</button>
+    <button onclick="textureCheck()"
+      title="DINOv3 appearance check on geometrically-STATIC surfaces (needs fields): poster/screen/banner content swaps the lidar can't see are detected by cross-state feature comparison and arrive as tex_NN proposals with masks, reviewable like cloud-diff objects. Runs several minutes.">🎨 texture check</button>
     <span class="status" id="fieldsStatus"></span>
     <span class="status" id="cdStatus"></span>
   </div>
@@ -601,6 +603,19 @@ async function whoIsHereClick(e){
     ? 'here: ' + found.join(', ') + ' — card highlighted (delete there removes it from the union)'
     : 'purple here = territory of ' + found.join(', ') + ' (cluster projects here, no mask on this '
       + 'frame yet) — card highlighted: propagate or review it';
+}
+async function textureCheck(){
+  const st = document.getElementById('fieldsStatus');
+  st.textContent = 'texture check …';
+  const r = await fetch('/api/texture_check', {method:'POST', headers:{'Content-Type':'application/json'}, body: '{}'});
+  const d = await r.json();
+  const poll = setInterval(async () => {
+    const j = await (await fetch('/api/job/' + d.job_id)).json();
+    st.textContent = j.status === 'running' ? (j.msg || '…')
+                   : j.status === 'error' ? ('texture error: ' + j.error)
+                   : `texture: ${j.n_proposals} proposal(s) added`;
+    if(j.status !== 'running'){ clearInterval(poll); refreshObjects(); }
+  }, 1500);
 }
 async function computeFields(){
   const st = document.getElementById('fieldsStatus');
