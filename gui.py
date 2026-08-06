@@ -868,27 +868,42 @@ def api_scene_coverage():
                    no_evidence=round(100 * none.mean(), 1))
 
 
+SEED_BOXES = {}       # key -> (seeds.json mtime, {frame: box}) for who-is-here fallback
+
+
 @app.route("/api/who_is_here", methods=["POST"])
 def api_who_is_here():
-    """Which object(s) own this pixel on this frame — scene-view click-to-identify."""
+    """Which object(s) own this pixel on this frame — scene-view click-to-identify.
+    Two tiers: masks (the pixel is annotated), else seed-box territory (a
+    proposal's cluster projects here but has no mask on this frame — exactly
+    what an unclaimed MAGENTA pixel usually is)."""
     d = request.get_json()
     state, frame = d["state"], d["frame"]
     x, y = int(d["x"]), int(d["y"])
-    hits = []
+    hits, territory = [], []
     for key, o in OBJECTS.items():
         if o.get("state") != state or o.get("ghost"):
             continue
         od = G.out_dir(CFG["capture"], key)
         mi_path = od / "masks_index.json"
-        if not mi_path.exists():
+        if mi_path.exists():
+            e = json.load(open(mi_path)).get(frame)
+            if e:
+                m = cv2.imread(str(od / e["mask_file"]), 0)
+                if (m is not None and 0 <= y < m.shape[0] and 0 <= x < m.shape[1]
+                        and m[y, x] > 127):
+                    hits.append(key)
+                    continue
+        sp = od / "seeds.json"
+        if not sp.exists():
             continue
-        e = json.load(open(mi_path)).get(frame)
-        if not e:
-            continue
-        m = cv2.imread(str(od / e["mask_file"]), 0)
-        if m is not None and 0 <= y < m.shape[0] and 0 <= x < m.shape[1] and m[y, x] > 127:
-            hits.append(key)
-    return jsonify(keys=hits)
+        mt = sp.stat().st_mtime
+        if key not in SEED_BOXES or SEED_BOXES[key][0] != mt:
+            SEED_BOXES[key] = (mt, {n: s["box"] for n, s in json.load(open(sp)).items()})
+        bx = SEED_BOXES[key][1].get(frame)
+        if bx and bx[0] <= x <= bx[2] and bx[1] <= y <= bx[3]:
+            territory.append(key)
+    return jsonify(keys=hits, territory=territory)
 
 
 @app.route("/api/depth_edges")

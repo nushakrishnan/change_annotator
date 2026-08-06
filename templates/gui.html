@@ -588,15 +588,19 @@ async function whoIsHereClick(e){
   const d = await r.json();
   document.querySelectorAll('.obj.reviewing, .grp.reviewing')
     .forEach(el => el.classList.remove('reviewing'));
-  if(!d.keys || !d.keys.length){
+  const found = (d.keys && d.keys.length) ? d.keys
+              : (d.territory && d.territory.length) ? d.territory : [];
+  if(!found.length){
     document.getElementById('clickStatus').textContent =
-      'scene view: no object owns this pixel'; return; }
-  d.keys.forEach((k, i) => {
+      'scene view: nothing claims this pixel — unproposed change (annotate it) or noise'; return; }
+  found.forEach((k, i) => {
     const el = document.querySelector(`[data-oid="${k}"]`);
     if(el){ el.classList.add('reviewing'); if(i === 0) el.scrollIntoView({block: 'center'}); }
   });
-  document.getElementById('clickStatus').textContent =
-    'here: ' + d.keys.join(', ') + ' — its card is highlighted (delete there removes it from the union)';
+  document.getElementById('clickStatus').textContent = (d.keys && d.keys.length)
+    ? 'here: ' + found.join(', ') + ' — card highlighted (delete there removes it from the union)'
+    : 'purple here = territory of ' + found.join(', ') + ' (cluster projects here, no mask on this '
+      + 'frame yet) — card highlighted: propagate or review it';
 }
 async function computeFields(){
   const st = document.getElementById('fieldsStatus');
