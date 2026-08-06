@@ -940,22 +940,6 @@ def api_claim_purple():
     return jsonify(ok=True, added=int(add.sum()), px=int(merged.sum()))
 
 
-@app.route("/api/mask_png")
-def api_mask_png():
-    """One object's mask on one frame as a dark-red PNG (dismiss-arm highlight)."""
-    oid, frame = request.args["id"], request.args["frame"]
-    od = G.out_dir(CFG["capture"], oid)
-    mi_path = od / "masks_index.json"
-    e = (json.load(open(mi_path)) if mi_path.exists() else {}).get(frame)
-    m = cv2.imread(str(od / e["mask_file"]), 0) if e else None
-    if m is None:
-        return jsonify(error="no mask"), 404
-    rgba = np.zeros((*m.shape, 4), np.uint8)
-    rgba[m > 127] = (0, 0, 150, 210)
-    ok, buf = cv2.imencode(".png", rgba)
-    return Response(buf.tobytes(), mimetype="image/png")
-
-
 @app.route("/api/dismiss_object", methods=["POST"])
 def api_dismiss_object():
     """Human-certified NO-CHANGE: the object's masks are removed (recoverable,
