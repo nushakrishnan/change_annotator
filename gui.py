@@ -785,8 +785,11 @@ def _scene_splats(state, frame):
     _, depth = renderer.render_from_capture(T, cam_s)
     H, W = cam.height, cam.width
     outs = []
+    dis = G.out_dir(CFG["capture"]) / "fields" / f"dismissed_{state}.npy"
     for p in (sp, chp):
         P = np.load(p)
+        if p is sp and dis.exists():                 # dismissed = certified no-change
+            P = np.vstack([P, np.load(dis)])
         p2d, z, vis = project(P.astype(np.float64), cam, pose=T.inverse())
         m = np.zeros((H // 2, W // 2), np.uint8)
         if vis.any():
@@ -911,6 +914,14 @@ def api_claim_purple():
             add = r
     except Exception:
         pass
+    if d.get("preview"):                             # arm step: show, don't write
+        H, W = add.shape
+        rgba = np.zeros((H, W, 4), np.uint8)
+        rgba[add] = (0, 0, 150, 210)                 # darker red = armed mergee
+        ok, buf = cv2.imencode(".png", rgba)
+        import base64
+        return jsonify(preview="data:image/png;base64," + base64.b64encode(buf).decode(),
+                       px=int(add.sum()))
     cur = None
     if e:
         m0 = cv2.imread(str(od / e["mask_file"]), 0)
@@ -927,6 +938,61 @@ def api_claim_purple():
                  "px": int(merged.sum()), "src": "prop"}
     json.dump(mi, open(mi_path, "w"), indent=1)
     return jsonify(ok=True, added=int(add.sum()), px=int(merged.sum()))
+
+
+@app.route("/api/mask_png")
+def api_mask_png():
+    """One object's mask on one frame as a dark-red PNG (dismiss-arm highlight)."""
+    oid, frame = request.args["id"], request.args["frame"]
+    od = G.out_dir(CFG["capture"], oid)
+    mi_path = od / "masks_index.json"
+    e = (json.load(open(mi_path)) if mi_path.exists() else {}).get(frame)
+    m = cv2.imread(str(od / e["mask_file"]), 0) if e else None
+    if m is None:
+        return jsonify(error="no mask"), 404
+    rgba = np.zeros((*m.shape, 4), np.uint8)
+    rgba[m > 127] = (0, 0, 150, 210)
+    ok, buf = cv2.imencode(".png", rgba)
+    return Response(buf.tobytes(), mimetype="image/png")
+
+
+@app.route("/api/dismiss_object", methods=["POST"])
+def api_dismiss_object():
+    """Human-certified NO-CHANGE: the object's masks are removed (recoverable,
+    .trash) and its 3D cluster joins the workspace's dismissed field, painted
+    GREEN by the scene view from now on. Confirmed client-side with 'g' after
+    an explicit review warning — dismissal applies to the WHOLE sequence."""
+    oid = request.get_json()["id"]
+    if oid not in OBJECTS:
+        return jsonify(error="unknown object"), 404
+    if OBJECTS[oid].get("done"):
+        return jsonify(error="object is done — uncheck to dismiss"), 400
+    state = OBJECTS[oid]["state"]
+    od = G.out_dir(CFG["capture"], oid)
+    greened = False
+    for cn in ("cluster.npy", "cluster_enriched.npy"):
+        cp = od / cn
+        if cp.exists():
+            fdir = G.out_dir(CFG["capture"]) / "fields"
+            fdir.mkdir(parents=True, exist_ok=True)
+            dp = fdir / f"dismissed_{state}.npy"
+            P = np.load(cp).astype(np.float32)
+            if dp.exists():
+                P = np.vstack([np.load(dp), P])
+            np.save(dp, P)
+            greened = True
+            break
+    OBJECTS.pop(oid)
+    _save_working()
+    if od.exists():
+        trash = Path(CFG["capture"]) / G.OUT / ".trash"
+        trash.mkdir(exist_ok=True)
+        dest = trash / oid
+        if dest.exists():
+            dest = trash / f"{oid}__{uuid.uuid4().hex[:8]}"
+        shutil.move(str(od), str(dest))
+    SCENE_SPLATS.clear()                             # green layer changed
+    return jsonify(ok=True, greened=greened)
 
 
 @app.route("/api/who_is_here", methods=["POST"])
