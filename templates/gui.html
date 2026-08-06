@@ -184,6 +184,10 @@
   </div>
   <div id="objects"></div>
   <hr>
+  <h2>purple blobs <span class="hint" style="margin:0">— unclaimed change; each must be promoted, merged, or dismissed</span></h2>
+  <div class="row"><button onclick="computeBlobs()" title="cluster the unclaimed changed-field points (minus objects' clusters and dismissals) into resolvable blobs">🟣 find unresolved blobs</button> <span class="status" id="blobStatus"></span></div>
+  <div id="blobs"></div>
+  <hr>
   <div class="row"><button onclick="exportSegments()">export segments.json</button> <span class="status" id="exportStatus"></span></div>
   <hr>
   <div class="row"><button onclick="nukeWorkspace()" style="background:#b30000;color:#fff;border-color:#7a0000"
@@ -650,14 +654,8 @@ async function whoIsHereClick(e){
     if(el){ el.classList.add('reviewing'); if(i === 0) el.scrollIntoView({block: 'center'}); }
   });
   if(d.keys && d.keys.length){
-    sceneArm = {type: 'dismiss', key: d.keys[0]};
-    armImg.onload = () => { armImg.style.display = 'block'; };
-    armImg.src = '/api/mask_png?id=' + encodeURIComponent(d.keys[0])
-               + '&frame=' + encodeURIComponent(frameName(idx)) + '&t=' + Date.now();
     document.getElementById('clickStatus').textContent =
-      'here: ' + found.join(', ') + ' (dark red) — press g to DISMISS ' + d.keys[0]
-      + ': its masks are removed and its region certified NO-CHANGE (green). '
-      + '⚠ review the WHOLE sequence first — this dismisses it everywhere · Esc cancels';
+      'here: ' + found.join(', ') + " — card highlighted (its 'dismiss ⇢ green' button certifies no-change)";
   } else {
     document.getElementById('clickStatus').textContent =
       'purple here = territory of ' + found.join(', ') + ' (cluster projects here, no mask on this '
@@ -731,7 +729,6 @@ document.addEventListener('keydown', (e) => {
   else if(sceneArm && e.key === 'Escape'){ e.preventDefault(); clearSceneArm();
     document.getElementById('clickStatus').textContent = 'armed action cancelled'; }
   else if(sceneArm && sceneArm.type === 'merge' && (e.key === 'm' || e.key === 'M')){ e.preventDefault(); commitSceneArm('merge'); }
-  else if(sceneArm && sceneArm.type === 'dismiss' && (e.key === 'g' || e.key === 'G')){ e.preventDefault(); commitSceneArm('dismiss'); }
   else if((e.key === 'u' || e.key === 'U') && !e.ctrlKey && !e.metaKey){ e.preventDefault(); cycleSceneView(); }
   else if((e.key === 'i' || e.key === 'I') && !e.ctrlKey && !e.metaKey){ e.preventDefault(); cycleFx(); }
   else if((e.key === 'e' || e.key === 'E') && !e.ctrlKey && !e.metaKey){ e.preventDefault();
@@ -1295,7 +1292,9 @@ function objCard(key, o, member){
     title="the bold name is the object's instance id (+ state) — double-click to edit it; the label box below is the semantic name">${title} ${cd} ${seeds} ${masks}</h4>
     ${metaLine}${metaRow}${seedProp}
     <button onclick="openReview('${key}')" ${o.n_masks ? '' : 'disabled'}>review / edit</button>
-    ${finished ? '' : `<button onclick="deleteObject('${key}')" class="del" title="remove this object — its seeds/masks are moved to .trash (recoverable on disk)">delete</button>`}
+    ${finished ? '' : `<button onclick="deleteObject('${key}')" class="del" title="remove this object — its seeds/masks are moved to .trash (recoverable on disk)">delete</button>
+    <button onclick="dismissObject('${key}')" class="del" style="background:#2a7;color:#fff"
+      title="certify this object's region as NO-CHANGE: masks are removed (recoverable) and its geometry turns GREEN in the scene view — for proposals that definitely did not change">dismiss ⇢ green</button>`}
     <span class="status" id="st_${key}"></span>
     <div id="res_${key}"></div>`;
   if(!member && !o.ghost) attachSelBox(div.querySelector('h4'), iid);
@@ -1366,6 +1365,61 @@ async function nukeWorkspace(){
   document.getElementById('nukeStatus').textContent =
     'nuked — old workspace moved to ' + d.moved_to;
   refreshObjects();
+}
+
+async function dismissObject(key){
+  const t = prompt('DISMISS ' + key + ' as NO-CHANGE?\n\nIts masks are removed (recoverable in .trash) and its region is certified UNCHANGED (green) for the export.\n\n⚠ Review the WHOLE sequence first: dismissal applies everywhere this object appears.\n\nType g to confirm:');
+  if((t || '').trim().toLowerCase() !== 'g') return;
+  const r = await fetch('/api/dismiss_object', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({id: key})});
+  const d = await r.json();
+  if(d.error){ alert(d.error); return; }
+  if(reviewObj === key) exitReview();
+  document.getElementById('clickStatus').textContent = 'dismissed ' + key +
+    (d.greened ? ' — region now green' : ' (no 3D cluster: region stays purple/uncoloured)');
+  refreshObjects(); if(sceneView) updateSceneView();
+}
+async function computeBlobs(){
+  const st = document.getElementById('blobStatus');
+  st.textContent = 'clustering unclaimed purple …';
+  const r = await fetch('/api/purple_blobs', {method:'POST', headers:{'Content-Type':'application/json'}, body: '{}'});
+  const d = await r.json();
+  if(d.error){ st.textContent = d.error; return; }
+  st.textContent = d.blobs.length + ' unresolved blob(s)';
+  renderBlobs(d.blobs);
+}
+function renderBlobs(blobs){
+  const box = document.getElementById('blobs'); box.innerHTML = '';
+  blobs.forEach(b => {
+    const div = document.createElement('div'); div.className = 'obj';
+    div.innerHTML = `<h4>${b.id} · ${b.state} · ${b.n.toLocaleString()} pts</h4>
+      <div class="meta">extent ${b.sig.extent_m.join(' × ')} m @ ${b.sig.centroid.join(', ')}</div>
+      <button onclick="resolveBlob('${b.id}','promote')" title="becomes a real object with seeds + SAM masks">promote to object</button>
+      <button onclick="resolveBlob('${b.id}','merge')" title="its 3D points join an existing object's cluster — run propagate there afterwards">merge into…</button>
+      <button onclick="resolveBlob('${b.id}','dismiss')" class="del" style="background:#2a7;color:#fff" title="certified no-change: turns green">dismiss ⇢ green</button>`;
+    box.appendChild(div);
+  });
+}
+async function resolveBlob(bid, action){
+  let target = null;
+  if(action === 'merge'){
+    target = prompt('Merge ' + bid + " into which object? (exact key, e.g. cd_post_03__post)");
+    if(!target) return;
+  }
+  if(action === 'dismiss'){
+    const t = prompt('DISMISS ' + bid + ' as NO-CHANGE (green)?\n⚠ check it across the sequence first.\nType g to confirm:');
+    if((t || '').trim().toLowerCase() !== 'g') return;
+  }
+  const st = document.getElementById('blobStatus');
+  st.textContent = action + ' ' + bid + ' …';
+  const r = await fetch('/api/resolve_blob', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({id: bid, action, target})});
+  const d = await r.json();
+  if(d.error){ st.textContent = d.error; return; }
+  st.textContent = d.msg + ' · ' + d.remaining + ' blob(s) left';
+  const rr = await (await fetch('/api/purple_blobs')).json();
+  renderBlobs(rr.blobs || []);
+  refreshObjects(); if(sceneView) updateSceneView();
 }
 
 // double-click on the bold name -> edit the id in place: single cards focus

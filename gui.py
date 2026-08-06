@@ -995,6 +995,117 @@ def api_dismiss_object():
     return jsonify(ok=True, greened=greened)
 
 
+@app.route("/api/purple_blobs", methods=["GET", "POST"])
+def api_purple_blobs():
+    """POST: (re)compute unresolved purple blobs per state — changed-field
+    points minus everything explained (near an object's cluster or dismissed),
+    DBSCAN'd into blob entries persisted under fields/blobs/. GET: list them.
+    Every blob must be RESOLVED: promote (new object), merge (into an existing
+    object's cluster), or dismiss (certified no-change, green)."""
+    fdir = G.out_dir(CFG["capture"]) / "fields"
+    bj = fdir / "blobs.json"
+    if request.method == "GET":
+        return jsonify(blobs=json.load(open(bj)) if bj.exists() else [])
+    from scipy.spatial import cKDTree
+    import open3d as o3d
+    blobs = []
+    (fdir / "blobs").mkdir(parents=True, exist_ok=True)
+    for state in ("pre", "post"):
+        chp = fdir / f"changed_{state}.npy"
+        if not chp.exists():
+            return jsonify(error="fields not computed"), 404
+        P = np.load(chp).astype(np.float64)
+        explained = []
+        for key, o in OBJECTS.items():
+            if o.get("state") != state or o.get("ghost"):
+                continue
+            for cn in ("cluster.npy", "cluster_enriched.npy"):
+                cp = G.out_dir(CFG["capture"], key) / cn
+                if cp.exists():
+                    explained.append(np.load(cp).astype(np.float64))
+                    break
+        dp = fdir / f"dismissed_{state}.npy"
+        if dp.exists():
+            explained.append(np.load(dp).astype(np.float64))
+        if explained:
+            d = cKDTree(np.vstack(explained)).query(P, workers=-1)[0]
+            P = P[d > 0.30]
+        if len(P) < 40:
+            continue
+        pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(P))
+        lab = np.asarray(pcd.cluster_dbscan(eps=0.12, min_points=8))
+        for li in range(lab.max() + 1):
+            pts = P[lab == li]
+            if len(pts) < 60:
+                continue
+            bid = f"blob_{state}_{len(blobs):03d}"
+            np.save(fdir / "blobs" / f"{bid}.npy", pts.astype(np.float32))
+            blobs.append({"id": bid, "state": state, "n": int(len(pts)),
+                          "sig": CD._signature(pts)})
+    blobs.sort(key=lambda b: -b["n"])
+    json.dump(blobs, open(bj, "w"), indent=1)
+    return jsonify(blobs=blobs)
+
+
+@app.route("/api/resolve_blob", methods=["POST"])
+def api_resolve_blob():
+    """Resolve one purple blob: action=dismiss (points join the green dismissed
+    field), merge (points join TARGET object's cluster.npy — re-run its
+    propagate to regenerate masks), or promote (becomes a new proposal object
+    with seeds + SAM masks, like a cloud-diff survivor)."""
+    d = request.get_json()
+    bid, action = d["id"], d["action"]
+    fdir = G.out_dir(CFG["capture"]) / "fields"
+    bj = fdir / "blobs.json"
+    blobs = json.load(open(bj)) if bj.exists() else []
+    b = next((x for x in blobs if x["id"] == bid), None)
+    bp = fdir / "blobs" / f"{bid}.npy"
+    if b is None or not bp.exists():
+        return jsonify(error="unknown blob"), 404
+    pts = np.load(bp)
+    state = b["state"]
+    if action == "dismiss":
+        dp = fdir / f"dismissed_{state}.npy"
+        P = np.vstack([np.load(dp), pts]) if dp.exists() else pts
+        np.save(dp, P)
+        msg = "dismissed — region certified no-change (green)"
+    elif action == "merge":
+        target = d.get("target") or ""
+        if target not in OBJECTS:
+            return jsonify(error=f"unknown target object '{target}'"), 404
+        od = G.out_dir(CFG["capture"], target)
+        cp = od / "cluster.npy"
+        P = np.vstack([np.load(cp), pts]) if cp.exists() else pts
+        np.save(cp, P.astype(np.float32))
+        msg = f"merged into {target}'s cluster — run propagate on it to regenerate masks"
+    elif action == "promote":
+        cand = {"id": bid, "state": state, "change_type": "moved",
+                "pts": pts.astype(np.float64), "sig": b["sig"]}
+        ctx = CD._ctx_for_states(CFG["capture"], CFG["states"], [cand])
+        CD._seed([cand], CFG["states"], ctx, 0, 5, 0.5,
+                 Path(CFG["capture"]) / "changes" / "cloud_diff" / "seed_dbg",
+                 occ_tol=0.05, min_frac=0.0)
+        if not cand.get("seeds"):
+            return jsonify(error="blob not visible in the walk (occlusion) — dismiss instead?"), 400
+        key = f"{bid}__{state}"
+        od = G.out_dir(CFG["capture"], key)
+        json.dump(cand["seeds"], open(od / "seeds.json", "w"), indent=1)
+        np.save(od / "cluster.npy", pts.astype(np.float32))
+        OBJECTS[key] = {"id": bid, "label": "", "deformability": "rigid",
+                        "state": state, "frame": next(iter(cand["seeds"])),
+                        "points": [], "seed_frames": [], "source": "purple_blob"}
+        _save_working()
+        _perframe_inproc(key, CFG["states"][state]["session"])
+        msg = f"promoted to object {key} ({cand['n_frames']} visible frames)"
+    else:
+        return jsonify(error="unknown action"), 400
+    blobs = [x for x in blobs if x["id"] != bid]
+    json.dump(blobs, open(bj, "w"), indent=1)
+    bp.unlink(missing_ok=True)
+    SCENE_SPLATS.clear()
+    return jsonify(ok=True, msg=msg, remaining=len(blobs))
+
+
 @app.route("/api/who_is_here", methods=["POST"])
 def api_who_is_here():
     """Which object(s) own this pixel on this frame — scene-view click-to-identify.
