@@ -701,52 +701,14 @@ def api_compute_fields():
 
 def _fields_job(job_id):
     try:
-        import numpy as _np
-        from scipy.spatial import cKDTree
-        cap = Path(CFG["capture"])
-        pre_ref = CFG["states"]["pre"]["ref"]
-        post_ref = CFG["states"]["post"]["ref"]
-        bridge = CD._bridge(str(cap), pre_ref, post_ref, None)
-        tau, tau_lo, voxel = 0.10, 0.10 / 3.0, 0.02
-        cb = lambda s: JOBS[job_id].update(msg=s)
-        cb(f"loading {pre_ref} …")
-        P1 = CD._load_cloud(str(cap), pre_ref, voxel, verbose=False)
-        cb(f"loading {post_ref} …")
-        P2 = CD._load_cloud(str(cap), post_ref, voxel, verbose=False)
-        T = G._load_T(bridge)
-        P2in1 = G._apply_T(T, P2)
-        cb("differencing (two-way NN) …")
-        d1 = cKDTree(P2in1).query(P1, workers=-1)[0]
-        d2 = cKDTree(P1).query(P2in1, workers=-1)[0]
-        plane1 = CD._floor_plane(P1, 0.04, False, pre_ref)
-        plane2 = CD._floor_plane(P2, 0.04, False, post_ref)
         out = G.out_dir(CFG["capture"]) / "fields"
-        out.mkdir(parents=True, exist_ok=True)
-        rng = _np.random.default_rng(0)
-
-        def keep(pts, cap_n=800_000):
-            if len(pts) > cap_n:
-                pts = pts[rng.choice(len(pts), cap_n, replace=False)]
-            return pts.astype(_np.float32)
-
-        # static: matched within tau_lo, PLUS the floor plane unconditionally —
-        # the floor is static by definition, and its registration ripple (often
-        # > tau_lo) must not leave naked holes between green and magenta;
-        # changed: hysteresis candidates, floor dropped (same ripple)
-        _np.save(out / "static_pre.npy",
-                 keep(P1[(d1 <= tau_lo) | ~CD._floor_keep(P1, plane1, 0.04)]))
-        ch1 = P1[d1 > tau_lo]
-        _np.save(out / "changed_pre.npy",
-                 keep(ch1[CD._floor_keep(ch1, plane1, 0.04)]))
-        P2n = G._apply_T(T.inverse(), P2in1)             # back to post native frame
-        _np.save(out / "static_post.npy",
-                 keep(P2n[(d2 <= tau_lo) | ~CD._floor_keep(P2n, plane2, 0.04)]))
-        ch2 = P2n[d2 > tau_lo]
-        _np.save(out / "changed_post.npy",
-                 keep(ch2[CD._floor_keep(ch2, plane2, 0.04)]))
+        n = CD.compute_fields(CFG["capture"], CFG["states"]["pre"]["ref"],
+                              CFG["states"]["post"]["ref"], out,
+                              progress=lambda s: JOBS[job_id].update(msg=s))
         SCENE_SPLATS.clear()                             # stale projections
         JOBS[job_id].update(status="done",
-                            msg=f"fields written -> {out} (tau_lo={tau_lo:.3f})")
+                            msg="fields written: " +
+                                ", ".join(f"{k} {v:,}" for k, v in n.items()))
     except Exception as e:
         JOBS[job_id].update(status="error", error=str(e))
 
@@ -803,8 +765,8 @@ def _scene_splats(state, frame):
             pv = pv[(pv[:, 0] >= 0) & (pv[:, 0] < W // 2)
                     & (pv[:, 1] >= 0) & (pv[:, 1] < H // 2)].astype(np.int32)
             m[pv[:, 1], pv[:, 0]] = 255
-            m = cv2.dilate(m, np.ones((5, 5), np.uint8))
-            m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+            m = cv2.dilate(m, np.ones((7, 7), np.uint8))
+            m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
         outs.append(cv2.resize(m, (W, H), interpolation=cv2.INTER_NEAREST) > 0)
     while len(SCENE_SPLATS) > 200:
         SCENE_SPLATS.pop(next(iter(SCENE_SPLATS)))

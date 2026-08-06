@@ -214,6 +214,55 @@ def _candidates_from_diff(res, prefix):
     return cands
 
 
+def compute_fields(capture, pre_ref, post_ref, out_dir, tau=0.10, tau_lo=None,
+                   voxel=0.02, progress=None):
+    """Persist per-state CERTIFIED-STATIC and CHANGED-CANDIDATE point fields
+    (scene view / trimap layers). Static = matched within tau_lo both ways PLUS
+    the floor plane unconditionally (floor is static by definition; its
+    registration ripple must not leave naked holes). Changed = hysteresis
+    candidates, floor dropped. Outputs are VOXEL-uniform (static 0.04 m,
+    changed 0.03 m), not randomly capped — random subsampling starves the
+    near-field splat (measured: speckle instead of surfaces on climate f8)."""
+    import open3d as o3d
+    from scipy.spatial import cKDTree
+    say = progress or (lambda s: None)
+    if tau_lo is None:
+        tau_lo = tau / 3.0
+    bridge = _bridge(capture, pre_ref, post_ref, None)
+    say(f"loading {pre_ref} …")
+    P1 = _load_cloud(capture, pre_ref, voxel, verbose=False)
+    say(f"loading {post_ref} …")
+    P2 = _load_cloud(capture, post_ref, voxel, verbose=False)
+    T = G._load_T(bridge)
+    P2in1 = G._apply_T(T, P2)
+    say("differencing (two-way NN) …")
+    d1 = cKDTree(P2in1).query(P1, workers=-1)[0]
+    d2 = cKDTree(P1).query(P2in1, workers=-1)[0]
+    plane1 = _floor_plane(P1, 0.04, False, pre_ref)
+    plane2 = _floor_plane(P2, 0.04, False, post_ref)
+    P2n = G._apply_T(T.inverse(), P2in1)
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    def dump(name, pts, vx):
+        pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts))
+        P = np.asarray(pcd.voxel_down_sample(vx).points, np.float32)
+        np.save(out / name, P)
+        return len(P)
+
+    say("writing fields …")
+    n = {}
+    n["static_pre"] = dump("static_pre.npy",
+                           P1[(d1 <= tau_lo) | ~_floor_keep(P1, plane1, 0.04)], 0.04)
+    ch1 = P1[d1 > tau_lo]
+    n["changed_pre"] = dump("changed_pre.npy", ch1[_floor_keep(ch1, plane1, 0.04)], 0.03)
+    n["static_post"] = dump("static_post.npy",
+                            P2n[(d2 <= tau_lo) | ~_floor_keep(P2n, plane2, 0.04)], 0.04)
+    ch2 = P2n[d2 > tau_lo]
+    n["changed_post"] = dump("changed_post.npy", ch2[_floor_keep(ch2, plane2, 0.04)], 0.03)
+    return n
+
+
 # ───────────────────────── attention (Aria visibility) ─────────────────────────
 def _ctx_for_states(capture, states, cands):
     """{state: (capo, sess, renderer)} for the states present among candidates;
