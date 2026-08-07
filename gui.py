@@ -1041,6 +1041,32 @@ def api_purple_blobs():
             P = P[d > 0.30]
         if len(P) < 40:
             continue
+        # EVALUATION-DOMAIN gate: the changed field is building-wide, but GT
+        # exists only where the walk looked. Count occlusion-tested sightings
+        # per point across sampled walk frames; points seen < 3 times are
+        # out-of-domain (ignore by definition) — first run without this gate
+        # produced 2,258 "unresolved" blobs on climate, mostly unwalked rooms.
+        from scantools.utils.geometry import project, sample_depth
+        capo, sess, renderer = _geom_ctx(state)
+        keys = sorted((k for k in sess.images.key_pairs() if "cam0" in str(k[1])),
+                      key=lambda k: k[0])[::5]
+        seen = np.zeros(len(P), np.int32)
+        occ_cams = {}
+        for ts, cam_t in keys:
+            cam = sess.sensors[cam_t]
+            if cam_t not in occ_cams:
+                occ_cams[cam_t] = G._scaled_camera(cam, 0.5)
+            cam_s, sx, sy = occ_cams[cam_t]
+            T = sess.get_pose(ts, cam_t)
+            p2d, z, vis = project(P, cam, pose=T.inverse())
+            if not vis.any():
+                continue
+            _, depth = renderer.render_from_capture(T, cam_s)
+            occ_z, occ_ok = sample_depth(p2d[vis] * np.array([sx, sy]), depth)
+            seen[np.where(vis)[0][occ_ok & (z[vis] <= occ_z + 0.05)]] += 1
+        P = P[seen >= 3]
+        if len(P) < 40:
+            continue
         pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(P))
         lab = np.asarray(pcd.cluster_dbscan(eps=0.12, min_points=8))
         for li in range(lab.max() + 1):
