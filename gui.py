@@ -891,6 +891,109 @@ def api_scene_coverage():
 SEED_BOXES = {}       # key -> (seeds.json mtime, {frame: box}) for who-is-here fallback
 
 
+def _project_field_indexed(state, frame, P):
+    """(indices, pixel coords, (H, W)) of cloud points visible in `frame`,
+    occlusion-tested — index-preserving flavour of the splat projection."""
+    from scantools.utils.geometry import project, sample_depth
+    capo, sess, renderer = _geom_ctx(state)
+    k = _frame_key(state, sess, frame)
+    if k is None:
+        raise KeyError("frame not in this state's session")
+    cam = sess.sensors[k[1]]
+    T = sess.get_pose(k[0], k[1])
+    cam_s, sx, sy = G._scaled_camera(cam, 0.5)
+    _, depth = renderer.render_from_capture(T, cam_s)
+    p2d, z, vis = project(P, cam, pose=T.inverse())
+    idx = np.where(vis)[0]
+    occ_z, occ_ok = sample_depth(p2d[vis] * np.array([sx, sy]), depth)
+    good = occ_ok & (z[vis] <= occ_z + 0.05)
+    return idx[good], p2d[vis][good], (cam.height, cam.width)
+
+
+@app.route("/api/lift3d", methods=["POST"])
+def api_lift3d():
+    """Edit once in 2D, propagate in 3D: the edit-canvas stroke lifts to cloud
+    points (in-stroke + occlusion-visible), region-grows (bounded), and labels
+    them with the reviewed object. preview=true returns an orange overlay of
+    the claim for the m-confirm; commit writes labels_<state>.npy. Points
+    already labeled by ANOTHER object are never stolen."""
+    import base64
+    import point_labels as PL
+    d = request.get_json()
+    oid, frame = d["id"], d["frame"]
+    if oid not in OBJECTS:
+        return jsonify(error="unknown object"), 404
+    state = OBJECTS[oid]["state"]
+    fdir = G.out_dir(CFG["capture"]) / "fields"
+    if not (fdir / f"static_{state}.npy").exists():
+        return jsonify(error="fields not computed"), 404
+    raw = base64.b64decode(d["mask"].split(",", 1)[1])
+    m = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_UNCHANGED)
+    stroke = (m[..., 3] > 0) if m.ndim == 3 and m.shape[2] == 4 else (m > 0)
+    P, L, n_static, reg = PL.load(fdir, state)
+    try:
+        idx, uv, (H, W) = _project_field_indexed(state, frame, P)
+    except KeyError as e:
+        return jsonify(error=str(e)), 404
+    if stroke.shape != (H, W):
+        stroke = cv2.resize(stroke.astype(np.uint8), (W, H),
+                            interpolation=cv2.INTER_NEAREST) > 0
+    u = np.clip(uv[:, 0].astype(int), 0, W - 1)
+    v = np.clip(uv[:, 1].astype(int), 0, H - 1)
+    seed = np.zeros(len(P), bool)
+    seed[idx[stroke[v, u]]] = True
+    if seed.sum() < 10:
+        return jsonify(error="stroke images too few cloud points (glass/unscanned "
+                             "surface?) — this object needs the 2D mask lane"), 400
+    own = PL.label_index(reg, oid)
+    claim = PL.grow(P, seed) & ((L == 0) | (L == own))
+    if d.get("preview"):
+        vis_claim = claim[idx]
+        rgba = np.zeros((H, W, 4), np.uint8)
+        cu, cv_ = u[vis_claim], v[vis_claim]
+        rgba[cv_, cu] = (0, 140, 255, 220)               # orange = armed 3D claim
+        rgba[..., 3] = cv2.dilate(rgba[..., 3], np.ones((7, 7), np.uint8))
+        rgba[rgba[..., 3] > 0, 0] = 0
+        rgba[rgba[..., 3] > 0, 1] = 140
+        rgba[rgba[..., 3] > 0, 2] = 255
+        ok, buf = cv2.imencode(".png", rgba)
+        return jsonify(preview="data:image/png;base64," + base64.b64encode(buf).decode(),
+                       n_seed=int(seed.sum()), n_claim=int(claim.sum()),
+                       n_static=int((claim[:n_static]).sum()))
+    L[claim] = own
+    PL.save(fdir, state, L, reg)
+    return jsonify(ok=True, n_claim=int(claim.sum()),
+                   msg=f"{int(claim.sum()):,} cloud points labeled {oid} — renders in every frame/walk")
+
+
+@app.route("/api/label_overlay")
+def api_label_overlay():
+    """One object's 3D-labeled points rendered into a frame (validation +
+    review display for point-canonical objects)."""
+    import point_labels as PL
+    state, frame, oid = request.args["state"], request.args["frame"], request.args["id"]
+    fdir = G.out_dir(CFG["capture"]) / "fields"
+    P, L, n_static, reg = PL.load(fdir, state)
+    own = next((int(k) for k, v in reg.items() if v == oid), None)
+    if own is None or not (L == own).any():
+        return jsonify(error="object has no 3D labels"), 404
+    try:
+        idx, uv, (H, W) = _project_field_indexed(state, frame, P)
+    except KeyError as e:
+        return jsonify(error=str(e)), 404
+    sel = (L == own)[idx]
+    rgba = np.zeros((H, W, 4), np.uint8)
+    u = np.clip(uv[sel, 0].astype(int), 0, W - 1)
+    v = np.clip(uv[sel, 1].astype(int), 0, H - 1)
+    a = np.zeros((H, W), np.uint8)
+    a[v, u] = 255
+    a = cv2.morphologyEx(cv2.dilate(a, np.ones((7, 7), np.uint8)),
+                         cv2.MORPH_CLOSE, np.ones((13, 13), np.uint8))
+    rgba[a > 0] = (0, 0, 255, 110)
+    ok, buf = cv2.imencode(".png", rgba)
+    return Response(buf.tobytes(), mimetype="image/png")
+
+
 @app.route("/api/claim_purple", methods=["POST"])
 def api_claim_purple():
     """Merge the UNCLAIMED-CHANGE (purple) connected component at (x,y) into an

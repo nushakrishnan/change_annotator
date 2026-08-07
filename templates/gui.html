@@ -86,6 +86,7 @@
       &nbsp;|&nbsp; <span class="status">click the object to re-segment this frame</span>
       <button onclick="geomMask()" title="geom+SAM: project the object's lidar cluster, then SAM snaps it to the image edge — recovers legs/parts RGB drops (shadows/exposure). Refuses when the geometry is too sparse in this view.">geom mask</button>
       <button onclick="saveEdit()" title="shortcut: z">save mask (z)</button>
+      <button onclick="lift3d()" title="edit once in 2D, propagate in 3D: lifts the CURRENT canvas mask onto the state's point cloud (in-stroke + line-of-sight points, bounded 3D grow), press m to confirm the orange preview — the label then renders in EVERY frame and walk">propagate in 3D</button>
       <button onclick="cancelEdit()">cancel</button>
     </span>
     <span id="reviewControls">
@@ -561,11 +562,33 @@ const edgeImg = document.getElementById('edgeOverlay');
 let sceneArm = null;
 const armImg = document.getElementById('armOverlay');
 function clearSceneArm(){ sceneArm = null; armImg.style.display = 'none'; armImg.src = ''; }
+async function lift3d(){
+  if(mode !== 'review' || !editing){ alert('propagate in 3D works in review → edit mode (x), with your 2D fix on the canvas'); return; }
+  const st = document.getElementById('clickStatus');
+  st.textContent = 'lifting stroke to the point cloud …';
+  const body = {id: reviewObj, frame: frames[idx].name, mask: maskCanvas.toDataURL('image/png')};
+  const r = await fetch('/api/lift3d', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({...body, preview: true})});
+  const d = await r.json();
+  if(d.error){ st.textContent = 'lift3d: ' + d.error; return; }
+  sceneArm = {type: 'lift', body};
+  armImg.onload = () => { armImg.style.display = 'block'; };
+  armImg.src = d.preview;
+  st.textContent = `ARMED (orange): ${d.n_claim.toLocaleString()} cloud pts (${d.n_seed.toLocaleString()} from stroke, `
+    + `${d.n_static.toLocaleString()} static=green→red) → m labels them as ${reviewObj} globally · Esc cancels`;
+}
 async function commitSceneArm(kind){
   const a = sceneArm;
   if(!a || a.type !== kind) return false;
   clearSceneArm();
   const st = document.getElementById('clickStatus');
+  if(kind === 'lift'){
+    const r = await fetch('/api/lift3d', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(a.body)});
+    const d = await r.json();
+    st.textContent = d.error ? ('lift3d: ' + d.error) : d.msg;
+    return true;
+  }
   if(kind === 'merge'){
     const r = await fetch('/api/claim_purple', {method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify(a.body)});
@@ -735,7 +758,7 @@ document.addEventListener('keydown', (e) => {
   else if((e.key === 'g' || e.key === 'G') && mode === 'review' && !editing){ e.preventDefault(); setFrontier(); }
   else if(sceneArm && e.key === 'Escape'){ e.preventDefault(); clearSceneArm();
     document.getElementById('clickStatus').textContent = 'armed action cancelled'; }
-  else if(sceneArm && sceneArm.type === 'merge' && (e.key === 'm' || e.key === 'M')){ e.preventDefault(); commitSceneArm('merge'); }
+  else if(sceneArm && (sceneArm.type === 'merge' || sceneArm.type === 'lift') && (e.key === 'm' || e.key === 'M')){ e.preventDefault(); commitSceneArm(sceneArm.type); }
   else if((e.key === 'u' || e.key === 'U') && !e.ctrlKey && !e.metaKey){ e.preventDefault(); cycleSceneView(); }
   else if((e.key === 'i' || e.key === 'I') && !e.ctrlKey && !e.metaKey){ e.preventDefault(); cycleFx(); }
   else if((e.key === 'e' || e.key === 'E') && !e.ctrlKey && !e.metaKey){ e.preventDefault();
