@@ -521,6 +521,42 @@ def api_propagate_fix():
     return jsonify(job_id=job_id)
 
 
+def _preview_grid(od, results, flags, sid_for, job_id):
+    """Contact sheet of up to 24 sampled proposals; YELLOW border = low-confidence
+    fill, ORANGE = suspicious shrink vs the existing mask, CYAN = overwrites a
+    legacy (pre-provenance) mask. Hand frames never appear."""
+    names = sorted(results)
+    sel = names[::max(1, len(names) // 24)][:24]
+    tiles = []
+    for n in sel:
+        bgr = cv2.imread(str(Path(CFG["capture"]) / "sessions" / sid_for(n)
+                             / "raw_data" / n))
+        if bgr is None:
+            continue
+        m = results[n]
+        bgr[m] = (0.45 * bgr[m] + 0.55 * np.array([0, 0, 255])).astype(np.uint8)
+        t = cv2.resize(bgr, (330, 330))
+        f = flags.get(n, {})
+        if f.get("lowconf"):
+            cv2.rectangle(t, (0, 0), (329, 329), (0, 220, 255), 8)
+        elif f.get("shrink"):
+            cv2.rectangle(t, (0, 0), (329, 329), (0, 128, 255), 6)
+        elif f.get("legacy"):
+            cv2.rectangle(t, (0, 0), (329, 329), (255, 200, 0), 5)
+        cv2.rectangle(t, (0, 0), (330, 20), (0, 0, 0), -1)
+        tag = ("  LOWCONF" if f.get("lowconf") else
+               "  SHRINK" if f.get("shrink") else "")
+        cv2.putText(t, Path(n).stem[-8:] + tag,
+                    (4, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1)
+        tiles.append(t)
+    while len(tiles) % 4:
+        tiles.append(np.zeros((330, 330, 3), np.uint8))
+    rows = [np.concatenate(tiles[j:j + 4], 1) for j in range(0, len(tiles), 4)]
+    prev = f"prop_preview_{job_id}.png"
+    cv2.imwrite(str(od / prev), np.concatenate(rows, 0))
+    return prev
+
+
 def _propagate_fix_job(job_id, oid, frame, mode):
     try:
         od = G.out_dir(CFG["capture"], oid)
@@ -546,36 +582,8 @@ def _propagate_fix_job(job_id, oid, frame, mode):
             if e and e.get("px") and int(results[n].sum()) < 0.6 * e["px"]:
                 flags.setdefault(n, {})["shrink"] = True
                 n_shrink += 1
-        # preview grid: up to 24 sampled frames; YELLOW border = low-confidence fill,
-        # ORANGE = geometry disagreed / suspicious shrink vs the existing mask,
-        # CYAN = overwrites a legacy (pre-provenance) mask. Hand frames never appear.
-        names = sorted(results)
-        sel = names[::max(1, len(names) // 24)][:24]
-        tiles = []
-        for n in sel:
-            sid = mi.get(n, mi[frame])["session"]
-            bgr = cv2.imread(str(Path(CFG["capture"]) / "sessions" / sid / "raw_data" / n))
-            m = results[n]
-            bgr[m] = (0.45 * bgr[m] + 0.55 * np.array([0, 0, 255])).astype(np.uint8)
-            t = cv2.resize(bgr, (330, 330))
-            f = flags.get(n, {})
-            if f.get("lowconf"):
-                cv2.rectangle(t, (0, 0), (329, 329), (0, 220, 255), 8)
-            elif f.get("shrink"):
-                cv2.rectangle(t, (0, 0), (329, 329), (0, 128, 255), 6)
-            elif f.get("legacy"):
-                cv2.rectangle(t, (0, 0), (329, 329), (255, 200, 0), 5)
-            cv2.rectangle(t, (0, 0), (330, 20), (0, 0, 0), -1)
-            tag = ("  LOWCONF" if f.get("lowconf") else
-                   "  SHRINK" if f.get("shrink") else "")
-            cv2.putText(t, Path(n).stem[-8:] + tag,
-                        (4, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1)
-            tiles.append(t)
-        while len(tiles) % 4:
-            tiles.append(np.zeros((330, 330, 3), np.uint8))
-        rows = [np.concatenate(tiles[j:j + 4], 1) for j in range(0, len(tiles), 4)]
-        prev = f"prop_preview_{job_id}.png"
-        cv2.imwrite(str(od / prev), np.concatenate(rows, 0))
+        prev = _preview_grid(od, results, flags,
+                             lambda n: mi.get(n, mi[frame])["session"], job_id)
         PROP_PENDING[job_id] = results
         PROP_FLAGS[job_id] = flags
         n_low = sum(1 for f in flags.values() if f.get("lowconf"))
@@ -891,23 +899,56 @@ def api_scene_coverage():
 SEED_BOXES = {}       # key -> (seeds.json mtime, {frame: box}) for who-is-here fallback
 
 
-def _project_field_indexed(state, frame, P):
-    """(indices, pixel coords, (H, W)) of cloud points visible in `frame`,
-    occlusion-tested — index-preserving flavour of the splat projection."""
+DEPTH_CACHE = {}      # (state, frame) -> (cam, T, depth, sx, sy); mesh renders are
+                      # the cost of every projection job and repeat across objects
+
+
+def _frame_geom(state, frame):
+    """(cam, T, depth, sx, sy) for a frame — the mesh render, cached."""
+    key = (state, frame)
+    if key not in DEPTH_CACHE:
+        capo, sess, renderer = _geom_ctx(state)
+        k = _frame_key(state, sess, frame)
+        if k is None:
+            raise KeyError("frame not in this state's session")
+        cam = sess.sensors[k[1]]
+        T = sess.get_pose(k[0], k[1])
+        cam_s, sx, sy = G._scaled_camera(cam, 0.5)
+        _, depth = renderer.render_from_capture(T, cam_s)
+        while len(DEPTH_CACHE) > 120:                # ~2 MB each at half res
+            DEPTH_CACHE.pop(next(iter(DEPTH_CACHE)))
+        DEPTH_CACHE[key] = (cam, T, depth, sx, sy)
+    return DEPTH_CACHE[key]
+
+
+def _project_visible(P, cam, T, depth, sx, sy):
+    """(indices into P, pixel coords) of points visible and unoccluded."""
     from scantools.utils.geometry import project, sample_depth
-    capo, sess, renderer = _geom_ctx(state)
-    k = _frame_key(state, sess, frame)
-    if k is None:
-        raise KeyError("frame not in this state's session")
-    cam = sess.sensors[k[1]]
-    T = sess.get_pose(k[0], k[1])
-    cam_s, sx, sy = G._scaled_camera(cam, 0.5)
-    _, depth = renderer.render_from_capture(T, cam_s)
     p2d, z, vis = project(P, cam, pose=T.inverse())
     idx = np.where(vis)[0]
+    if not len(idx):
+        return idx, p2d[:0]
     occ_z, occ_ok = sample_depth(p2d[vis] * np.array([sx, sy]), depth)
     good = occ_ok & (z[vis] <= occ_z + 0.05)
-    return idx[good], p2d[vis][good], (cam.height, cam.width)
+    return idx[good], p2d[vis][good]
+
+
+def _project_field_indexed(state, frame, P):
+    """(indices, pixel coords, (H, W)) of cloud points visible in `frame`."""
+    cam, T, depth, sx, sy = _frame_geom(state, frame)
+    idx, uv = _project_visible(P, cam, T, depth, sx, sy)
+    return idx, uv, (cam.height, cam.width)
+
+
+def _splat(uv, H, W):
+    """Projected points -> filled bool mask (depth-independent splat)."""
+    a = np.zeros((H, W), np.uint8)
+    if len(uv):
+        a[np.clip(uv[:, 1].astype(int), 0, H - 1),
+          np.clip(uv[:, 0].astype(int), 0, W - 1)] = 255
+        a = cv2.morphologyEx(cv2.dilate(a, np.ones((7, 7), np.uint8)),
+                             cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
+    return a > 0
 
 
 @app.route("/api/lift3d", methods=["POST"])
@@ -930,7 +971,7 @@ def api_lift3d():
     raw = base64.b64decode(d["mask"].split(",", 1)[1])
     m = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_UNCHANGED)
     stroke = (m[..., 3] > 0) if m.ndim == 3 and m.shape[2] == 4 else (m > 0)
-    P, L, n_static, reg = PL.load(fdir, state)
+    P, L_auto, L, n_static, reg = PL.load(fdir, state)   # L = HUMAN labels here
     try:
         idx, uv, (H, W) = _project_field_indexed(state, frame, P)
     except KeyError as e:
@@ -946,7 +987,8 @@ def api_lift3d():
         return jsonify(error="stroke images too few cloud points (glass/unscanned "
                              "surface?) — this object needs the 2D mask lane"), 400
     own = PL.label_index(reg, oid)
-    claim = PL.grow(P, seed) & ((L == 0) | (L == own))
+    eff = PL.effective(L_auto, L)
+    claim = PL.grow(P, seed) & ((eff == 0) | (eff == own))   # never steal
     if d.get("preview"):
         vis_claim = claim[idx]
         rgba = np.zeros((H, W, 4), np.uint8)
@@ -961,7 +1003,7 @@ def api_lift3d():
                        n_seed=int(seed.sum()), n_claim=int(claim.sum()),
                        n_static=int((claim[:n_static]).sum()))
     L[claim] = own
-    PL.save(fdir, state, L, reg)
+    PL.save(fdir, state, L_human=L, reg=reg)         # human tier: rebuilds keep it
     return jsonify(ok=True, n_claim=int(claim.sum()),
                    msg=f"{int(claim.sum()):,} cloud points labeled {oid} — renders in every frame/walk")
 
@@ -973,7 +1015,8 @@ def api_label_overlay():
     import point_labels as PL
     state, frame, oid = request.args["state"], request.args["frame"], request.args["id"]
     fdir = G.out_dir(CFG["capture"]) / "fields"
-    P, L, n_static, reg = PL.load(fdir, state)
+    P, L_auto, L_hum, n_static, reg = PL.load(fdir, state)
+    L = PL.effective(L_auto, L_hum)
     own = next((int(k) for k, v in reg.items() if v == oid), None)
     if own is None or not (L == own).any():
         return jsonify(error="object has no 3D labels"), 404
@@ -992,6 +1035,240 @@ def api_label_overlay():
     rgba[a > 0] = (0, 0, 255, 110)
     ok, buf = cv2.imencode(".png", rgba)
     return Response(buf.tobytes(), mimetype="image/png")
+
+
+REBUILD_RATIO = 0.6        # a point is the object's if >=60% of the frames that
+                           # SAW it also masked it (user-set, 2026-08-07)
+REBUILD_HAND_WEIGHT = 3.0  # hand masks are co-GT: their vote counts triple
+
+
+def _rebuild_one(oid, threshold, cb, refine=True):
+    """Consensus rebuild of one object's masks through its 3D label.
+
+    Every existing mask votes for the cloud points it images (occlusion-tested);
+    a point is kept when the frames that SAW it masked it >= threshold of the
+    time. Inconsistent overflow (a spill only one viewpoint makes) falls below
+    the ratio and vanishes from EVERY frame; a part most frames dropped but a
+    few caught survives and is rendered back into all of them. Systematic
+    errors — a neighbour swallowed from every angle — are the human's job via
+    'propagate in 3D'; those points live in the HUMAN label tier and this
+    rebuild never touches them.
+
+    Returns (results {frame: bool mask}, stats)."""
+    import point_labels as PL
+    from scipy.spatial import cKDTree
+    state = OBJECTS[oid]["state"]
+    fdir = G.out_dir(CFG["capture"]) / "fields"
+    if not (fdir / f"static_{state}.npy").exists():
+        raise ValueError("fields not computed (run detect / compute fields)")
+    od = G.out_dir(CFG["capture"], oid)
+    mi_path = od / "masks_index.json"
+    mi = json.load(open(mi_path)) if mi_path.exists() else {}
+    if not mi:
+        raise ValueError("object has no masks to learn from")
+    P, L_auto, L_hum, n_static, reg = PL.load(fdir, state)
+
+    # candidates: points near the object's own geometry — keeps the per-frame
+    # projection over ~1e5 points instead of the whole multi-million field
+    cand = None
+    for cn in ("cluster.npy", "cluster_enriched.npy"):
+        cp = od / cn
+        if cp.exists():
+            d = cKDTree(np.load(cp).astype(np.float64)).query(P, workers=-1)[0]
+            cand = d < 2.0
+            break
+    if cand is None:                                  # no geometry: seed from the
+        big = max(mi, key=lambda n: mi[n].get("px", 0))   # biggest existing mask
+        m = cv2.imread(str(od / mi[big]["mask_file"]), 0)
+        idx, uv, (H, W) = _project_field_indexed(state, big, P)
+        u = np.clip(uv[:, 0].astype(int), 0, W - 1)
+        v = np.clip(uv[:, 1].astype(int), 0, H - 1)
+        seed = np.zeros(len(P), bool)
+        seed[idx[(m > 127)[v, u]]] = True
+        if seed.sum() < 10:
+            raise ValueError("no cloud support (glass/unscanned?) — keep the 2D masks")
+        cand = PL.grow(P, seed, radius=0.08, iters=4)
+    ci = np.where(cand)[0]
+    Pc = P[ci]
+    votes = np.zeros(len(ci), np.float32)
+    opps = np.zeros(len(ci), np.float32)
+
+    names = sorted(mi, key=lambda n: int(Path(n).stem))
+    for j, n in enumerate(names):
+        if j % 20 == 0:
+            cb(f"{oid}: voting {j}/{len(names)} frames")
+        m = cv2.imread(str(od / mi[n]["mask_file"]), 0)
+        if m is None:
+            continue
+        try:
+            cam, T, depth, sx, sy = _frame_geom(state, n)
+        except KeyError:
+            continue
+        idx, uv = _project_visible(Pc, cam, T, depth, sx, sy)
+        if not len(idx):
+            continue
+        w = REBUILD_HAND_WEIGHT if mi[n].get("src") == "hand" else 1.0
+        opps[idx] += w
+        u = np.clip(uv[:, 0].astype(int), 0, m.shape[1] - 1)
+        v = np.clip(uv[:, 1].astype(int), 0, m.shape[0] - 1)
+        votes[idx[(m > 127)[v, u]]] += w
+
+    min_opps = 2.0 if len(names) >= 4 else 1.0
+    ratio = votes / np.maximum(opps, 1e-6)
+    keep = (opps >= min_opps) & (ratio >= threshold)
+    own = PL.label_index(reg, oid)
+    L_auto[L_auto == own] = 0                        # re-decide only its OWN points
+    L_auto[ci[keep]] = own
+    PL.save(fdir, state, L_auto=L_auto, reg=reg)
+    eff = PL.effective(L_auto, L_hum)
+    lab = np.where(eff == own)[0]
+    stats = {"cand": int(len(ci)), "kept": int(keep.sum()),
+             "human": int(((L_hum == own)).sum()), "labeled": int(len(lab))}
+    if not len(lab):
+        return {}, stats
+
+    # render the label into every frame the object is known to reach
+    P_lab = P[lab]
+    seeds_p = od / "seeds.json"
+    frames = set(mi)
+    if seeds_p.exists():
+        frames |= set(json.load(open(seeds_p)))
+    frames = sorted(frames, key=lambda n: int(Path(n).stem))
+    results = {}
+    sid = CFG["states"][state]["session"]
+    for j, n in enumerate(frames):
+        if j % 20 == 0:
+            cb(f"{oid}: rendering {j}/{len(frames)} frames")
+        try:
+            cam, T, depth, sx, sy = _frame_geom(state, n)
+        except KeyError:
+            continue
+        idx, uv = _project_visible(P_lab, cam, T, depth, sx, sy)
+        if len(idx) < 12:                            # not meaningfully in view
+            continue
+        m = _splat(uv, cam.height, cam.width)
+        if m.sum() < 200:
+            continue
+        if refine:                                   # geometry proposes, RGB draws
+            try:
+                bgr = cv2.imread(str(Path(CFG["capture"]) / "sessions" / sid
+                                     / "raw_data" / n))
+                img = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                clip = cv2.dilate(m.astype(np.uint8), np.ones((41, 41), np.uint8)) > 0
+                r = _sam_refine_geom(img, m, clip)
+                inter, union = (r & m).sum(), (r | m).sum()
+                if r.sum() >= 200 and union and inter / union >= 0.4:
+                    m = r
+            except Exception:
+                pass
+        results[n] = m
+    return results, stats
+
+
+def _rebuild_job(job_id, oid, threshold):
+    """Single object -> the standard preview/veto/apply flow."""
+    try:
+        cb = lambda s: JOBS[job_id].update(msg=s)
+        results, stats = _rebuild_one(oid, threshold, cb)
+        if not results:
+            JOBS[job_id].update(status="done", n=0,
+                                msg=f"nothing rendered ({stats['kept']} pts kept "
+                                    f"of {stats['cand']} candidates — lower the vote?)")
+            return
+        od = G.out_dir(CFG["capture"], oid)
+        mi = json.load(open(od / "masks_index.json"))
+        flags = {}
+        for n, m in results.items():
+            e = mi.get(n)
+            if e and e.get("px") and int(m.sum()) < 0.6 * e["px"]:
+                flags[n] = {"shrink": True}
+        sid = CFG["states"][OBJECTS[oid]["state"]]["session"]
+        prev = _preview_grid(od, results, flags, lambda n: sid, job_id)
+        PROP_PENDING[job_id] = results
+        PROP_FLAGS[job_id] = flags
+        JOBS[job_id].update(status="done", n=len(results), obj=oid,
+                            n_shrink=sum(1 for f in flags.values() if f.get("shrink")),
+                            anchors=0, span=len(results), invisible=0, resumes=0,
+                            msg=f"3D rebuild: {stats['labeled']:,} labeled pts "
+                                f"({stats['human']:,} human) -> {len(results)} frames",
+                            preview=f"/results/{oid}/{prev}")
+    except Exception as e:
+        JOBS[job_id].update(status="error", error=str(e))
+
+
+def _rebuild_batch_job(job_id, threshold):
+    """Every eligible object, applied straight to geom/empty frames (hand,
+    prop, concept and at/behind-frontier frames are never touched)."""
+    try:
+        cb = lambda s: JOBS[job_id].update(msg=s)
+        todo = [k for k, o in OBJECTS.items()
+                if not o.get("ghost") and not o.get("done")
+                and o.get("deformability") != "deformable"]
+        done_n, written = 0, 0
+        for i, oid in enumerate(todo, 1):
+            JOBS[job_id].update(msg=f"[{i}/{len(todo)}] {oid} …")
+            try:
+                results, stats = _rebuild_one(oid, threshold, cb)
+            except Exception as e:
+                print(f"rebuild {oid}: {e}", flush=True)
+                continue
+            if not results:
+                continue
+            od = G.out_dir(CFG["capture"], oid)
+            mi_path = od / "masks_index.json"
+            mi = json.load(open(mi_path)) if mi_path.exists() else {}
+            f_ts = G.frontier_ts(OBJECTS.get(oid, {}).get("verified_until"))
+            bak = od / "masks" / f".bak_rebuild"
+            for n, m in sorted(results.items()):
+                cur = mi.get(n)
+                if (cur and cur.get("src") in ("hand", "prop", "concept")) \
+                        or int(Path(n).stem) <= f_ts:
+                    continue
+                flat = n.replace("/", "_")
+                if cur and (od / cur["mask_file"]).exists():
+                    bak.mkdir(parents=True, exist_ok=True)
+                    shutil.copy(od / cur["mask_file"], bak / flat)
+                (od / "masks").mkdir(exist_ok=True)
+                cv2.imwrite(str(od / "masks" / flat), (m * 255).astype(np.uint8))
+                mi[n] = {"session": cur["session"] if cur
+                         else CFG["states"][OBJECTS[oid]["state"]]["session"],
+                         "mask_file": f"masks/{flat}", "px": int(m.sum()),
+                         "src": "prop"}
+                written += 1
+            json.dump(mi, open(mi_path, "w"), indent=1)
+            done_n += 1
+        JOBS[job_id].update(status="done", n_objects=done_n, n_frames=written,
+                            msg=f"3D rebuild: {done_n} objects, {written:,} frames written")
+    except Exception as e:
+        JOBS[job_id].update(status="error", error=str(e))
+
+
+@app.route("/api/rebuild3d", methods=["POST"])
+def api_rebuild3d():
+    """Rebuild masks from the object's 3D consensus label. {id} = one object,
+    previewed; {all: true} = every eligible object, applied directly."""
+    d = request.get_json() or {}
+    threshold = float(d.get("threshold", REBUILD_RATIO))
+    job_id = uuid.uuid4().hex[:8]
+    if d.get("all"):
+        _snapshot_workspace("prerebuild")
+        JOBS[job_id] = {"status": "running", "msg": "starting batch rebuild …"}
+        threading.Thread(target=_rebuild_batch_job, args=(job_id, threshold),
+                         daemon=True).start()
+        return jsonify(job_id=job_id, batch=True)
+    oid = d["id"]
+    if oid not in OBJECTS:
+        return jsonify(error="unknown object"), 404
+    if OBJECTS[oid].get("done"):
+        return jsonify(error="object is done — uncheck to rebuild"), 400
+    for jid in [j for j in list(PROP_PENDING)
+                if (JOBS.get(j) or {}).get("obj") == oid]:
+        PROP_PENDING.pop(jid, None)
+        PROP_FLAGS.pop(jid, None)
+    JOBS[job_id] = {"status": "running", "obj": oid, "msg": "starting …"}
+    threading.Thread(target=_rebuild_job, args=(job_id, oid, threshold),
+                     daemon=True).start()
+    return jsonify(job_id=job_id)
 
 
 @app.route("/api/claim_purple", methods=["POST"])

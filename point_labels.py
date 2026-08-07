@@ -26,28 +26,42 @@ import numpy as np
 def _paths(fields_dir, state):
     f = Path(fields_dir)
     return (f / f"static_{state}.npy", f / f"changed_{state}.npy",
-            f / f"labels_{state}.npy", f / "labels_objects.json")
+            f / f"labels_{state}.npy", f / "labels_objects.json",
+            f / f"labels_human_{state}.npy")
 
 
 def load(fields_dir, state):
-    """(P cloud, L labels, n_static, registry). Labels reset to zeros if the
-    fields were recomputed since (length mismatch — stale labels must not
-    silently misalign)."""
-    sp, cp, lp, rp = _paths(fields_dir, state)
+    """(P cloud, L_auto, L_human, n_static, registry).
+
+    TWO label arrays, same tier discipline as the mask pipeline: `auto` is
+    machine consensus (a rebuild may re-decide its own points), `human` is
+    explicit 2D->3D edits (a rebuild must never erase them). Both reset to
+    zeros if the fields were recomputed since — stale labels must not silently
+    misalign with a different cloud."""
+    sp, cp, lp, rp, hp = _paths(fields_dir, state)
     S = np.load(sp)
     C = np.load(cp)
     P = np.vstack([S, C]).astype(np.float64)
-    L = np.load(lp) if lp.exists() else np.zeros(len(P), np.uint16)
-    if len(L) != len(P):
-        L = np.zeros(len(P), np.uint16)
+    def _arr(p):
+        a = np.load(p) if p.exists() else np.zeros(len(P), np.uint16)
+        return a if len(a) == len(P) else np.zeros(len(P), np.uint16)
     reg = json.load(open(rp)) if rp.exists() else {}
-    return P, L, len(S), reg
+    return P, _arr(lp), _arr(hp), len(S), reg
 
 
-def save(fields_dir, state, L, reg):
-    sp, cp, lp, rp = _paths(fields_dir, state)
-    np.save(lp, L.astype(np.uint16))
-    json.dump(reg, open(rp, "w"), indent=1)
+def save(fields_dir, state, L_auto=None, L_human=None, reg=None):
+    sp, cp, lp, rp, hp = _paths(fields_dir, state)
+    if L_auto is not None:
+        np.save(lp, L_auto.astype(np.uint16))
+    if L_human is not None:
+        np.save(hp, L_human.astype(np.uint16))
+    if reg is not None:
+        json.dump(reg, open(rp, "w"), indent=1)
+
+
+def effective(L_auto, L_human):
+    """Human labels win wherever they exist."""
+    return np.where(L_human > 0, L_human, L_auto)
 
 
 def label_index(reg, key):

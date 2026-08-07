@@ -188,7 +188,9 @@
   <div id="objects"></div>
   <hr>
   <h2>purple blobs <span class="hint" style="margin:0">— unclaimed change; each must be promoted, merged, or dismissed</span></h2>
-  <div class="row"><button onclick="computeBlobs()" title="cluster the unclaimed changed-field points (minus objects' clusters and dismissals) into resolvable blobs">🟣 find unresolved blobs</button> <span class="status" id="blobStatus"></span></div>
+  <div class="row"><button onclick="computeBlobs()" title="cluster the unclaimed changed-field points (minus objects' clusters and dismissals) into resolvable blobs">🟣 find unresolved blobs</button>
+    <button onclick="rebuildAll3d()" title="after sieving the junk: rebuild EVERY object's masks from its 3D consensus label, applied to geom/empty frames only">🧱 rebuild all from 3D</button>
+    <span class="status" id="blobStatus"></span></div>
   <div id="blobs"></div>
   <hr>
   <div class="row"><button onclick="exportSegments()">export segments.json</button> <span class="status" id="exportStatus"></span></div>
@@ -422,6 +424,60 @@ async function propagateFix(){
 }
 let propPreview = null;
 let pendingMap = null, pendingVeto = new Set(), pendingObj = null;
+// enter the pending preview/veto UI for a finished job (propagate or 3D rebuild)
+async function enterPending(jobId, obj, j, statusText){
+  const pf = await (await fetch('/api/prop_frames?job_id=' + jobId)).json();
+  pendingMap = new Map((pf.frames || []).map(x => [x.name, x]));
+  pendingVeto = new Set(); pendingObj = obj;
+  propPreview = j.preview ? j.preview + '?t=' + Date.now() : null;
+  updateApplyLabel();
+  if(reviewObj === obj){
+    document.getElementById('clickStatus').textContent = statusText;
+    document.getElementById('propControls').style.display = '';
+    const first = frames.findIndex(fr => pendingMap.has(fr.name));
+    renderMaskmap();
+    if(first >= 0) gotoIdx(first); else showReview();
+  } else {
+    const cardSt = document.getElementById('st_' + obj);
+    if(cardSt) cardSt.textContent = 'ready — open review to inspect';
+  }
+}
+// rebuild an object's masks from its 3D consensus label: every existing mask
+// votes at 3D addresses, points the views agree on are re-rendered into every
+// frame (fixes jitter, misses and inconsistent overflow in one pass)
+async function rebuild3d(key){
+  if(!guardDone(key)) return;
+  const cardSt = document.getElementById('st_' + key);
+  const r = await fetch('/api/rebuild3d', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({id: key})});
+  const d = await r.json();
+  if(d.error){ alert(d.error); return; }
+  const poll = setInterval(async () => {
+    const j = await (await fetch('/api/job/' + d.job_id)).json();
+    if(cardSt) cardSt.textContent = j.msg || j.status;
+    if(j.status === 'running') return;
+    clearInterval(poll);
+    if(j.status === 'error'){ if(cardSt) cardSt.textContent = 'rebuild error: ' + j.error; return; }
+    if(!j.n) return;
+    propJob = d.job_id;
+    if(mode !== 'review' || reviewObj !== key) await openReview(key);
+    enterPending(d.job_id, key, j, j.msg + ' — scrub: red=rebuilt, green=current · v=veto · then apply');
+  }, 1500);
+}
+async function rebuildAll3d(){
+  const t = prompt('Rebuild EVERY object from its 3D consensus?\n\nApplies straight to geom/empty frames (hand, propagated, remasked and behind-frontier frames are untouched; workspace snapshotted first).\n\nDo the blob sieve FIRST so junk objects are gone.\n\nType r to run:');
+  if((t || '').trim().toLowerCase() !== 'r') return;
+  const st = document.getElementById('blobStatus');
+  st.textContent = 'batch 3D rebuild …';
+  const r = await fetch('/api/rebuild3d', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({all: true})});
+  const d = await r.json();
+  const poll = setInterval(async () => {
+    const j = await (await fetch('/api/job/' + d.job_id)).json();
+    st.textContent = j.msg || j.status;
+    if(j.status !== 'running'){ clearInterval(poll); refreshObjects(); if(sceneView) updateSceneView(); }
+  }, 2000);
+}
 function clearPending(){ pendingMap = null; pendingVeto = new Set(); pendingObj = null; }
 function updateApplyLabel(){
   if(!pendingMap) return;
@@ -1295,7 +1351,8 @@ function objCard(key, o, member){
   const cd = o.source === 'cloud_diff' ? '<span class="pill">cloud-diff</span>' : '';
   const seedProp = (o.ghost || finished) ? '' : `
     <button onclick="addSeed('${key}')" title="add the current frame as another seed view — for cloud-diff objects too: seeds + your hand masks + the diff cluster union into one completed 3D object">+ seed</button>
-    <button onclick="propagate('${key}')" title="re-seed from the completed geometry (cluster + hand masks + seeds) and re-run per-frame SAM on geom/empty frames only — hand, propagated and remasked frames survive">propagate</button>`;
+    <button onclick="propagate('${key}')" title="re-seed from the completed geometry (cluster + hand masks + seeds) and re-run per-frame SAM on geom/empty frames only — hand, propagated and remasked frames survive">propagate</button>
+    <button onclick="rebuild3d('${key}')" title="rebuild from 3D consensus: every existing mask votes at 3D addresses, points ≥60% of the views agree on are re-rendered into EVERY frame — fixes jitter, misses and inconsistent overflow at once (preview → apply)">rebuild 3D</button>`;
   const iid = (o.instance || o.id);
   const remaskBtn = (o.ghost || finished) ? '' : `<button onclick="remask('${key}')"
     title="re-segment by concept from the label — pulls in thin legs/base the click-mask drops; keeps the current mask on frames it can't match">label → remask</button>`;
