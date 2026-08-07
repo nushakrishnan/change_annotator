@@ -807,33 +807,17 @@ def _scene_splats(state, frame):
     chp = fdir / f"changed_{state}.npy"
     if not sp.exists() or not chp.exists():
         raise FileNotFoundError("fields not computed")
-    from scantools.utils.geometry import project, sample_depth
-    capo, sess, renderer = _geom_ctx(state)
-    k = _frame_key(state, sess, frame)
-    if k is None:
-        raise KeyError("frame not in session")
-    cam = sess.sensors[k[1]]
-    T = sess.get_pose(k[0], k[1])
-    cam_s, sx, sy = G._scaled_camera(cam, 0.5)
-    _, depth = renderer.render_from_capture(T, cam_s)
+    cam, T, depth, sx, sy = _frame_geom(state, frame)
     H, W = cam.height, cam.width
+    fx = _cam_fx(cam)
     outs = []
     dis = G.out_dir(CFG["capture"]) / "fields" / f"dismissed_{state}.npy"
-    for p in (sp, chp):
+    for p, sp_m in ((sp, 0.04), (chp, 0.03)):
         P = np.load(p)
         if p is sp and dis.exists():                 # dismissed = certified no-change
             P = np.vstack([P, np.load(dis)])
-        p2d, z, vis = project(P.astype(np.float64), cam, pose=T.inverse())
-        m = np.zeros((H // 2, W // 2), np.uint8)
-        if vis.any():
-            occ_z, occ_ok = sample_depth(p2d[vis] * np.array([sx, sy]), depth)
-            pv = p2d[vis][occ_ok & (z[vis] <= occ_z + 0.05)] / 2.0
-            pv = pv[(pv[:, 0] >= 0) & (pv[:, 0] < W // 2)
-                    & (pv[:, 1] >= 0) & (pv[:, 1] < H // 2)].astype(np.int32)
-            m[pv[:, 1], pv[:, 0]] = 255
-            m = cv2.dilate(m, np.ones((7, 7), np.uint8))
-            m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
-        outs.append(cv2.resize(m, (W, H), interpolation=cv2.INTER_NEAREST) > 0)
+        _i, uv, z = _project_visible(P.astype(np.float64), cam, T, depth, sx, sy)
+        outs.append(_splat(uv, z, fx, H, W, spacing=sp_m))
     while len(SCENE_SPLATS) > 200:
         SCENE_SPLATS.pop(next(iter(SCENE_SPLATS)))
     SCENE_SPLATS[key] = (outs[0], outs[1])
@@ -922,33 +906,49 @@ def _frame_geom(state, frame):
 
 
 def _project_visible(P, cam, T, depth, sx, sy):
-    """(indices into P, pixel coords) of points visible and unoccluded."""
+    """(indices into P, pixel coords, depths) of points visible and unoccluded."""
     from scantools.utils.geometry import project, sample_depth
     p2d, z, vis = project(P, cam, pose=T.inverse())
     idx = np.where(vis)[0]
     if not len(idx):
-        return idx, p2d[:0]
+        return idx, p2d[:0], z[:0]
     occ_z, occ_ok = sample_depth(p2d[vis] * np.array([sx, sy]), depth)
     good = occ_ok & (z[vis] <= occ_z + 0.05)
-    return idx[good], p2d[vis][good]
+    return idx[good], p2d[vis][good], z[vis][good]
 
 
 def _project_field_indexed(state, frame, P):
-    """(indices, pixel coords, (H, W)) of cloud points visible in `frame`."""
+    """(indices, pixel coords, depths, (H, W)) of points visible in `frame`."""
     cam, T, depth, sx, sy = _frame_geom(state, frame)
-    idx, uv = _project_visible(P, cam, T, depth, sx, sy)
-    return idx, uv, (cam.height, cam.width)
+    idx, uv, z = _project_visible(P, cam, T, depth, sx, sy)
+    return idx, uv, z, (cam.height, cam.width)
 
 
-def _splat(uv, H, W):
-    """Projected points -> filled bool mask (depth-independent splat)."""
+def _cam_fx(cam):
+    return float(getattr(cam, "f", [cam.params[0]])[0])
+
+
+def _splat(uv, z, fx, H, W, spacing=0.04):
+    """Projected points -> filled bool mask with a DEPTH-ADAPTIVE radius: a
+    voxel-spaced cloud subtends `spacing * fx / z` pixels, so a fixed radius
+    leaves a close-up surface moth-eaten (measured: 2.7k label points over a
+    950k-px poster board). Points are bucketed by radius so each bucket needs
+    one dilate."""
     a = np.zeros((H, W), np.uint8)
-    if len(uv):
-        a[np.clip(uv[:, 1].astype(int), 0, H - 1),
-          np.clip(uv[:, 0].astype(int), 0, W - 1)] = 255
-        a = cv2.morphologyEx(cv2.dilate(a, np.ones((7, 7), np.uint8)),
-                             cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
-    return a > 0
+    if not len(uv):
+        return a > 0
+    r = np.clip(0.65 * spacing * fx / np.maximum(z, 0.3), 2, 48)
+    edges = np.array([3, 5, 8, 13, 21, 34, 48])
+    for b in np.unique(np.digitize(r, edges)):
+        sel = np.digitize(r, edges) == b
+        k = int(edges[min(int(b), len(edges) - 1)])
+        c = np.zeros((H, W), np.uint8)
+        c[np.clip(uv[sel, 1].astype(int), 0, H - 1),
+          np.clip(uv[sel, 0].astype(int), 0, W - 1)] = 255
+        ks = min(k, 12)                                # big radii via iterations
+        a |= cv2.dilate(c, np.ones((2 * ks + 1, 2 * ks + 1), np.uint8),
+                        iterations=max(1, round(k / ks)))
+    return cv2.morphologyEx(a, cv2.MORPH_CLOSE, np.ones((11, 11), np.uint8)) > 0
 
 
 @app.route("/api/lift3d", methods=["POST"])
@@ -973,7 +973,7 @@ def api_lift3d():
     stroke = (m[..., 3] > 0) if m.ndim == 3 and m.shape[2] == 4 else (m > 0)
     P, L_auto, L, n_static, reg = PL.load(fdir, state)   # L = HUMAN labels here
     try:
-        idx, uv, (H, W) = _project_field_indexed(state, frame, P)
+        idx, uv, z, (H, W) = _project_field_indexed(state, frame, P)
     except KeyError as e:
         return jsonify(error=str(e)), 404
     if stroke.shape != (H, W):
@@ -1021,18 +1021,14 @@ def api_label_overlay():
     if own is None or not (L == own).any():
         return jsonify(error="object has no 3D labels"), 404
     try:
-        idx, uv, (H, W) = _project_field_indexed(state, frame, P)
+        cam, T, depth, sx, sy = _frame_geom(state, frame)
+        idx, uv, z = _project_visible(P, cam, T, depth, sx, sy)
     except KeyError as e:
         return jsonify(error=str(e)), 404
+    H, W = cam.height, cam.width
     sel = (L == own)[idx]
     rgba = np.zeros((H, W, 4), np.uint8)
-    u = np.clip(uv[sel, 0].astype(int), 0, W - 1)
-    v = np.clip(uv[sel, 1].astype(int), 0, H - 1)
-    a = np.zeros((H, W), np.uint8)
-    a[v, u] = 255
-    a = cv2.morphologyEx(cv2.dilate(a, np.ones((7, 7), np.uint8)),
-                         cv2.MORPH_CLOSE, np.ones((13, 13), np.uint8))
-    rgba[a > 0] = (0, 0, 255, 110)
+    rgba[_splat(uv[sel], z[sel], _cam_fx(cam), H, W)] = (0, 0, 255, 110)
     ok, buf = cv2.imencode(".png", rgba)
     return Response(buf.tobytes(), mimetype="image/png")
 
@@ -1080,7 +1076,7 @@ def _rebuild_one(oid, threshold, cb, refine=True):
     if cand is None:                                  # no geometry: seed from the
         big = max(mi, key=lambda n: mi[n].get("px", 0))   # biggest existing mask
         m = cv2.imread(str(od / mi[big]["mask_file"]), 0)
-        idx, uv, (H, W) = _project_field_indexed(state, big, P)
+        idx, uv, _z, (H, W) = _project_field_indexed(state, big, P)
         u = np.clip(uv[:, 0].astype(int), 0, W - 1)
         v = np.clip(uv[:, 1].astype(int), 0, H - 1)
         seed = np.zeros(len(P), bool)
@@ -1104,7 +1100,7 @@ def _rebuild_one(oid, threshold, cb, refine=True):
             cam, T, depth, sx, sy = _frame_geom(state, n)
         except KeyError:
             continue
-        idx, uv = _project_visible(Pc, cam, T, depth, sx, sy)
+        idx, uv, _z = _project_visible(Pc, cam, T, depth, sx, sy)
         if not len(idx):
             continue
         w = REBUILD_HAND_WEIGHT if mi[n].get("src") == "hand" else 1.0
@@ -1143,10 +1139,10 @@ def _rebuild_one(oid, threshold, cb, refine=True):
             cam, T, depth, sx, sy = _frame_geom(state, n)
         except KeyError:
             continue
-        idx, uv = _project_visible(P_lab, cam, T, depth, sx, sy)
+        idx, uv, z = _project_visible(P_lab, cam, T, depth, sx, sy)
         if len(idx) < 12:                            # not meaningfully in view
             continue
-        m = _splat(uv, cam.height, cam.width)
+        m = _splat(uv, z, _cam_fx(cam), cam.height, cam.width)
         if m.sum() < 200:
             continue
         if refine:                                   # geometry proposes, RGB draws
