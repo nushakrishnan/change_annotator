@@ -35,7 +35,11 @@
   /* green hue = finished GT, not to be touched casually; reviewed = even greener */
   .obj.f-done { border-color: #8c8; background: #eef8ef; }
   .obj.f-done.f-reviewed { border-color: #2a7; background: #d8f0de; }
-  .obj.reviewing { border-color: #2a7; box-shadow: 0 0 0 2px #2a72; }
+  /* the card being REVIEWED / identified: unmissable full-card highlight so a
+     delete/dismiss can never hit the wrong neighbour by mistake */
+  .obj.reviewing, .grp.reviewing { border-color: #0a84ff; background: #d9ecff;
+      box-shadow: 0 0 0 3px #0a84ff; }
+  .obj.f-done.reviewing { background: #d9ecff; }      /* blue beats done-green */
   .obj h4 { margin: 0 0 4px; font-size: 14px; padding-right: 118px; }  /* room for the flags */
   .obj .meta { font-size: 12px; color: #666; }
   .obj img { max-width: 100%; margin-top: 6px; border: 1px solid #eee; }
