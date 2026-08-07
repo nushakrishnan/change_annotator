@@ -656,8 +656,13 @@ async function whoIsHereClick(e){
     if(el){ el.classList.add('reviewing'); if(i === 0) el.scrollIntoView({block: 'center'}); }
   });
   if(d.keys && d.keys.length){
+    // clicking an object in the u view drops back to the BASIC view with just
+    // that object's mask on the plain frame, at this same frame (u re-enters)
+    const stay = frameName(idx);
+    sceneView = 0; updateSceneView();
+    openReview(d.keys[0], stay);
     document.getElementById('clickStatus').textContent =
-      'here: ' + found.join(', ') + " — card highlighted (its 'dismiss ⇢ green' button certifies no-change)";
+      'reviewing ' + d.keys[0] + ' — its mask alone on the plain sequence (press u to return to scene view)';
   } else {
     document.getElementById('clickStatus').textContent =
       'purple here = territory of ' + found.join(', ') + ' (cluster projects here, no mask on this '
