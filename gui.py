@@ -1060,8 +1060,19 @@ def _rebuild_one(oid, threshold, cb, refine=True):
     od = G.out_dir(CFG["capture"], oid)
     mi_path = od / "masks_index.json"
     mi = json.load(open(mi_path)) if mi_path.exists() else {}
-    if not mi:
-        raise ValueError("object has no masks to learn from")
+    # evidence = per-frame masks PLUS the seed store (src_masks/ + src_index.json,
+    # where '+ seed' puts its hand-drawn masks). A freshly seeded object has no
+    # masks_index at all — and 2-3 spread seeds are exactly the case consensus
+    # serves best, so they must be able to drive a rebuild on their own.
+    ev = {}
+    for n, e in mi.items():
+        m = cv2.imread(str(od / e["mask_file"]), 0)
+        if m is not None:
+            ev[n] = (m > 127, REBUILD_HAND_WEIGHT if e.get("src") == "hand" else 1.0)
+    for sn, sm in G._load_src_masks(od, OBJECTS[oid].get("frame")):
+        ev[sn] = (sm, REBUILD_HAND_WEIGHT)           # seeds are hand-drawn
+    if not ev:
+        raise ValueError("no masks or seeds to learn from — draw one first")
     P, L_auto, L_hum, n_static, reg = PL.load(fdir, state)
 
     # candidates: points near the object's own geometry — keeps the per-frame
@@ -1074,18 +1085,16 @@ def _rebuild_one(oid, threshold, cb, refine=True):
             cand = d < 2.0
             break
     if cand is None:                                  # no stored geometry: seed the
-        seed = np.zeros(len(P), bool)                 # candidates from ALL the masks,
-        for n in sorted(mi, key=lambda n: -mi[n].get("px", 0))[:12]:   # biggest first
-            m = cv2.imread(str(od / mi[n]["mask_file"]), 0)
-            if m is None:
-                continue
+        seed = np.zeros(len(P), bool)                 # candidates from ALL the evidence
+        for n in sorted(ev, key=lambda n: -int(ev[n][0].sum()))[:12]:  # biggest first
+            m = ev[n][0]
             try:
                 idx, uv, _z, (H, W) = _project_field_indexed(state, n, P)
             except KeyError:
                 continue
             u = np.clip(uv[:, 0].astype(int), 0, W - 1)
             v = np.clip(uv[:, 1].astype(int), 0, H - 1)
-            seed[idx[(m > 127)[v, u]]] = True         # union: one view sees one side
+            seed[idx[m[v, u]]] = True                 # union: one view sees one side
         if seed.sum() < 10:
             raise ValueError("no cloud support (glass/unscanned?) — keep the 2D masks")
         cand = PL.grow(P, seed, radius=0.08, iters=4)
@@ -1097,13 +1106,11 @@ def _rebuild_one(oid, threshold, cb, refine=True):
                                      # frames from the same spot make the SAME mistake,
                                      # so they cannot corroborate each other
 
-    names = sorted(mi, key=lambda n: int(Path(n).stem))
+    names = sorted(ev, key=lambda n: int(Path(n).stem))
     for j, n in enumerate(names):
         if j % 20 == 0:
             cb(f"{oid}: voting {j}/{len(names)} frames")
-        m = cv2.imread(str(od / mi[n]["mask_file"]), 0)
-        if m is None:
-            continue
+        m, w = ev[n]
         try:
             cam, T, depth, sx, sy = _frame_geom(state, n)
         except KeyError:
@@ -1111,14 +1118,13 @@ def _rebuild_one(oid, threshold, cb, refine=True):
         idx, uv, _z = _project_visible(Pc, cam, T, depth, sx, sy)
         if not len(idx):
             continue
-        w = REBUILD_HAND_WEIGHT if mi[n].get("src") == "hand" else 1.0
         cpos = np.asarray(T.t, float)                 # camera centre, for diversity
         if not any(np.linalg.norm(cpos - q) < 0.5 for q in viewpoints):
             viewpoints.append(cpos)
         opps[idx] += w
         u = np.clip(uv[:, 0].astype(int), 0, m.shape[1] - 1)
         v = np.clip(uv[:, 1].astype(int), 0, m.shape[0] - 1)
-        votes[idx[(m > 127)[v, u]]] += w
+        votes[idx[m[v, u]]] += w
 
     min_opps = 2.0 if len(names) >= 4 else 1.0
     ratio = votes / np.maximum(opps, 1e-6)
@@ -1137,9 +1143,12 @@ def _rebuild_one(oid, threshold, cb, refine=True):
     # render the label into every frame the object is known to reach
     P_lab = P[lab]
     seeds_p = od / "seeds.json"
-    frames = set(mi)
-    if seeds_p.exists():
-        frames |= set(json.load(open(seeds_p)))
+    if seeds_p.exists():                              # the object's visibility index
+        frames = set(mi) | set(json.load(open(seeds_p)))
+    else:                                             # seeded-only object: the label is
+        d = (Path(CFG["capture"]) / "sessions"        # all we have, so try the whole walk
+             / CFG["states"][state]["session"] / "raw_data" / "images" / "cam0")
+        frames = {f"images/cam0/{p.name}" for p in d.glob("*.jpg")} | set(ev)
     frames = sorted(frames, key=lambda n: int(Path(n).stem))
     results = {}
     sid = CFG["states"][state]["session"]
@@ -1147,11 +1156,20 @@ def _rebuild_one(oid, threshold, cb, refine=True):
         if j % 20 == 0:
             cb(f"{oid}: rendering {j}/{len(frames)} frames")
         try:
+            capo, sess, _r = _geom_ctx(state)
+            k = _frame_key(state, sess, n)
+            if k is None:
+                continue
+            cam0, T0 = sess.sensors[k[1]], sess.get_pose(k[0], k[1])
+            from scantools.utils.geometry import project as _proj
+            _p, _z0, in_view = _proj(P_lab, cam0, pose=T0.inverse())
+            if int(in_view.sum()) < 12:              # cheap frustum reject: skip the
+                continue                             # mesh render entirely
             cam, T, depth, sx, sy = _frame_geom(state, n)
         except KeyError:
             continue
         idx, uv, z = _project_visible(P_lab, cam, T, depth, sx, sy)
-        if len(idx) < 12:                            # not meaningfully in view
+        if len(idx) < 12:                            # occluded in this view
             continue
         m = _splat(uv, z, _cam_fx(cam), cam.height, cam.width)
         if m.sum() < 200:
