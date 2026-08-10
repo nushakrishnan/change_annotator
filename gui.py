@@ -1073,14 +1073,19 @@ def _rebuild_one(oid, threshold, cb, refine=True):
             d = cKDTree(np.load(cp).astype(np.float64)).query(P, workers=-1)[0]
             cand = d < 2.0
             break
-    if cand is None:                                  # no geometry: seed from the
-        big = max(mi, key=lambda n: mi[n].get("px", 0))   # biggest existing mask
-        m = cv2.imread(str(od / mi[big]["mask_file"]), 0)
-        idx, uv, _z, (H, W) = _project_field_indexed(state, big, P)
-        u = np.clip(uv[:, 0].astype(int), 0, W - 1)
-        v = np.clip(uv[:, 1].astype(int), 0, H - 1)
-        seed = np.zeros(len(P), bool)
-        seed[idx[(m > 127)[v, u]]] = True
+    if cand is None:                                  # no stored geometry: seed the
+        seed = np.zeros(len(P), bool)                 # candidates from ALL the masks,
+        for n in sorted(mi, key=lambda n: -mi[n].get("px", 0))[:12]:   # biggest first
+            m = cv2.imread(str(od / mi[n]["mask_file"]), 0)
+            if m is None:
+                continue
+            try:
+                idx, uv, _z, (H, W) = _project_field_indexed(state, n, P)
+            except KeyError:
+                continue
+            u = np.clip(uv[:, 0].astype(int), 0, W - 1)
+            v = np.clip(uv[:, 1].astype(int), 0, H - 1)
+            seed[idx[(m > 127)[v, u]]] = True         # union: one view sees one side
         if seed.sum() < 10:
             raise ValueError("no cloud support (glass/unscanned?) — keep the 2D masks")
         cand = PL.grow(P, seed, radius=0.08, iters=4)
@@ -1088,6 +1093,9 @@ def _rebuild_one(oid, threshold, cb, refine=True):
     Pc = P[ci]
     votes = np.zeros(len(ci), np.float32)
     opps = np.zeros(len(ci), np.float32)
+    viewpoints = []                  # distinct camera positions (>0.5 m apart): two
+                                     # frames from the same spot make the SAME mistake,
+                                     # so they cannot corroborate each other
 
     names = sorted(mi, key=lambda n: int(Path(n).stem))
     for j, n in enumerate(names):
@@ -1104,6 +1112,9 @@ def _rebuild_one(oid, threshold, cb, refine=True):
         if not len(idx):
             continue
         w = REBUILD_HAND_WEIGHT if mi[n].get("src") == "hand" else 1.0
+        cpos = np.asarray(T.t, float)                 # camera centre, for diversity
+        if not any(np.linalg.norm(cpos - q) < 0.5 for q in viewpoints):
+            viewpoints.append(cpos)
         opps[idx] += w
         u = np.clip(uv[:, 0].astype(int), 0, m.shape[1] - 1)
         v = np.clip(uv[:, 1].astype(int), 0, m.shape[0] - 1)
@@ -1118,7 +1129,7 @@ def _rebuild_one(oid, threshold, cb, refine=True):
     PL.save(fdir, state, L_auto=L_auto, reg=reg)
     eff = PL.effective(L_auto, L_hum)
     lab = np.where(eff == own)[0]
-    stats = {"cand": int(len(ci)), "kept": int(keep.sum()),
+    stats = {"cand": int(len(ci)), "kept": int(keep.sum()), "views": len(viewpoints),
              "human": int(((L_hum == own)).sum()), "labeled": int(len(lab))}
     if not len(lab):
         return {}, stats
@@ -1185,8 +1196,12 @@ def _rebuild_job(job_id, oid, threshold):
         JOBS[job_id].update(status="done", n=len(results), obj=oid,
                             n_shrink=sum(1 for f in flags.values() if f.get("shrink")),
                             anchors=0, span=len(results), invisible=0, resumes=0,
-                            msg=f"3D rebuild: {stats['labeled']:,} labeled pts "
-                                f"({stats['human']:,} human) -> {len(results)} frames",
+                            msg=f"3D rebuild: {stats['labeled']:,} labeled pts from "
+                                f"{stats['views']} viewpoint(s)"
+                                + (" — ONE viewpoint: no consensus possible, this is a "
+                                   "plain lift; add a mask from elsewhere"
+                                   if stats['views'] < 2 else "")
+                                + f" -> {len(results)} frames",
                             preview=f"/results/{oid}/{prev}")
     except Exception as e:
         JOBS[job_id].update(status="error", error=str(e))
