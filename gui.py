@@ -569,7 +569,8 @@ def _propagate_fix_job(job_id, oid, frame, mode):
             JOBS[job_id].update(status="done", n=0,
                                 msg="nothing to fill (span already hand-covered?)")
             return
-        mi = json.load(open(od / "masks_index.json"))
+        mi_path = od / "masks_index.json"
+        mi = json.load(open(mi_path)) if mi_path.exists() else {}
         # NOTE: proposals are the tracker's own masks, untouched. A geometry
         # "snap" stage that auto-corrected them was tried and rolled back
         # (2026-07-24): partial clusters/lifted shells clamped SAM's pose-driven
@@ -658,7 +659,7 @@ def api_propagate_apply():
     exclude = set(d.get("exclude") or [])            # per-frame vetoes from pending review
     od = G.out_dir(CFG["capture"], oid)
     mi_path = od / "masks_index.json"
-    mi = json.load(open(mi_path))
+    mi = json.load(open(mi_path)) if mi_path.exists() else {}
     bak = od / "masks" / f".bak_{job_id}"
     written, skipped = 0, 0
     for name, mask in sorted(results.items()):
@@ -672,7 +673,9 @@ def api_propagate_apply():
             bak.mkdir(parents=True, exist_ok=True)
             shutil.copy(od / cur["mask_file"], bak / flat)
         cv2.imwrite(str(od / "masks" / flat), (mask * 255).astype(np.uint8))
-        sid = cur["session"] if cur else mi[sorted(mi)[0]]["session"]
+        sid = (cur["session"] if cur else
+               mi[sorted(mi)[0]]["session"] if mi else
+               CFG["states"][OBJECTS[oid]["state"]]["session"])
         mi[name] = {"session": sid, "mask_file": f"masks/{flat}",
                     "px": int(mask.sum()), "src": "prop"}
         written += 1
@@ -1201,7 +1204,8 @@ def _rebuild_job(job_id, oid, threshold):
                                     f"of {stats['cand']} candidates — lower the vote?)")
             return
         od = G.out_dir(CFG["capture"], oid)
-        mi = json.load(open(od / "masks_index.json"))
+        mi_path = od / "masks_index.json"            # absent on a seeds-only object
+        mi = json.load(open(mi_path)) if mi_path.exists() else {}
         flags = {}
         for n, m in results.items():
             e = mi.get(n)
