@@ -638,6 +638,22 @@ async function commitSceneArm(kind){
   if(!a || a.type !== kind) return false;
   clearSceneArm();
   const st = document.getElementById('clickStatus');
+  if(kind === 'newobj'){
+    const base = 'obj_' + String(Object.keys(objsCache || {}).length + 1).padStart(2, '0');
+    const id = prompt('New object id:', base);
+    if(!id){ st.textContent = 'new object cancelled'; return true; }
+    const r = await fetch('/api/add_object', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({id: id.trim(), label: '', deformability: 'rigid',
+                            state: a.state, frame: a.frame, points: [a.point], mask: a.mask})});
+    const d = await r.json();
+    if(d.error){ st.textContent = 'new object: ' + d.error; return true; }
+    await refreshObjects();
+    const key = id.trim() + '__' + a.state;
+    sceneView = 0; updateSceneView();
+    await openReview(key, a.frame);
+    st.textContent = `created ${key} — refine it here, '+ seed' other views, then rebuild 3D`;
+    return true;
+  }
   if(kind === 'lift'){
     const r = await fetch('/api/lift3d', {method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify(a.body)});
@@ -728,8 +744,22 @@ async function whoIsHereClick(e){
   const found = (d.keys && d.keys.length) ? d.keys
               : (d.territory && d.territory.length) ? d.territory : [];
   if(!found.length){
+    // nothing owns this pixel: SAM it right here and arm a NEW object, so an
+    // unclaimed purple blob can become an object without leaving the scene view
+    document.getElementById('clickStatus').textContent = 'scene view: segmenting here …';
+    const sr = await fetch('/api/click', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({state: st, frame: frameName(idx), points: [[Math.round(x), Math.round(y)]], neg: []})});
+    const sd = await sr.json();
+    if(sd.error){ document.getElementById('clickStatus').textContent =
+      'scene view: nothing claims this pixel · ' + sd.error; return; }
+    sceneArm = {type: 'newobj', mask: sd.mask, state: st, frame: frameName(idx),
+                point: [Math.round(x), Math.round(y)]};
+    armImg.onload = () => { armImg.style.display = 'block'; };
+    armImg.src = sd.mask;
     document.getElementById('clickStatus').textContent =
-      'scene view: nothing claims this pixel — unproposed change (annotate it) or noise'; return; }
+      `unclaimed — SAM'd ${sd.px.toLocaleString()} px here (score ${sd.score.toFixed(2)}): `
+      + 'press n to make it a NEW object · Esc cancels';
+    return; }
   found.forEach((k, i) => {
     const el = document.querySelector(`[data-oid="${k}"]`);
     if(el){ el.classList.add('reviewing'); if(i === 0) el.scrollIntoView({block: 'center'}); }
@@ -815,6 +845,7 @@ document.addEventListener('keydown', (e) => {
   else if(sceneArm && e.key === 'Escape'){ e.preventDefault(); clearSceneArm();
     document.getElementById('clickStatus').textContent = 'armed action cancelled'; }
   else if(sceneArm && (sceneArm.type === 'merge' || sceneArm.type === 'lift') && (e.key === 'm' || e.key === 'M')){ e.preventDefault(); commitSceneArm(sceneArm.type); }
+  else if(sceneArm && sceneArm.type === 'newobj' && (e.key === 'n' || e.key === 'N')){ e.preventDefault(); commitSceneArm('newobj'); }
   else if((e.key === 'u' || e.key === 'U') && !e.ctrlKey && !e.metaKey){ e.preventDefault(); cycleSceneView(); }
   else if((e.key === 'i' || e.key === 'I') && !e.ctrlKey && !e.metaKey){ e.preventDefault(); cycleFx(); }
   else if((e.key === 'e' || e.key === 'E') && !e.ctrlKey && !e.metaKey){ e.preventDefault();
