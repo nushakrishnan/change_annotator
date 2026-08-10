@@ -124,12 +124,27 @@ def _native_unions(capture, geom_out, object_keys, verbose):
         if "__" not in key:
             continue
         _, state = key.rsplit("__", 1)
+        # masks_index PLUS the seed store: a seeded-but-not-yet-propagated object
+        # has hand-drawn masks only under src_masks/, and they are annotation too
+        entries = {}
+        si_path = root / key / "src_index.json"
+        if si_path.exists():
+            for it in json.load(open(si_path)):
+                entries[it["src_name"]] = {"mask_file": it["mask_file"], "session": None}
         mi_path = root / key / "masks_index.json"
-        if not mi_path.exists():
+        if mi_path.exists():
+            mi = json.load(open(mi_path))
+            entries.update(mi)
+            sid = next((e.get("session") for e in mi.values() if e.get("session")), None)
+            for e in entries.values():               # seed entries carry no session
+                e.setdefault("session", None)
+                if e["session"] is None:
+                    e["session"] = sid
+        if not entries:
             if verbose:
-                print(f"  skip {key}: no masks_index.json")
+                print(f"  skip {key}: no masks")
             continue
-        for frame, meta in json.load(open(mi_path)).items():
+        for frame, meta in entries.items():
             m = cv2.imread(str(root / key / meta["mask_file"]), cv2.IMREAD_GRAYSCALE)
             if m is None:
                 if verbose:

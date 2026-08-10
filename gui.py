@@ -779,20 +779,36 @@ def _fields_job(job_id, tau_lo=None):
         JOBS[job_id].update(status="error", error=str(e))
 
 
+def _object_mask_paths(oid):
+    """{frame: png path} for an object — masks_index entries PLUS the seed store
+    (src_masks/, where a new object's first mask and every '+ seed' lands).
+    A freshly created or seeded object has masks ONLY in the seed store, so
+    anything that reads just masks_index treats it as unannotated: it stayed
+    invisible in the scene view and missing from the export. masks_index wins
+    where both exist (that is the reviewed/applied version)."""
+    od = G.out_dir(CFG["capture"], oid)
+    out = {}
+    idx = od / "src_index.json"
+    if idx.exists():
+        for it in json.load(open(idx)):
+            out[it["src_name"]] = od / it["mask_file"]
+    mi_path = od / "masks_index.json"
+    if mi_path.exists():
+        for n, e in json.load(open(mi_path)).items():
+            out[n] = od / e["mask_file"]
+    return out
+
+
 def _union_mask(state, frame):
     """Union of every object's saved mask on this frame (bool full-res or None)."""
     u = None
     for key, o in OBJECTS.items():
         if o.get("state") != state or o.get("ghost"):
             continue
-        od = G.out_dir(CFG["capture"], key)
-        mi_path = od / "masks_index.json"
-        if not mi_path.exists():
+        p = _object_mask_paths(key).get(frame)
+        if p is None:
             continue
-        e = json.load(open(mi_path)).get(frame)
-        if not e:
-            continue
-        m = cv2.imread(str(od / e["mask_file"]), 0)
+        m = cv2.imread(str(p), 0)
         if m is None:
             continue
         u = (m > 127) if u is None else (u | (m > 127))
@@ -1585,15 +1601,13 @@ def api_who_is_here():
         if o.get("state") != state or o.get("ghost"):
             continue
         od = G.out_dir(CFG["capture"], key)
-        mi_path = od / "masks_index.json"
-        if mi_path.exists():
-            e = json.load(open(mi_path)).get(frame)
-            if e:
-                m = cv2.imread(str(od / e["mask_file"]), 0)
-                if (m is not None and 0 <= y < m.shape[0] and 0 <= x < m.shape[1]
-                        and m[y, x] > 127):
-                    hits.append(key)
-                    continue
+        p = _object_mask_paths(key).get(frame)
+        if p is not None:
+            m = cv2.imread(str(p), 0)
+            if (m is not None and 0 <= y < m.shape[0] and 0 <= x < m.shape[1]
+                    and m[y, x] > 127):
+                hits.append(key)
+                continue
         sp = od / "seeds.json"
         if not sp.exists():
             continue
@@ -2229,15 +2243,14 @@ def api_export():
         if o.get("ghost"):
             continue
         od = G.out_dir(CFG["capture"], key)
-        mi_path = od / "masks_index.json"
-        mi = json.load(open(mi_path)) if mi_path.exists() else {}
+        mi = _object_mask_paths(key)           # incl. seed-born masks (src_masks/)
         iid = o.get("instance") or o["id"]     # group / moved pair = shared instance id
         e = by_id.setdefault(iid, {"label": o["label"],
                                    "deformability": o["deformability"], "contrib": {}})
         e["label"] = o.get("label") or e["label"]          # keep a non-empty label
         e["deformability"] = o.get("deformability", e["deformability"])
-        for name, m in mi.items():
-            e["contrib"].setdefault(o["state"], {}).setdefault(name, []).append(od / m["mask_file"])
+        for name, mpath in mi.items():
+            e["contrib"].setdefault(o["state"], {}).setdefault(name, []).append(mpath)
     objects_out = {}
     for oid, e in by_id.items():
         masks = {}
