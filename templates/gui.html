@@ -617,7 +617,8 @@ const edgeImg = document.getElementById('edgeOverlay');
 // m (merge) or g (dismiss) COMMITS, Esc cancels
 let sceneArm = null;
 const armImg = document.getElementById('armOverlay');
-function clearSceneArm(){ sceneArm = null; armImg.style.display = 'none'; armImg.src = ''; }
+function clearSceneArm(){ sceneArm = null; armImg.style.display = 'none'; armImg.src = '';
+                          armImg.style.filter = ''; }
 async function lift3d(){
   if(mode !== 'review' || !editing){ alert('propagate in 3D works in review → edit mode (x), with your 2D fix on the canvas'); return; }
   const st = document.getElementById('clickStatus');
@@ -628,6 +629,7 @@ async function lift3d(){
   const d = await r.json();
   if(d.error){ st.textContent = 'lift3d: ' + d.error; return; }
   sceneArm = {type: 'lift', body};
+  armImg.style.filter = '';
   armImg.onload = () => { armImg.style.display = 'block'; };
   armImg.src = d.preview;
   st.textContent = `ARMED (orange): ${d.n_claim.toLocaleString()} cloud pts (${d.n_seed.toLocaleString()} from stroke, `
@@ -730,6 +732,7 @@ async function whoIsHereClick(e){
     const d0 = await r0.json();
     if(d0.error){ clearSceneArm(); document.getElementById('clickStatus').textContent = 'claim purple: ' + d0.error; return; }
     sceneArm = {type: 'merge', body};
+    armImg.style.filter = '';
     armImg.onload = () => { armImg.style.display = 'block'; };
     armImg.src = d0.preview;
     document.getElementById('clickStatus').textContent =
@@ -755,7 +758,8 @@ async function whoIsHereClick(e){
     sceneArm = {type: 'newobj', mask: sd.mask, state: st, frame: frameName(idx),
                 point: [Math.round(x), Math.round(y)]};
     armImg.onload = () => { armImg.style.display = 'block'; };
-    armImg.src = sd.mask;
+    armImg.style.filter = 'hue-rotate(150deg) saturate(2.5) brightness(1.3)';  // CYAN =
+    armImg.src = sd.mask;                       // freshly clicked, not yet an object
     document.getElementById('clickStatus').textContent =
       `unclaimed — SAM'd ${sd.px.toLocaleString()} px here (score ${sd.score.toFixed(2)}): `
       + 'press n to make it a NEW object · Esc cancels';
@@ -1293,6 +1297,26 @@ async function handleClick(e){
 
 // ───────── objects sidebar ─────────
 async function addObject(){
+  // a scene-view selection (cyan) lives in the arm overlay, not the mask canvas —
+  // accept it here too so 'add object' works straight from the u view
+  if(sceneArm && sceneArm.type === 'newobj'){
+    const id0 = document.getElementById('oid').value.trim();
+    if(!id0){ alert('give the object an id first (or press n to be prompted)'); return; }
+    const r0 = await fetch('/api/add_object', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({id: id0, label: document.getElementById('olabel').value,
+        deformability: document.getElementById('odeform').value,
+        state: sceneArm.state, frame: sceneArm.frame, points: [sceneArm.point],
+        mask: sceneArm.mask})});
+    const d0 = await r0.json();
+    if(d0.error){ alert(d0.error); return; }
+    const key0 = id0 + '__' + sceneArm.state;
+    clearSceneArm();
+    document.getElementById('oid').value=''; document.getElementById('olabel').value='';
+    await refreshObjects();
+    sceneView = 0; updateSceneView();
+    openReview(key0, frameName(idx));
+    return;
+  }
   if(mode !== 'annotate'){ alert('switch to annotate (← back to annotate) to add an object'); return; }
   const id = document.getElementById('oid').value;
   const body = { id, label: document.getElementById('olabel').value,

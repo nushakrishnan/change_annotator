@@ -661,7 +661,7 @@ def api_propagate_apply():
     mi_path = od / "masks_index.json"
     mi = json.load(open(mi_path)) if mi_path.exists() else {}
     bak = od / "masks" / f".bak_{job_id}"
-    written, skipped = 0, 0
+    written, skipped, failed = 0, 0, 0
     for name, mask in sorted(results.items()):
         cur = mi.get(name)
         if (name in exclude or (cur and cur.get("src") == "hand")
@@ -672,7 +672,11 @@ def api_propagate_apply():
         if cur and (od / cur["mask_file"]).exists():         # backup before overwrite
             bak.mkdir(parents=True, exist_ok=True)
             shutil.copy(od / cur["mask_file"], bak / flat)
-        cv2.imwrite(str(od / "masks" / flat), (mask * 255).astype(np.uint8))
+        (od / "masks").mkdir(parents=True, exist_ok=True)    # absent on a seeds-only
+        if not cv2.imwrite(str(od / "masks" / flat),         # object; imwrite would
+                           (mask * 255).astype(np.uint8)):   # then fail SILENTLY and
+            failed += 1                                      # leave an index of ghosts
+            continue
         sid = (cur["session"] if cur else
                mi[sorted(mi)[0]]["session"] if mi else
                CFG["states"][OBJECTS[oid]["state"]]["session"])
@@ -682,6 +686,9 @@ def api_propagate_apply():
     json.dump(mi, open(mi_path, "w"), indent=1)
     PROP_PENDING.pop(job_id, None)
     PROP_FLAGS.pop(job_id, None)
+    if failed:
+        return jsonify(error=f"{failed} mask file(s) could not be written to "
+                             f"{od / 'masks'} — check disk/permissions"), 500
     return jsonify(ok=True, written=written, skipped_hand=skipped, n_masks=len(mi))
 
 
@@ -795,7 +802,9 @@ def _object_mask_paths(oid):
     mi_path = od / "masks_index.json"
     if mi_path.exists():
         for n, e in json.load(open(mi_path)).items():
-            out[n] = od / e["mask_file"]
+            p = od / e["mask_file"]
+            if p.exists():                       # a stale entry (file gone/never
+                out[n] = p                       # written) must not shadow a seed
     return out
 
 
