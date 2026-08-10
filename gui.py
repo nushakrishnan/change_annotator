@@ -1139,7 +1139,8 @@ def _rebuild_one(oid, threshold, cb, refine=True):
     eff = PL.effective(L_auto, L_hum)
     lab = np.where(eff == own)[0]
     stats = {"cand": int(len(ci)), "kept": int(keep.sum()), "views": len(viewpoints),
-             "human": int(((L_hum == own)).sum()), "labeled": int(len(lab))}
+             "human": int(((L_hum == own)).sum()), "labeled": int(len(lab)),
+             "refined": 0, "splat": 0}
     if not len(lab):
         return {}, stats
 
@@ -1154,6 +1155,7 @@ def _rebuild_one(oid, threshold, cb, refine=True):
         frames = {f"images/cam0/{p.name}" for p in d.glob("*.jpg")} | set(ev)
     frames = sorted(frames, key=lambda n: int(Path(n).stem))
     results = {}
+    n_refined = n_splat = 0                          # did SAM's edge win, or geometry's?
     sid = CFG["states"][state]["session"]
     for j, n in enumerate(frames):
         if j % 20 == 0:
@@ -1177,19 +1179,33 @@ def _rebuild_one(oid, threshold, cb, refine=True):
         m = _splat(uv, z, _cam_fx(cam), cam.height, cam.width)
         if m.sum() < 200:
             continue
-        if refine:                                   # geometry proposes, RGB draws
+        if refine:                                   # geometry PROMPTS, SAM DRAWS
             try:
                 bgr = cv2.imread(str(Path(CFG["capture"]) / "sessions" / sid
                                      / "raw_data" / n))
                 img = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                clip = cv2.dilate(m.astype(np.uint8), np.ones((41, 41), np.uint8)) > 0
+                clip = cv2.dilate(m.astype(np.uint8), np.ones((61, 61), np.uint8)) > 0
                 r = _sam_refine_geom(img, m, clip)
-                inter, union = (r & m).sum(), (r | m).sum()
-                if r.sum() >= 200 and union and inter / union >= 0.4:
+                # Accept SAM's boundary unless it is degenerate or ran away.
+                # The old rule demanded IoU >= 0.4 WITH THE SPLAT — backwards for
+                # thin objects: a poster's splat is a fat, voxel-quantised slab, so
+                # SAM's correct clean rectangle scored low and was thrown away,
+                # leaving the ragged geometry edge. Geometry decides WHERE (it does
+                # that in every frame from a few seeds); the image decides the EDGE.
+                core = cv2.erode(m.astype(np.uint8), np.ones((15, 15), np.uint8)) > 0
+                if not core.any():                   # thin object: erosion wipes it
+                    core = m
+                cover = (r & core).sum() / max(1, int(core.sum()))
+                grow = r.sum() / max(1, int(m.sum()))
+                if r.sum() >= 200 and cover >= 0.5 and grow <= 4.0:
                     m = r
+                    n_refined += 1
+                else:
+                    n_splat += 1
             except Exception:
-                pass
+                n_splat += 1
         results[n] = m
+    stats["refined"], stats["splat"] = n_refined, n_splat
     return results, stats
 
 
@@ -1219,7 +1235,8 @@ def _rebuild_job(job_id, oid, threshold):
                             n_shrink=sum(1 for f in flags.values() if f.get("shrink")),
                             anchors=0, span=len(results), invisible=0, resumes=0,
                             msg=f"3D rebuild: {stats['labeled']:,} labeled pts from "
-                                f"{stats['views']} viewpoint(s)"
+                                f"{stats['views']} viewpoint(s) · "
+                                f"{stats['refined']} SAM-drawn / {stats['splat']} geometry-edged"
                                 + (" — ONE viewpoint: no consensus possible, this is a "
                                    "plain lift; add a mask from elsewhere"
                                    if stats['views'] < 2 else "")
