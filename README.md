@@ -1,294 +1,382 @@
 # SceneDiff Annotator
 
-A video annotation tool for logging down changes between paired video sequences. 
+A tool for building **ground truth about what changed** between two visits to the same
+place. You get two lidar scans (NavVis) and two head-mounted camera walks (Aria) of the
+same scene, recorded weeks or months apart. The tool helps you produce, for every video
+frame, a mask marking the pixels that changed — plus, where it makes sense, which object
+each mask belongs to.
 
-🔗 Check out the [project page](https://yuqunw.github.io/SceneDiff) for more details.
+🔗 [Project page](https://yuqunw.github.io/SceneDiff)
 
-## Overview
+---
 
-The SceneDiff Annotator is built on top of [SAM 3.1](https://github.com/facebookresearch/sam3) and provides a geometry-assisted workflow for annotating changes between a paired "pre" and "post" capture of the same scene:
+## 1. The idea in plain English
 
-- **Click to Segment**: Click point prompts on a source frame and get a live SAM 3.1 mask preview; add objects with a label and deformability.
-- **Geometry-Assisted Propagation**: LaMAR poses and per-state mesh depth seed each object across every frame of the camera walk, then SAM 3.1 produces a per-frame mask.
-- **Video Refinement (optional)**: Sharpen the per-frame masks with the SAM 3.1 video tracker over each visible span.
-- **Review & Refine**: Scrub the full walk to catch missed frames, then re-click, brush, erase, or delete masks before exporting.
+Two things look at the scene, and they are good at opposite jobs:
 
-### Demo
-https://github.com/user-attachments/assets/1779894f-f843-4e9b-a651-3fcb0ae43166
+- **The lidar scans** know *geometry*. Comparing them tells you, in 3D, where the world
+  physically differs — regardless of lighting, shadows, or how dark the room was. But
+  lidar is blobby: it cannot draw a crisp outline on a photo, and it can't see a poster
+  swapped for another poster (same shape, different content).
+- **The video frames** know *appearance*. SAM (Segment Anything) draws beautiful pixel
+  boundaries — but it has no idea what "changed" means, and it fails where contrast dies
+  (a black chair in a shadow).
 
-*Watch the video above to see the annotation tool in action.*
+So the tool always uses them in the same order: **geometry says where to look, the image
+draws the outline, and a human vouches for the result.** Everything else in this README is
+a consequence of that sentence.
 
-## Installation
+### The four colours
 
-The annotator runs inside a **single** Python 3.10 environment that carries the
-whole pipeline — SAM 3.1, the Flask GUI, **and** the LaMAR geometry stack
-(`scantools` / `raybender` / `pycolmap` / `open3d`) used by the propagation
-(`seeds`) step. `setup.sh` builds it from scratch; by default it lives at
-`~/annotator_env`. (Earlier versions split this across a `sam3_env` on 3.12 and a
-separate `lamar_env` on 3.10 — that is no longer needed.)
+Turn on the scene view (press **`u`**) and every frame is painted with the current state
+of knowledge:
 
-The only codebase dependency kept *outside* the env is lamaria-indoor's
-`scantools`, which is pure-python and used via `PYTHONPATH` (no install). Clone
-it once and point `LAMARIA_INDOOR` at it.
-
-### Prerequisites
-- **Python 3.10** (the common denominator: SAM 3.1 supports 3.8–3.12, but the geometry stack is built for 3.10 here)
-- A CUDA-capable GPU with CUDA 12.8 (required — SAM 3.1 loads itself on CUDA)
-- A HuggingFace account with access to [`facebook/sam3.1`](https://huggingface.co/facebook/sam3.1)
-- Local checkouts of the source-built dependencies (the install script expects these paths, override via env vars):
-  - SAM 3.1 — `~/repos/refs/sam3` (`SAM3_SRC`)
-  - `raybender` (custom C++ raycaster, bundles embree) — `~/repos/geom/raybender` (`RAYBENDER_SRC`)
-  - `lamaria-indoor` (provides `scantools`) — `~/repos/lamaria-indoor` (`LAMARIA_INDOOR`)
-  - `colmap` source — `~/repos/refs/colmap` (`COLMAP_SRC`) — only needed if the prebuilt `pycolmap` wheel is unavailable
-
-### Setup Instructions
-
-1. **Clone this repository**:
-   ```bash
-   git clone https://github.com/yuqunw/scenediff_annotator
-   cd scenediff_annotator
-   ```
-
-2. **Clone the source dependencies** (skip any you already have):
-   ```bash
-   git clone git@github.com:facebookresearch/sam3.git ~/repos/refs/sam3
-   git clone <lamaria-indoor-url>                      ~/repos/lamaria-indoor
-   git clone <raybender-url>                           ~/repos/geom/raybender
-   ```
-
-3. **Build the single environment**:
-   ```bash
-   bash setup.sh
-   ```
-   This creates `~/annotator_env` (Python 3.10), installs torch 2.10/cu128,
-   SAM 3.1 (editable, with the `notebooks` extras), the geometry stack
-   (`open3d`, `pycolmap`, `plyfile`, `rawpy`, `scipy`, `raybender`), and Flask,
-   then validates that every stage's imports resolve in the one interpreter.
-   Override locations with env vars, e.g. `ENV_DIR=~/foo SAM3_SRC=... bash setup.sh`.
-
-4. **Authenticate with HuggingFace** and accept the model access request for `facebook/sam3.1`:
-   ```bash
-   hf auth login   # or: huggingface-cli login
-   ```
-   The SAM 3.1 checkpoint is downloaded automatically on first run of `gui.py`.
-
-5. **Verify the install** (also done automatically at the end of `setup.sh`):
-   ```bash
-   PYTHONPATH=~/repos/lamaria-indoor ~/annotator_env/bin/python -c \
-     "import torch, flask, scantools.proc.rendering; from sam3 import build_sam3_image_model; print('cuda:', torch.cuda.is_available())"
-   ```
-   This should print `cuda: True` with no import errors.
-
-For detailed SAM 3.1 installation instructions (including optional Flash
-Attention 3 support), refer to the [official SAM 3 repository](https://github.com/facebookresearch/sam3).
-
-## Usage
-
-### Starting the Application
-
-The GUI runs against a single capture directory holding a `pre` and a `post` session of the same scene (by default the Aria RGB sessions `aria_a_rgb` / `aria_b_rgb`). Launch it with the one env, putting `scantools` (lamaria-indoor) on `PYTHONPATH` so the `Propagate` step can run:
-
-```bash
-PYTHONPATH=~/repos/lamaria-indoor ~/annotator_env/bin/python gui.py \
-    --capture /path/to/captures/changes/cnb_e100
-```
-
-Then open `http://127.0.0.1:5000` in your browser. Useful flags:
-
-- `--pre-session` / `--post-session` — session folder names (default `aria_a_rgb` / `aria_b_rgb`)
-- `--pre-ref` / `--post-ref` — reference reconstruction per state (default `navvis_a` / `navvis_b`)
-- `--n` — frames to seed per object (`0` = every frame, the default; `N>0` evenly subsamples N for a quick coarse pass)
-- `--host` / `--port` — bind address (default `127.0.0.1:5000`)
-
-The geometry-seeding step shells out to a separate environment that has the LaMAR / `scantools` stack; point to it with the `LAMAR_PY` and `LAMAR_PYTHONPATH` environment variables (default `~/lamar_env/bin/python` and `~/repos/lamaria-indoor`).
-
-### Annotation Workflow
-
-1. **Segment an object**: Choose the `pre` or `post` state, scrub to a frame, and click positive (and optional negative) points. SAM 3.1 returns a live mask preview; brush or erase to clean it up.
-
-2. **Add the object**: Give it an id, label, and deformability (`rigid` / `deformable`). The same id used in both `pre` and `post` marks a *moved* object; an id in only one state is *added* or *removed* — the change type is derived from presence, not set by hand.
-
-3. **Propagate**: Click `Propagate`. Geometry seeds (LaMAR poses + per-state mesh depth) carry the object across every frame of that state's camera walk, and SAM 3.1 produces a per-frame mask. A contact-sheet preview is generated for review.
-
-4. **Refine (optional)**: Run `Refine` to sharpen the per-frame masks with the SAM 3.1 video tracker over each visible span.
-
-5. **Review & edit**: Scrub the whole walk to spot frames the propagation missed. Re-click, brush/erase, or delete the mask on any frame.
-
-6. **Export**: Click `Export` to write `changes/segments.json` (see [Output Format](#output-format)).
-
-## End-to-End: a Fresh Sequence to Symmetric GT
-
-The recipe for a capture that has **no masks at all yet** — neither per-sequence
-object masks nor ghost masks on the inference frames. Only step 2 involves a
-human; everything after is generated from those masks plus the scan geometry.
-
-### 0. What the capture must already contain
-
-```
-<capture>/                                  e.g. /media/lamaria_indoor/captures/changes/<scene>
-├── sessions/
-│   ├── aria_a_rgb/                         "pre" walk
-│   │   ├── raw_data/images/cam0/*.jpg      the frames
-│   │   └── proc/navvis_a/colmap_model_aligned/   aligned poses
-│   ├── aria_b_rgb/                         "post" walk (same layout, ref navvis_b)
-│   ├── navvis_a/
-│   │   ├── raw_data/pointcloud.ply         RAW lidar scan (keeps the changed objects!)
-│   │   └── proc/.../mesh                   NavVis mesh (occlusion testing)
-│   └── navvis_b/                           same layout
-└── changes/navvis_b_to_navvis_a/T_navvis_a_from_navvis_b.txt   rigid NavVis↔NavVis bridge
-```
-
-Different session/ref names? Every command below accepts
-`--pre-session/--pre-ref/--post-session/--post-ref` (defaults shown above).
-
-### 1. Environments
-
-| env | used by | contents |
+| Colour | Meaning | What you do |
 |---|---|---|
-| `~/annotator_env` | `gui.py` (steps 2 and 5) | SAM 3.1 + Flask + geometry stack (`setup.sh`) |
-| `~/lamar_env` | `point_ghost_prototype.py`, `change_mask.py --symmetric` | scantools/raybender/open3d, no GPU needed |
+| 🟩 **Green** | Geometry certifies **no change** here — the two scans match within ~3 cm (and the floor, which is static by definition), plus anything a human dismissed | Nothing. Skip it. |
+| 🟥 **Red** | An object mask exists here — someone or something claims this changed | Review it, fix it, or dismiss it |
+| 🟪 **Purple** | Geometry says **something changed** and *nobody has claimed it yet* | Resolve it: annotate it, or decide it's noise |
+| ⬜ **Uncoloured** | No lidar evidence either way — glass, unscanned surfaces, your own hands | Nothing. This is the "ignore" class. |
 
-Both need lamaria-indoor's `scantools` on `PYTHONPATH` (shown inline below).
+Green and purple are **born together**: one measurement (how far each scan point is from
+the other scan) split at a threshold. Red is *added on top* — first by the machine
+(rough masks from detection), then upgraded by you.
 
-### 2. Annotate the per-sequence masks (manual, the only annotation step)
+A frame is done when no purple is left unexplained. A scene is done when the purple-blob
+list is empty.
 
-```bash
-PYTHONPATH=~/repos/lamaria-indoor ~/annotator_env/bin/python gui.py \
-    --capture /media/lamaria_indoor/captures/changes/<scene>
-```
+### Who vouches for what
 
-For every changed object, **in each state where it is physically visible**
-(a moved chair gets `chair` in *pre* AND `chair` in *post*; an added bottle only
-in *post*): click → add object → `+ seed` from 1-3 spread-out views →
-`Propagate` → review/edit (brush, erase, `d` to drop a bad frame) → next object.
-Finish with `Export`. This writes the verified per-object masks
-(`changes/geom_sam_out/<id>__<state>/masks_index.json`), `segments.json`, and
-the native `change_mask/` GT. Do NOT annotate where an object is absent — the
-ghost there is generated in step 3.
+Not all red is equal, and the tool tracks this per mask (`src` in `masks_index.json`):
 
-### 3. Generate the symmetric GT (automatic ghosts on the inference frames)
+| Tier | Where it came from | Trust |
+|---|---|---|
+| `hand` | You drew or fixed it | Ground truth. Never overwritten by anything. |
+| `prop` | Propagated from your hand masks by the video tracker, or rebuilt from 3D consensus | High — measured ~0.97 IoU against hand masks |
+| `concept` | `label → remask` (SAM segmenting by the word you typed) | Good on sharp frames, spills on motion blur |
+| `geom` | Auto-generated when an object was detected (lidar box → SAM) | Starting point only. Freely regenerated. |
 
-```bash
-CAP=/media/lamaria_indoor/captures/changes/<scene>
-# per-object 3D meshes from the RAW lidar cloud + the step-2 masks (~minutes/object)
-PYTHONPATH=~/repos/lamaria-indoor:. ~/lamar_env/bin/python point_ghost_prototype.py objects   --capture $CAP
-# render each mesh into the OTHER state's frames, occlusion-tested -> the symmetric GT
-PYTHONPATH=~/repos/lamaria-indoor:. ~/lamar_env/bin/python point_ghost_prototype.py symmetric --capture $CAP --viz
-```
+Plus one line you control: **the green frontier**. Press **`g`** on a frame and everything
+up to it is marked "a human has checked this" — no automatic process may ever write there
+again, whatever its tier.
 
-Output: `changes/change_mask_symmetric_points/<state>/*.png` (+ `_index.json`,
-`<state>_viz/` panels with native = green, ghost = red). Sanity-check the
-`objects` stage per object in `changes/point_ghost/<id>__<state>/`
-(`mesh.ply`, `points.ply`, `stats.json`) — a degenerate object (too few lidar
-points) is logged and simply has no ghost.
+---
 
-### 4. (Optional) benchmark against the voted-faces baseline
+## 2. Install
 
-```bash
-PYTHONPATH=~/repos/lamaria-indoor ~/lamar_env/bin/python change_mask.py --capture $CAP --symmetric --viz
-PYTHONPATH=~/repos/lamaria-indoor:. ~/lamar_env/bin/python point_ghost_prototype.py compare --capture $CAP
-```
+Everything runs in **one** Python 3.10 environment (`~/annotator_env`): SAM 3.1, the Flask
+GUI, and the LaMAR geometry stack (`scantools` / `raybender` / `pycolmap` / `open3d`).
 
-Writes `[RGB | old | new]` panels + a source-frame IoU table under
-`changes/point_ghost_compare/`.
-
-### 5. (Optional) hand-correct the generated ghosts in the GUI
+**You need:** Python 3.10, a CUDA 12.8 GPU, a HuggingFace account with access to
+[`facebook/sam3.1`](https://huggingface.co/facebook/sam3.1), and local checkouts of
+SAM 3.1 (`~/repos/refs/sam3`), `raybender` (`~/repos/geom/raybender`), and
+`lamaria-indoor` (`~/repos/lamaria-indoor`, provides `scantools` — used via `PYTHONPATH`,
+never installed).
 
 ```bash
-# each object's ghost as a GUI-editable 👻 pseudo-object (<id>_ghost__<state>)
-PYTHONPATH=~/repos/lamaria-indoor:. ~/lamar_env/bin/python point_ghost_prototype.py ghosts --capture $CAP
-# restart gui.py (step 2 command) -> 👻 objects appear in the sidebar:
-#   review/edit -> brush/erase the ghost region (SAM clicks can't help: nothing
-#   visible to segment where an object *used to be*), `d` drops a frame
-# then rebuild the symmetric GT from the corrected masks:
-PYTHONPATH=~/repos/lamaria-indoor:. ~/lamar_env/bin/python point_ghost_prototype.py merge --capture $CAP --viz
+bash setup.sh          # builds ~/annotator_env and validates every import
+hf auth login          # accept model access; the checkpoint downloads on first run
 ```
 
-Ghost pseudo-objects are derived data: they never enter `segments.json` or the
-native `change_mask/`, and `propagate`/`+ seed` are disabled for them. Re-running
-`ghosts` regenerates them (overwriting hand edits — correct AFTER the geometry
-is final).
-
-## Output Format
-
-All outputs are written into the capture directory under `changes/`:
-
-- **`changes/geom_sam_out/<id>__<state>/`** — per-object working data: the source mask (`src_mask.png`), geometry seeds (`seeds.json`), per-frame masks (`masks/`), and an index (`masks_index.json`).
-- **`changes/gui_objects.json`** — the object sources you added; reloaded on the next launch so you can resume.
-- **`changes/segments.json`** — the final export.
-- **`changes/change_mask/<state>/<frame>.png`** — per-frame binary change mask (255 = changed), the **union of all object masks** on that frame. This is the per-pixel ground truth a method is scored against (`annotation_spec.md` §6/§7), the metric MV3DCD / SceneDiff report. Produced automatically on `Export`, indexed in `changes/change_mask_index.json`, and referenced from `segments.json` under a top-level `change_mask: {state: {frame: relpath}}` block.
-
-- **`changes/change_mask_symmetric/<state>/<frame>.png`** — the **MV3DCD-suited symmetric** change mask (`--symmetric`). Each frame carries changes from **both** directions: the native object masks **plus** the cross-projected footprint of the other state's changes (where an object *was* / *will be*). This matches what a multi-view 3D detector outputs — every changed region, both directions, in every image. The cross-projection is mesh-anchored and multi-view-consistent: each object's verified masks are **voted onto the NavVis mesh faces**, carried across the rigid NavVis→NavVis bridge, and the labeled sub-mesh is **rendered** into the other sequence with the target mesh providing occlusion (no per-frame 2D warp, no SAM). Indexed in `change_mask_symmetric_index.json`. Native per-sequence masks stay the authoritative human-verified GT; this is a derived view.
-
-To (re)generate change masks for a capture without re-running the GUI:
+Verify:
 
 ```bash
-# native (pure cv2, any env)
-~/lamar_env/bin/python change_mask.py --capture /path/to/captures/changes/cnb_e100
-
-# + symmetric MV3DCD GT (needs lamar_env: scantools/raybender/open3d)
-PYTHONPATH=~/repos/lamaria-indoor ~/lamar_env/bin/python change_mask.py \
-    --capture /path/to/captures/changes/cnb_e100 --symmetric --render-scale 1.0
+PYTHONPATH=~/repos/lamaria-indoor ~/annotator_env/bin/python -c \
+  "import torch, flask, scantools.proc.rendering; from sam3 import build_sam3_image_model; print('cuda:', torch.cuda.is_available())"
 ```
 
-Useful `--symmetric` knobs: `--ratio` (min inside/seen vote per face, raise to reject stray faces), `--min-views` (min source views to keep a face), `--vote-scale` / `--render-scale` (speed vs. crispness), `--occ-tol` (target-mesh occlusion tolerance, metres).
+---
 
-The NavVis meshing step drops most changed objects, so the voted-face footprint can come out holey or empty. Two prototypes rebuild the missing geometry: `lidar_tsdf_prototype.py` (DA3 mono depth anchored to the raw lidar, TSDF-fused per state, output in `change_mask_symmetric_tsdf/`) and `point_ghost_prototype.py` (no mono depth: per object, the verified masks select the object's own points from the **raw lidar cloud** — z-buffered multi-view point voting — which are alpha-shape meshed, mask-exterior trimmed, and rendered as the ghost; output in `change_mask_symmetric_points/`). `point_ghost_prototype.py compare` writes `[RGB | old | new]` panels and a source-frame IoU table under `changes/point_ghost_compare/` to judge the variants against each other.
+## 3. Launching
 
-The generated ghosts can be **hand-corrected in the GUI**: `point_ghost_prototype.py ghosts` renders each object's ghost separately into the other state's frames and registers it as a 👻 pseudo-object (`<id>_ghost__<state>` in `geom_sam_out/`, flagged `ghost` in `gui_objects.json`). Restart `gui.py` and the ghosts appear in the sidebar — review/edit them with the brush/eraser (SAM clicks won't help: there is nothing visible to segment where an object *used to be*), delete bad frames, then run `point_ghost_prototype.py merge --viz` to rebuild `change_mask_symmetric_points/` from the corrected masks. Ghost pseudo-objects never enter `segments.json` or the native `change_mask/` export.
+```bash
+cd ~/repos/change_annotator-sangwoo
+GEOM_OUT=changes/geom_sam_out_1_2_sangwoo PYTHONPATH=~/repos/lamaria-indoor \
+  ~/annotator_env/bin/python gui.py \
+  --capture /media/lamaria_indoor/captures/changes/<scene> \
+  --pre-session <walk>_rgb  --pre-ref navvis_1 \
+  --post-session <walk>_rgb --post-ref navvis_2 \
+  [--port 5001]
+```
 
-### `segments.json` Structure
+Then open `http://127.0.0.1:5000`.
+
+**`GEOM_OUT` is the workspace** — the folder holding everything you produce. Give each
+state-pair (and each annotator) its own: `geom_sam_out_1_2_sangwoo`, `geom_sam_out_2_3_...`.
+Workspaces are independent and disposable; the raw capture is never touched.
+
+**Naming varies by scene.** Check what exists first:
+
+```bash
+ls /media/lamaria_indoor/captures/changes/<scene>/sessions/
+```
+
+Some scenes number the scans differently from the walks (climate_day's states 1 and 2 use
+`navvis_2` and `navvis_3`), and some have several walk repetitions per state
+(`climate_day_1_1_rgb`, `_1_2_rgb`, …) — each walk pair deserves its own workspace.
+
+If port 5000 is taken by a stale server: `ss -tlnp | grep 5000`, then `kill <pid>`.
+
+---
+
+## 4. Two ways to work
+
+### A. Object-first — for ordinary room-scale scenes
+
+Best when a handful of discrete things changed (a room, an office, a lab).
+
+1. **🔍 detect changes** — diffs the two scans, keeps what the walk actually looked at, and
+   drops each survivor in as an object with rough masks.
+2. **Triage** — for each proposal: real change → keep; junk (glass noise, a wall sliver) →
+   **dismiss ⇢ green**.
+3. **Annotate** — open an object, fix its mask on a good frame (`x` to edit, tools below,
+   `z` to save), then **propagate this fix** to carry it across the walk. Press **`g`** as
+   you verify to advance the frontier.
+4. **Link moved objects** — give a `pre` object and a `post` object the *same id* and they
+   become one physical object that moved. Presence decides the change type: pre only =
+   removed, post only = added, both = moved. You never set it by hand.
+5. **Export** — writes `segments.json` and the per-frame change masks.
+
+### B. Scene-first — for mass-change scenes (trade fairs, event halls)
+
+When *most* of the scene was reconfigured, per-object triage stops being an aid and becomes
+a burden. Here the object is just a tool for making masks — the deliverable is the pixels.
+
+1. **🔍 detect changes** at a coarse preset (see §7).
+2. **Sieve** — dismiss the proposals you don't care about; press **🟣 find unresolved
+   blobs** and resolve each leftover (promote to an object / merge into an existing one /
+   dismiss to green).
+3. **🧱 rebuild all from 3D** — every object's masks are re-derived from multi-view
+   consensus and re-rendered consistently across all frames (see §6).
+4. **Spot-fix** what consensus can't: draw the correction on one frame and press
+   **propagate in 3D** — it applies to every frame at once.
+5. Work with the scene view on (`u`), driving purple to zero.
+
+**Multi-SAM** is useful here: click ten separate things, they all land in one mask, save as
+one "blob" object. Identity is optional when nobody can meaningfully name 200 shuffled chairs.
+
+---
+
+## 5. The tools
+
+Everything below is display-and-canvas work — nothing is written to disk until you press
+save (`z`), or apply a preview.
+
+### Drawing (edit mode: press `x`, or `z` from browsing)
+
+| Tool | What it does |
+|---|---|
+| **point (SAM)** | Click = positive, shift-click = negative. Live mask preview. |
+| **multi-SAM** | Every click segments *independently* and adds to the mask — stamp many separate things into one object without them bleeding together. Shift-click removes one. |
+| **brush** | Paint freehand. When a stroke closes off an area, the enclosed region fills automatically. |
+| **erase** | Paint to remove. |
+| **smart brush** | Rough scribble to include (shift = exclude); SAM refines to the object edge on release. |
+| **line** / **line fill** | Click start, click end — a straight stroke at brush width, chained. `line fill` also fills a loop when you close one. Good for thin legs and cables. |
+| **erase line** / **erase fill** | Same, but removing. `erase fill` deletes an island the moment your cut separates it — carve off a wrongly-included neighbour and it vanishes. |
+| **geom brush** | Paint over a wrong region and only there the mask is replaced by the lidar geometry's answer. |
+| **propagate in 3D** | Lifts your current mask onto the 3D point cloud → applies to *every* frame and walk (§6). |
+
+### Keys
+
+| Key | Action |
+|---|---|
+| `←` `→` | Scrub frames |
+| `x` | Enter edit mode |
+| `z` | Enter edit / save mask |
+| `d` | Delete this frame's mask |
+| `g` | **Good up to here** — advance the verified frontier |
+| `q` (hold) | Peek the clean original frame (all overlays off) |
+| `u` | Cycle the scene view (off → red → +green → +purple) |
+| `i` | Cycle display filters (normal → shadow lift → invert) — helps in dark scenes |
+| `e` | Toggle mesh depth edges — geometry outlines that survive any lighting |
+| `v` | Veto the current frame in a preview |
+| `m` | Confirm an armed action |
+| `ctrl+z` / `ctrl+y` | Undo (both keys, for QWERTZ) |
+| `Esc` / `Enter` | Finish a line, or cancel an armed action |
+
+---
+
+## 6. How masks spread across frames
+
+Four mechanisms, from most human to most automatic.
+
+**Propagate this fix** — you fixed a frame; this carries it forward with the SAM video
+tracker. It fills gaps *between* your hand masks, continues into frames that never had a
+mask, tolerates a few blurry frames before giving up, bridges stretches where the object
+is off-screen, and re-acquires the object at a later visit when the geometry confirms it.
+It never writes behind your frontier or over a hand mask. Everything arrives as a preview
+you scrub and veto before applying.
+
+**Propagate (re-seed)** — for detected objects: unions the object's lidar cluster with all
+your hand masks into completed 3D geometry, re-projects it, and regenerates masks. Only
+`geom`-tier and empty frames are touched.
+
+**Rebuild from 3D** — the consensus mechanism. Every existing mask *votes* for the 3D
+points it covers (hand masks count triple). A point is kept when ≥60% of the frames that
+could see it also masked it. Then the surviving points are rendered back into every frame.
+This fixes three problems at once:
+
+- **jitter** — masks stop wobbling frame to frame, because they all render one 3D thing;
+- **misses** — a part most frames dropped survives on the votes of the few that caught it,
+  and reappears everywhere;
+- **inconsistent overflow** — a spill that only one viewpoint made falls below the vote
+  ratio and disappears from every frame.
+
+It cannot fix *systematic* overflow (a neighbour swallowed from every angle) — that's the
+next tool's job.
+
+**Propagate in 3D** — edit once, apply everywhere. Draw the correction on the frame in
+front of you and press the button: your stroke is lifted onto the point cloud (the points
+it images, line-of-sight tested), grown a little in 3D to cover parts this view can't see,
+shown to you in orange, and committed with **`m`**. From then on it renders into every
+frame of that state. This is how you fix a poster change the geometry can't see, or carve
+off a neighbour the consensus keeps. Human 3D labels are stored separately and **a rebuild
+never erases them**.
+
+---
+
+## 7. Detection settings
+
+The **🔍 detect changes (cloud diff + texture diff)** button runs three things: the
+geometric scan diff (proposals named `cd_*`), the change fields that power the scene view,
+and a DINOv3 appearance check on geometrically-static surfaces (proposals named `tex_*`)
+for content changes like swapped posters.
+
+| Setting | What it means | Room scene | Mass scene |
+|---|---|---|---|
+| `voxel` | Cloud downsampling (m) — smaller sees smaller things, slower | 0.015 | 0.02 |
+| `tau` | How far apart two scans must be to call it a change (m) | 0.10 | 0.10 |
+| `tau-lo` | The "same" threshold — below this, geometry certifies *unchanged* (green). Empty = tau/3 ≈ 3.3 cm | empty | empty |
+| `min-cluster` | Smallest proposal, in points | 150 | 300 |
+| `eps` | Cluster linkage (m) — lower splits touching objects apart | 0.10 | 0.08 |
+| `min-frames` | How many frames the walk must have seen it in | 5 | 8 |
+| remove floor | Floor is static by definition | ✓ | ✓ |
+| strict occlusion | Only log changes the glasses actually saw | ✓ | ✓ |
+
+**A hard-won lesson:** if a change seems "missed", check the size gate before blaming the
+diff. A tray on a table was once dropped simply because it produced ~450 points against a
+`min-cluster` of 500 — the diff had seen it perfectly.
+
+**Detect once per workspace.** Re-running it on a workspace you've already annotated can
+collide with existing object ids. To start over, use **☢ nuke workspace** (below) or launch
+with a new `GEOM_OUT`.
+
+---
+
+## 8. Deciding what *didn't* change
+
+Two buttons, easy to confuse, opposite meanings:
+
+- **delete** — "this object entry was wrong." The masks go to `.trash`, and the region
+  **returns to purple**: the question is re-opened and the blob finder will ask again.
+- **dismiss ⇢ green** — "this change claim was wrong." The masks go to `.trash` *and* the
+  object's geometry is recorded as human-certified no-change: the region turns **green**
+  and stops being asked about. Requires typing `g` to confirm, because it applies to the
+  whole sequence.
+
+When in doubt, **delete** — the system will re-ask.
+
+---
+
+## 9. Your work is safe
+
+- **The raw capture is never modified.** Everything under `sessions/` — the point clouds,
+  the meshes, the images — is opened read-only. Every write goes into your `changes/<workspace>/`
+  folder. Even the clouds that carry 3D labels are *derived copies* inside the workspace.
+- **Snapshots** are taken automatically before anything destructive (detect, re-seed,
+  texture check, batch rebuild): hardlink copies under `<workspace>/snapshots/`, last 10 kept.
+  Restore with `rsync -a <snapshot>/ <workspace>/`.
+- **Deletions are moves**, not deletions: `.trash/` for objects, `masks/.deleted/` and
+  `masks/.bak_*/` for masks.
+- **☢ nuke workspace** starts a workspace over: everything is renamed to
+  `<workspace>.nuked_<timestamp>` next to it — recoverable with a `mv`. Requires typing
+  `proceed`.
+- **Hand masks and the frontier** are respected by every automatic writer, including
+  mid-job: a job that runs for minutes re-checks them right before each write, so a mask
+  you save while it runs is never clobbered.
+
+---
+
+## 10. Output
+
+Written under `<capture>/changes/`:
+
+| Path | What |
+|---|---|
+| `segments.json` | The export: objects, labels, change types, per-frame mask paths |
+| `change_mask/<state>/*.png` | Per-frame binary change mask (union of all object masks) — the pixel-level GT |
+| `<workspace>/<id>__<state>/masks/` | Per-object per-frame mask PNGs |
+| `<workspace>/<id>__<state>/masks_index.json` | Which frames have masks, their tier (`src`) and pixel counts |
+| `<workspace>/gui_objects.json` | Object list, labels, done/reviewed flags, frontiers |
+| `<workspace>/fields/` | The green/purple point fields, dismissals, and 3D labels |
+
+`segments.json` in short:
 
 ```json
 {
-  "scene": "cnb_e100",
-  "tier": "instance",
-  "camera": "cam0",
-  "pre":  {"session": "aria_a_rgb", "ref": "navvis_a"},
-  "post": {"session": "aria_b_rgb", "ref": "navvis_b"},
+  "scene": "climate_day", "tier": "instance", "camera": "cam0",
+  "pre":  {"session": "climate_day_1_1_rgb", "ref": "navvis_2"},
+  "post": {"session": "climate_day_2_1_rgb", "ref": "navvis_3"},
   "objects": {
-    "<object_id>": {
-      "label": "chair",
-      "deformability": "rigid",
-      "in_pre": true,
-      "in_post": false,
-      "change_type": "removed",
-      "masks": {
-        "pre": {"images/cam0/<frame>.jpg": "geom_sam_out/<id>__pre/masks/images_cam0_<frame>.jpg"}
-      }
+    "chair_01": {
+      "label": "chair", "deformability": "rigid",
+      "in_pre": true, "in_post": false, "change_type": "removed",
+      "masks": {"pre": {"images/cam0/123.jpg": "geom_sam_out_.../masks/images_cam0_123.jpg"}}
     }
   }
 }
 ```
 
-`change_type` is derived from presence: `pre` only → `removed`, `post` only → `added`, both states → `moved`. Only the states an object appears in show up under `masks`. Each mask path is relative to the capture's `changes/` directory (i.e. resolve as `<capture>/changes/<path>`) and points to a binary PNG (white = object).
+Mask paths are relative to `<capture>/changes/`. Masks are plain PNGs — `cv2.imread(path, 0) > 127`.
 
-### Loading Masks
+Note: working state (`done`, `reviewed`, the frontier) deliberately stays out of the
+export; it is annotation bookkeeping, not ground truth.
 
-The masks are plain PNGs, so decode with any image library:
+---
 
-```python
-import cv2
-mask = cv2.imread("changes/geom_sam_out/chair__pre/masks/images_cam0_0001.jpg", 0) > 127
-```
+## 11. What this tool is good at — and where it struggles
 
-<!-- ## Citation
+**Designed for:** a room-scale scene where 5–30 discrete, rigid, opaque objects changed
+between two well-registered scans, filmed by a walk that revisits them in decent light.
 
-If you use this annotation tool in your research, please cite the SceneDiff project:
+**Degrades gracefully:** many small objects (use the fine preset), long multi-visit walks,
+objects that grow hugely as you approach, scenes needing heavy hand annotation.
 
-```bibtex
-@misc{scenediff2024,
-  title={SceneDiff: Scene Change Detection and Analysis},
-  author={Your Name},
-  year={2024},
-  howpublished={\url{https://yuqunw.github.io/SceneDiff}}
-}
-``` -->
+**Genuinely hard:**
+
+- **Mass reconfiguration** (event halls) — hundreds of proposals; use workflow B.
+- **Glass** — lidar barely sees it, so it produces both false proposals and uncoloured gaps.
+- **Two changed objects touching** — the diff fuses them into one proposal; separate them
+  by hand (erase fill + propagate in 3D).
+- **Changes thinner than ~3 cm** — a swapped plate of the same shape is below any safe
+  threshold. Appearance changes of that kind need the texture check or a manual 3D label.
+- **Deformables** (curtains, bags) — geometry-based helpers stand down; annotate by hand.
+- **Boundaries in deep shadow or motion blur** — the `i` and `e` display aids help you see;
+  the masks still need care.
+
+---
+
+## 12. File map
+
+| File | Role |
+|---|---|
+| `gui.py` | The web GUI and every endpoint — the thing you run |
+| `geom_sam_prototype.py` | Core geometry↔SAM pipeline: source masks, seeds, per-frame masks |
+| `cloud_diff_prototype.py` | Scan-to-scan change detection, hysteresis, the change fields |
+| `appearance_check.py` | DINOv3 texture/appearance change detection on static surfaces |
+| `point_labels.py` | The 3D point-label store (auto vs human tiers, region growing) |
+| `propagate_fix.py` | The video-tracker propagation between human anchors |
+| `change_mask.py` | Per-frame change-mask GT generation |
+| `point_ghost_prototype.py` | Symmetric GT: renders an object's footprint into the *other* sequence |
+| `annotate.py` | Headless config-driven runner (no GUI) |
+| `templates/gui.html` | The entire front end |
+
+---
 
 ## Acknowledgements
 
-This project is built upon the excellent [SAM 3 repository](https://github.com/facebookresearch/sam3) (Segment Anything Model 3). We gratefully acknowledge their contributions to the computer vision community.
+Built on [SAM 3](https://github.com/facebookresearch/sam3) and the LaMAR geometry stack.
 
 ## License
 
-See [LICENSE](LICENSE) for more information.
+See [LICENSE](LICENSE).
