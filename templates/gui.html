@@ -68,6 +68,9 @@
 </head>
 <body>
 <div id="left">
+  {% if depth %}<div style="background:#7a1fa2;color:#fff;padding:6px 10px;border-radius:6px;
+    font-weight:700;letter-spacing:.5px;margin-bottom:6px">🩻 DEPTH MODE — depth masks →
+    changes/depth/ (NOT change GT)</div>{% endif %}
   <h2>{{ scene }} · rgb</h2>
 
   <!-- annotate toolbar -->
@@ -148,6 +151,7 @@
   </div>
   <div class="row"><button onclick="addObject()" title="shortcut: a">add object (a)</button></div>
   <hr>
+  {% if not depth %}
   <div class="row">
     <button onclick="cloudDiff()" id="cdBtn"
       title="ONE pass: geometric cloud diff (cd_* proposals) + change fields + DINOv3 texture diff on static surfaces (tex_* proposals) — everything arrives as reviewable objects">🔍 detect changes (cloud diff + texture diff)</button>
@@ -179,6 +183,7 @@
     &nbsp;<label title="Strict depth-based occlusion: only log a change where Aria had clear line of sight. Drops changes hidden behind walls/geometry that the glasses never actually saw."><input type="checkbox" id="cdStrictOcc" checked> strict occlusion</label>
   </div>
   <div class="hint"><span class="tip" title="PRESETS&#10;  330 ml can:  voxel 0.01, min-cluster 40&#10;  bag / box:   voxel 0.015, min-cluster 150&#10;  furniture:   voxel 0.02, min-cluster 500&#10;&#10;Smaller voxel + min-cluster → smaller objects, but more noise to triage.&#10;&#10;⚠ Translucent items (Nalgene bottles, glass) are barely seen by lidar and may not appear at all — annotate those manually.&#10;&#10;Per-cluster proposals: give a moved object's pre & post the same id to link them.">ⓘ presets &amp; tips</span></div>
+  {% endif %}
   <hr>
   <h2>objects</h2>
   <div class="row" id="groupBar" style="display:none">
@@ -187,13 +192,15 @@
   </div>
   <div id="objects"></div>
   <hr>
+  {% if not depth %}
   <h2>purple blobs <span class="hint" style="margin:0">— unclaimed change; each must be promoted, merged, or dismissed</span></h2>
   <div class="row"><button onclick="computeBlobs()" title="cluster the unclaimed changed-field points (minus objects' clusters and dismissals) into resolvable blobs">🟣 find unresolved blobs</button>
     <button onclick="rebuildAll3d()" title="after sieving the junk: rebuild EVERY object's masks from its 3D consensus label, applied to geom/empty frames only">🧱 rebuild all from 3D</button>
     <span class="status" id="blobStatus"></span></div>
   <div id="blobs"></div>
+  {% endif %}
   <hr>
-  <div class="row"><button onclick="exportSegments()">export segments.json</button> <span class="status" id="exportStatus"></span></div>
+  <div class="row"><button onclick="exportSegments()">{% if depth %}export depth masks{% else %}export segments.json{% endif %}</button> <span class="status" id="exportStatus"></span></div>
   <hr>
   <div class="row"><button onclick="nukeWorkspace()" style="background:#b30000;color:#fff;border-color:#7a0000"
     title="start this workspace over: every object, mask, seed, frontier and snapshot is moved aside on disk (recoverable by hand) and the object list goes blank">☢ nuke workspace</button>
@@ -201,6 +208,7 @@
 </div>
 
 <script>
+const DEPTH_MODE = {{ 'true' if depth else 'false' }};
 const seedN = {{ seed_n }}, seedMinVis = {{ seed_min_vis }};
 let mode = 'annotate';     // 'annotate' | 'review'
 let frames = [];           // annotate: ['images/cam0/..jpg', ...]  review: [{name,session,px}, ...]
@@ -1406,7 +1414,7 @@ function objCard(key, o, member){
   const cd = o.source === 'cloud_diff' ? '<span class="pill">cloud-diff</span>' : '';
   const seedProp = (o.ghost || finished) ? '' : `
     <button onclick="addSeed('${key}')" title="add the current frame as another seed view — for cloud-diff objects too: seeds + your hand masks + the diff cluster union into one completed 3D object">+ seed</button>
-    <button onclick="propagate('${key}')" title="re-seed from the completed geometry (cluster + hand masks + seeds) and re-run per-frame SAM on geom/empty frames only — hand, propagated and remasked frames survive">propagate</button>
+    <button onclick="${DEPTH_MODE ? `depthPropagate('${key}')` : `propagate('${key}')`}" title="${DEPTH_MODE ? 'track these blobs forward from the drawn frame (appearance-based — correct for glass; each blob tracked independently) — preview then apply' : 're-seed from the completed geometry (cluster + hand masks + seeds) and re-run per-frame SAM on geom/empty frames only — hand, propagated and remasked frames survive'}">propagate</button>
     <button onclick="rebuild3d('${key}')" title="rebuild from 3D consensus: every existing mask votes at 3D addresses, points ≥60% of the views agree on are re-rendered into EVERY frame — fixes jitter, misses and inconsistent overflow at once (preview → apply)">rebuild 3D</button>`;
   const iid = (o.instance || o.id);
   const remaskBtn = (o.ghost || finished) ? '' : `<button onclick="remask('${key}')"
@@ -1647,6 +1655,26 @@ function highlightReviewing(){
     el.classList.toggle('reviewing', mode==='review' && el.dataset.oid===reviewObj));
 }
 
+async function depthPropagate(key, frame){
+  const cardSt = document.getElementById('st_' + key);
+  if(cardSt) cardSt.textContent = 'tracking windows forward …';
+  const r = await fetch('/api/depth_propagate', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({id: key})});
+  const d = await r.json();
+  if(d.error){ alert(d.error); if(cardSt) cardSt.textContent = ''; return; }
+  propJob = d.job_id;
+  const poll = setInterval(async () => {
+    const j = await (await fetch('/api/job/' + d.job_id)).json();
+    if(cardSt) cardSt.textContent = j.msg || j.status;
+    if(j.status === 'running') return;
+    clearInterval(poll);
+    if(j.status === 'error'){ alert('propagate: ' + j.error); return; }
+    if(!j.n){ if(cardSt) cardSt.textContent = 'nothing to propagate'; return; }
+    if(mode !== 'review' || reviewObj !== key) await openReview(key);
+    enterPending(d.job_id, key, j,
+      `tracked ${j.n} frame(s) — scrub: red=proposed, green=current · v=veto · then apply`);
+  }, 1500);
+}
 async function propagate(id){
   if(!guardDone(id)) return;
   if(!confirm('Are you sure you wish to propagate?\n\nYour manually added masks may be impacted (overwritten in place — there is no undo).')) return;
@@ -1824,7 +1852,9 @@ async function deleteObject(key){
 
 async function exportSegments(){
   const d = await (await fetch('/api/export', {method:'POST'})).json();
-  document.getElementById('exportStatus').textContent = `wrote ${d.n} objects → ${d.path}`;
+  if(d.error){ document.getElementById('exportStatus').textContent = 'export: ' + d.error; return; }
+  document.getElementById('exportStatus').textContent = d.msg
+    || `wrote ${d.n} objects → ${d.path}`;
 }
 
 document.querySelectorAll('input[name=state]').forEach(el => el.addEventListener('change', loadAnnotateFrames));

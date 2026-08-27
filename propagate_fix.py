@@ -38,6 +38,20 @@ _TRACKER = None
 # extra anchors sampled from the human-vouched region at/behind the frontier
 # ("good up to here" teaches the tracker, not just protects). 0 disables.
 BLESSED_EXTRA_CAP = 40
+# a multi-SAM object (many disjoint blobs — e.g. 14 windows) is tracked as ONE
+# SAM3 object today, and all but one blob fades. Instead track each blob as its
+# OWN object in the same session (SAM3 is natively multi-object, so it is one
+# parallel pass, not N runs); the per-frame output is their UNION, so nothing
+# downstream sees parts. Capped so a pathological split can't explode memory.
+MULTIPART_CAP = 96
+
+
+def _split_components(mask, min_area=120):
+    """Connected components of a bool mask, each >= min_area px (else the whole
+    mask as one). cv2 import is local to keep this module's top clean."""
+    n, lab = cv2.connectedComponents(mask.astype(np.uint8))
+    out = [lab == i for i in range(1, n) if int((lab == i).sum()) >= min_area]
+    return out or [mask.astype(bool)]
 
 
 def load_tracker():
@@ -211,9 +225,41 @@ def propagate(capture, obj_dir, anchor_name, iou_floor=0.2, max_span=600,
                if torch.cuda.is_available() else torch.no_grad())
         with torch.inference_mode(), ctx:
             st = tr.init_state(video_path=td, offload_video_to_cpu=len(win) > 120)
-            for al in anchors:
-                tr.add_new_mask(st, frame_idx=al, obj_id=1,
-                                mask=torch.from_numpy(_anchor_mask(al).astype(np.float32)))
+            # Multi-part fires ONLY on several COMPARABLE, separated blobs
+            # (many windows) — NOT on a solid object with a small satellite
+            # (that keeps the strong single-object multi-anchor path). A blob
+            # counts if it is >= 25% of the largest and >= 800 px; >=2 such =
+            # multi-part.
+            click_comps = _split_components(_anchor_mask(click_local))
+            big = max((int(c.sum()) for c in click_comps), default=0)
+            parts = [c for c in click_comps
+                     if int(c.sum()) >= max(800, 0.25 * big)]
+            if len(parts) < 2:
+                for al in anchors:                   # single-object, multi-anchor
+                    tr.add_new_mask(st, frame_idx=al, obj_id=1,
+                                    mask=torch.from_numpy(_anchor_mask(al).astype(np.float32)))
+                n_obj = 1
+            else:
+                # seed EVERY drawn blob from EVERY anchor frame — a window seen
+                # only in another seed frame (e.g. the lower windows) would
+                # otherwise never be tracked. Redundant tracks of the same window
+                # across frames just re-vote into the union (harmless); capped
+                # biggest-first so memory stays bounded.
+                plan = []                            # (area, frame_idx, comp)
+                for al in anchors:
+                    am = _anchor_mask(al)
+                    cc = _split_components(am)
+                    b = max((int(c.sum()) for c in cc), default=0)
+                    for c in cc:
+                        if int(c.sum()) >= max(600, 0.12 * b):
+                            plan.append((int(c.sum()), al, c))
+                plan.sort(reverse=True, key=lambda t: t[0])
+                for oid, (_a, al, c) in enumerate(plan[:MULTIPART_CAP], start=1):
+                    tr.add_new_mask(st, frame_idx=al, obj_id=oid,
+                                    mask=torch.from_numpy(c.astype(np.float32)))
+                n_obj = min(len(plan), MULTIPART_CAP)
+                say(f"multi-part: {len(plan)} blobs across {len(anchors)} anchor "
+                    f"frame(s) -> {n_obj} component tracks (capped {MULTIPART_CAP})")
             passes = ([(False, fwd, click_local)] if mode == "forward" else
                       [(False, fwd, anchors[0]), (True, bwd, anchors[-1])])
             for reverse, store, start in passes:
@@ -225,7 +271,8 @@ def propagate(capture, obj_dir, anchor_name, iou_floor=0.2, max_span=600,
                         propagate_preflight=True, reverse=reverse):
                     if fi in anchor_set or win[fi] in hand:
                         continue
-                    store[fi] = (vrm[0] > 0).squeeze().cpu().numpy().astype(bool)
+                    a = (vrm > 0).cpu().numpy()      # [n_obj, 1, H, W] (or [1,..])
+                    store[fi] = a.reshape(-1, a.shape[-2], a.shape[-1]).any(0)
 
     # merge the two passes: each frame takes the pass whose anchor side is nearer
     def _pick(i):

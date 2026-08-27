@@ -152,7 +152,7 @@ def _add_seed_mask(od, frame, mask, reset=False):
 # ───────────────────────────── pages / static ─────────────────────────────
 @app.route("/")
 def index():
-    return render_template("gui.html", scene=CFG["scene"],
+    return render_template("gui.html", scene=CFG["scene"], depth=CFG.get("depth", False),
                            seed_n=CFG["seed"]["n"], seed_min_vis=CFG["seed"]["min_vis"])
 
 
@@ -222,6 +222,15 @@ def api_add_object():
     od = G.out_dir(CFG["capture"], key)
     cv2.imwrite(str(od / "src_mask.png"), (mask * 255).astype(np.uint8))  # first seed (viz)
     _add_seed_mask(od, frame, mask, reset=True)                          # multi-seed store
+    if CFG.get("depth"):        # depth objects have no liftable geometry (glass) — the
+        (od / "masks").mkdir(exist_ok=True)   # drawn mask IS the anchor; make it a hand
+        flat = frame.replace("/", "_")        # frame so 'propagate this fix' (tracker) runs
+        cv2.imwrite(str(od / "masks" / flat), (mask * 255).astype(np.uint8))
+        mi_path = od / "masks_index.json"
+        mi = json.load(open(mi_path)) if mi_path.exists() else {}
+        mi[frame] = {"session": state and CFG["states"][state]["session"],
+                     "mask_file": f"masks/{flat}", "px": int(mask.sum()), "src": "hand"}
+        json.dump(mi, open(mi_path, "w"), indent=1)
     OBJECTS[key] = {"id": oid, "label": d.get("label") or oid,
                     "deformability": d.get("deformability", "rigid"),
                     "state": state, "frame": frame, "points": points,
@@ -485,6 +494,50 @@ def _remask_job(job_id, oid, label):
 
 
 # ─────────────── propagate this fix (anchored tracker, preview->confirm) ───────────────
+@app.route("/api/depth_propagate", methods=["POST"])
+def api_depth_propagate():
+    """Depth mode: track the drawn window blobs FORWARD with the video tracker
+    (appearance — correct for glass; multi-part, one memory per blob). Never the
+    geometry re-seed (which projects a pierced-glass box and overflows). Any
+    multi-SAM src masks are first materialized as hand anchors."""
+    d = request.get_json()
+    oid = d["id"]
+    if oid not in OBJECTS:
+        return jsonify(error="unknown object"), 404
+    od = G.out_dir(CFG["capture"], oid)
+    sid = CFG["states"][OBJECTS[oid]["state"]]["session"]
+    mi_path = od / "masks_index.json"
+    mi = json.load(open(mi_path)) if mi_path.exists() else {}
+    si = od / "src_index.json"
+    if si.exists():                                   # src (drawn) masks -> hand anchors
+        (od / "masks").mkdir(exist_ok=True)
+        for it in json.load(open(si)):
+            n = it["src_name"]
+            if mi.get(n, {}).get("src") == "hand":
+                continue
+            m = cv2.imread(str(od / it["mask_file"]), 0)
+            if m is None:
+                continue
+            flat = n.replace("/", "_")
+            cv2.imwrite(str(od / "masks" / flat), m)
+            mi[n] = {"session": sid, "mask_file": f"masks/{flat}",
+                     "px": int((m > 127).sum()), "src": "hand"}
+        json.dump(mi, open(mi_path, "w"), indent=1)
+    if not mi:
+        return jsonify(error="draw the windows first (multi-SAM), then propagate"), 400
+    frame = OBJECTS[oid].get("frame")
+    if frame not in mi:
+        frame = sorted(mi, key=lambda n: int(Path(n).stem))[0]
+    for jid in [j for j in list(PROP_PENDING) if (JOBS.get(j) or {}).get("obj") == oid]:
+        PROP_PENDING.pop(jid, None); PROP_FLAGS.pop(jid, None)
+    job_id = uuid.uuid4().hex[:8]
+    JOBS[job_id] = {"status": "running", "obj": oid, "mode": "forward",
+                    "msg": "tracking windows forward …"}
+    threading.Thread(target=_propagate_fix_job, args=(job_id, oid, frame, "forward"),
+                     daemon=True).start()
+    return jsonify(job_id=job_id)
+
+
 @app.route("/api/propagate_fix", methods=["POST"])
 def api_propagate_fix():
     """Carry the anchor frame's SAVED mask to temporal neighbours (SAM3 video tracker,
@@ -1792,7 +1845,7 @@ def _propagate_job(job_id, oid):
         # cmd_seeds unions: explicit src_masks + ALL hand masks + cluster.npy if the
         # object came from cloud diff — the completed geometry covers the holes the
         # cluster alone missed. Cluster objects use the strict occlusion defaults.
-        env = dict(os.environ, PYTHONPATH=LAMARIA_PYTHONPATH)  # scantools on path
+        env = dict(os.environ, PYTHONPATH=LAMARIA_PYTHONPATH, GEOM_OUT=G.OUT)  # match in-proc root
         seed_cmd = [str(ANNOTATOR_PY), str(G.__file__), "seeds",
                     "--capture", CFG["capture"], "--session", st["session"],
                     "--ref", st["ref"], "--src-name", o["frame"], "--obj", objdir,
@@ -2236,8 +2289,47 @@ def _composite_group_mask(iid, state, frame, paths):
     return fp
 
 
+def _export_depth():
+    """DEPTH-mode export: OR every non-ghost object's masks per frame into one
+    depth mask per state -> capture/depth/masks/<state>/<frame>.png +
+    depth_index.json. The object is only a tool; the deliverable is the union."""
+    base = Path(CFG["capture"]) / "changes" / "depth" / "masks"
+    unions = {}                                      # (state, frame) -> bool mask
+    for key, o in OBJECTS.items():
+        if o.get("ghost"):
+            continue
+        state = o["state"]
+        for name, mpath in _object_mask_paths(key).items():
+            m = cv2.imread(str(mpath), 0)
+            if m is None:
+                continue
+            mb = m > 127
+            u = unions.get((state, name))
+            unions[(state, name)] = mb if u is None else (u | mb)
+    idx, n = {}, 0
+    for (state, name), mb in unions.items():
+        d = base / state
+        d.mkdir(parents=True, exist_ok=True)
+        flat = name.replace("/", "_")
+        cv2.imwrite(str(d / flat), (mb.astype(np.uint8) * 255))
+        idx.setdefault(state, {})[name] = f"masks/{state}/{flat}"
+        n += 1
+    ddir = Path(CFG["capture"]) / "changes" / "depth"
+    ddir.mkdir(parents=True, exist_ok=True)
+    json.dump(idx, open(ddir / "depth_index.json", "w"), indent=1)
+    return n, base
+
+
 @app.route("/api/export", methods=["POST"])
 def api_export():
+    if CFG.get("depth"):
+        n, base = _export_depth()
+        return jsonify(ok=True, depth=True, n=n, path=str(base),
+                       msg=f"{n} depth frame mask(s) -> {base}")
+    return _api_export_change()
+
+
+def _api_export_change():
     # merge the per-state entries of each shared instance id: a moved pair, or a larger
     # GROUP (several part-annotations of one physical object). Downstream sees ONE
     # object per instance with ONE mask_file per frame; a frame covered by several
@@ -2306,13 +2398,23 @@ def main():
     ap.add_argument("--min-vis", type=int, default=10)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=5000)
+    ap.add_argument("--depth", action="store_true",
+                    help="DEPTH MODE: annotate depth regions (windows/glass "
+                         "pierce/unobserved). Writes to capture/depth/ — a sibling of "
+                         "changes/, fully isolated; export makes per-frame depth "
+                         "masks, NOT segments.json/change_mask. Default is change mode.")
     args = ap.parse_args()
 
-    CFG.update(capture=args.capture, tier=args.tier,
+    CFG.update(capture=args.capture, tier=args.tier, depth=args.depth,
                scene=args.scene or Path(args.capture).name,
                states={"pre": {"session": args.pre_session, "ref": args.pre_ref},
                        "post": {"session": args.post_session, "ref": args.post_ref}},
                seed={"n": args.n, "min_vis": args.min_vis})
+    if args.depth:                                   # force the workspace under depth/
+        go = os.environ.get("GEOM_OUT", "geom_sam_out")
+        go = go.split("/", 1)[1] if go.startswith("changes/") else go
+        G.OUT = f"changes/depth/{go}"
+        print(f"DEPTH MODE — workspace {G.OUT} (isolated subtree; capture root is not writable)", flush=True)
 
     gobj = G.out_dir(args.capture) / "gui_objects.json"           # workspace-scoped (GEOM_OUT)
     legacy = Path(args.capture) / "changes" / "gui_objects.json"
