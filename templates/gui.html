@@ -1,0 +1,1835 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>change annotator — {{ scene }}</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; display: flex; height: 100vh; }
+  /* left is a flex column: controls take their natural height, the viewport fills
+     the rest so the frame scales to fit (no more vertical scrolling). */
+  #left { flex: 1; padding: 12px; min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
+  #right { width: 360px; padding: 12px; border-left: 1px solid #ddd; overflow: auto; background: #fafafa; }
+  h2 { margin: 4px 0 12px; font-size: 16px; }
+  #viewport { flex: 1 1 auto; min-height: 0; max-width: 100%; overflow: hidden; position: relative; border: 1px solid #ccc; line-height: 0; }
+  /* contain: bound by BOTH width and height so the whole frame is always visible.
+     #view and #maskCanvas share identical intrinsic size + rules, so they stay aligned. */
+  #view { display: block; max-width: 100%; max-height: 100%; width: auto; height: auto; transform-origin: top left; cursor: crosshair; }
+  #maskCanvas { position: absolute; top: 0; left: 0; max-width: 100%; max-height: 100%; width: auto; height: auto; transform-origin: top left; pointer-events: none; }
+  #edgeOverlay { position: absolute; top: 0; left: 0; max-width: 100%; max-height: 100%; width: auto; height: auto; transform-origin: top left; pointer-events: none; display: none; }
+  #sceneOverlay { position: absolute; top: 0; left: 0; max-width: 100%; max-height: 100%; width: auto; height: auto; transform-origin: top left; pointer-events: none; display: none; }
+  #armOverlay { position: absolute; top: 0; left: 0; max-width: 100%; max-height: 100%; width: auto; height: auto; transform-origin: top left; pointer-events: none; display: none; }
+  #toolBar { font-size: 13px; }
+  .toolbtn.active { background: #2a7; color: #fff; border-color: #2a7; }
+  .row { margin: 8px 0; }
+  label { font-size: 13px; color: #444; }
+  select, input { font-size: 13px; padding: 3px; }
+  button { font-size: 13px; padding: 5px 10px; cursor: pointer; }
+  button:disabled { opacity: .4; cursor: default; }
+  #slider { width: 100%; }
+  .navrow { display: flex; align-items: center; gap: 8px; }
+  .navrow #slider { flex: 1; }
+  .obj { border: 1px solid #ddd; border-radius: 6px; padding: 8px; margin: 8px 0; background: #fff; position: relative; }
+  .obj .flags { position: absolute; top: 6px; right: 8px; font-size: 11px; color: #555;
+                display: flex; gap: 8px; background: #fff; padding-left: 4px; }
+  .obj .flags label { font-size: 11px; cursor: pointer; user-select: none; }
+  /* green hue = finished GT, not to be touched casually; reviewed = even greener */
+  .obj.f-done { border-color: #8c8; background: #eef8ef; }
+  .obj.f-done.f-reviewed { border-color: #2a7; background: #d8f0de; }
+  /* the card being REVIEWED / identified: unmissable full-card highlight so a
+     delete/dismiss can never hit the wrong neighbour by mistake */
+  .obj.reviewing, .grp.reviewing { border-color: #0a84ff; background: #d9ecff;
+      box-shadow: 0 0 0 3px #0a84ff; }
+  .obj.f-done.reviewing { background: #d9ecff; }      /* blue beats done-green */
+  .obj h4 { margin: 0 0 4px; font-size: 14px; padding-right: 118px; }  /* room for the flags */
+  .obj .meta { font-size: 12px; color: #666; }
+  .obj img { max-width: 100%; margin-top: 6px; border: 1px solid #eee; }
+  /* group container: several GUI objects = ONE physical object (shared instance id) */
+  .grp { border: 1px solid #ccc; border-radius: 6px; margin: 8px 0; background: #f6f6f6; }
+  .grp-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 6px 8px; font-size: 13px; }
+  .grp-cols { display: flex; gap: 6px; padding: 0 6px 6px; align-items: flex-start; }
+  .grp-col { flex: 1 1 0; min-width: 0; }
+  .grp-col .col-tag { font-size: 11px; font-weight: 600; color: #888; margin: 2px 0 2px 2px; }
+  .grp .obj { margin: 0 0 6px; }
+  .grp .obj .flags { position: static; display: block; margin: 0 0 2px; }
+  .grp .obj h4 { padding-right: 0; font-size: 13px; }
+  .selbox { margin-right: 4px; vertical-align: middle; }
+  .status { font-size: 12px; color: #888; }
+  .hint { font-size: 12px; color: #888; margin-top: 6px; }
+  .tip { cursor: help; border-bottom: 1px dotted #999; color: #667; }
+  .ident.dirty { outline: 2px solid #e6b800; }   /* yellow = typed, not saved yet   */
+  .ident.saved { outline: 2px solid #2a7; }      /* green flash = saved to server   */
+  #brushCursor { position: absolute; border: 2px solid rgba(0,200,255,.9); border-radius: 50%;
+                 pointer-events: none; display: none; transform: translate(-50%,-50%); z-index: 5; }
+  .pill { display:inline-block; font-size:11px; padding:1px 6px; border-radius:10px; background:#eee; color:#555; margin-left:4px; }
+  button.del { color:#b00; border-color:#e3b3b3; }
+  .reviewbar { background:#eaf7f0; border:1px solid #b9e4cf; border-radius:6px; padding:6px 8px; }
+  code { background: #eee; padding: 1px 4px; border-radius: 3px; }
+</style>
+</head>
+<body>
+<div id="left">
+  <h2>{{ scene }} · rgb</h2>
+
+  <!-- annotate toolbar -->
+  <div class="row" id="annotateBar">
+    <label>state:</label>
+    <label><input type="radio" name="state" value="pre" checked> pre</label>
+    <label><input type="radio" name="state" value="post"> post</label>
+    &nbsp; <button onclick="resetPoints()">reset points</button>
+  </div>
+
+  <!-- review toolbar -->
+  <div class="row reviewbar" id="reviewBar" style="display:none">
+    <button onclick="exitReview()">← back to annotate</button>
+    <b id="reviewName"></b>
+    <span id="editControls" style="display:none">
+      &nbsp;|&nbsp; <span class="status">click the object to re-segment this frame</span>
+      <button onclick="geomMask()" title="geom+SAM: project the object's lidar cluster, then SAM snaps it to the image edge — recovers legs/parts RGB drops (shadows/exposure). Refuses when the geometry is too sparse in this view.">geom mask</button>
+      <button onclick="saveEdit()" title="shortcut: z">save mask (z)</button>
+      <button onclick="lift3d()" title="edit once in 2D, propagate in 3D: lifts the CURRENT canvas mask onto the state's point cloud (in-stroke + line-of-sight points, bounded 3D grow), press m to confirm the orange preview — the label then renders in EVERY frame and walk">propagate in 3D</button>
+      <button onclick="cancelEdit()">cancel</button>
+    </span>
+    <span id="reviewControls">
+      &nbsp;|&nbsp; <span class="status" id="coverInfo"></span>
+      <button onclick="jumpMasked(-1)" title="previous masked frame">◂ masked</button>
+      <button onclick="jumpMasked(1)" title="next masked frame">masked ▸</button>
+      &nbsp; <button onclick="startEdit()" id="editBtn" title="shortcut: z (x also works)">re-segment frame (z)</button>
+      <button onclick="deleteMask()" id="delBtn" title="shortcut: d">delete mask (d)</button>
+      &nbsp; <button onclick="setFrontier()" title="shortcut: g — frames 0…here are confirmed (green band). No machine writer (remask/propagate) touches them; this frame's mask becomes an approved anchor">good up to here (g)</button>
+      <button onclick="propagateFix()" id="propBtn"
+        title="fill gaps FORWARD from this frame's saved mask, carrying to the end of the walk while the object stays in view (hand anchors + frontier are immutable posts). Tick 'whole span' to fill backward too — first-pass bootstrap only.">propagate this fix</button>
+      <label style="font-size:12px" title="also fill frames BEFORE the clicked one (whole visible span). Default off: your green-lit past stays untouched."><input type="checkbox" id="propSpanChk"> whole span</label>
+      <span id="propControls" style="display:none">
+        <button onclick="propShowPreview()" title="show the sampled preview grid; scrubbing returns to frames">grid</button>
+        <button onclick="toggleVeto()" title="shortcut: v — exclude/include the current frame from this propagation">veto (v)</button>
+        <button onclick="propApply()" id="propApplyBtn" style="background:#2a7;color:#fff">apply</button>
+        <button onclick="propDiscard()">discard</button>
+      </span>
+    </span>
+  </div>
+
+  <!-- shared frame navigation -->
+  <div class="row navrow">
+    <button id="prevBtn" onclick="gotoIdx(idx-1)">◀</button>
+    <input type="range" id="slider" min="0" max="0" value="0">
+    <button id="nextBtn" onclick="gotoIdx(idx+1)">▶</button>
+    <button id="fitBtn" onclick="resetView()" title="reset zoom/pan">fit</button>
+  </div>
+  <canvas id="maskmap" height="8" title="green = frame has a mask · click to jump"
+          style="width:100%; display:none; border:1px solid #ddd; image-rendering:pixelated; cursor:pointer;"></canvas>
+  <div class="status" id="frameLabel"></div>
+
+  <div class="row" id="toolBar">
+    tool:
+    <button class="toolbtn active" data-tool="point" onclick="setTool('point')">point (SAM)</button>
+    <button class="toolbtn" data-tool="msam" onclick="setTool('msam')" title="multi-SAM: every click segments INDEPENDENTLY (no shared context, so ball 2 can't overflow ball 1) and unions onto the mask — stamp 10 separate things into ONE object ('blob1'). shift-click un-sams a stamped thing; ctrl-z reverts one stamp">multi-SAM</button>
+    <button class="toolbtn" data-tool="brush" onclick="setTool('brush')" title="brush: drag to paint; when a stroke closes off an area (against the existing mask or by looping on itself) the enclosed area fills automatically; ctrl-z reverts stroke+fill together">brush</button>
+    <button class="toolbtn" data-tool="erase" onclick="setTool('erase')">erase</button>
+    <button class="toolbtn" data-tool="smart" onclick="setTool('smart')" title="smart brush: rough scribble to INCLUDE (shift-drag to EXCLUDE); SAM refines the mask to the object edge on release">smart brush</button>
+    <button class="toolbtn" data-tool="line" onclick="setTool('line')" title="line: click the start then end of a thin part (leg/cable) to fill a straight stroke at brush width; keep clicking to chain a polyline; Esc/Enter finishes">line</button>
+    <button class="toolbtn" data-tool="linefill" onclick="setTool('linefill')" title="line fill: same as line, but when a chained segment closes a loop (on itself or against the existing mask) the enclosed area fills automatically; ctrl-z reverts segment+fill; Esc/Enter finishes">line fill</button>
+    <button class="toolbtn" data-tool="eline" onclick="setTool('eline')" title="erase line: click start then end to erase a straight stroke at brush width; keep clicking to chain; Esc/Enter finishes">erase line</button>
+    <button class="toolbtn" data-tool="efill" onclick="setTool('efill')" title="erase fill: same as erase line, but when a cut splits the mask, the smaller piece(s) are deleted automatically — carve off the unnecessary part and the island vanishes; ctrl-z reverts cut+deletion; Esc/Enter finishes">erase fill</button>
+    <button class="toolbtn" data-tool="geombrush" onclick="setTool('geombrush')" title="geom brush: paint over a WRONG region — only inside your stroke the mask is replaced by the lidar-geometry(+SAM) answer; the rest stays untouched. Review→edit mode, needs a stored cluster (cloud-diff objects).">geom brush</button>
+    &nbsp; size <input type="range" id="brushSize" min="3" max="250" value="40" style="vertical-align:middle" oninput="brushSize=+this.value">
+  </div>
+  <div id="viewport"><img id="view" src=""><img id="edgeOverlay" src=""><img id="sceneOverlay" src=""><img id="armOverlay" src=""><canvas id="maskCanvas"></canvas><div id="brushCursor"></div></div>
+  <div class="hint" id="annotateHint"><b>point</b>: click=positive, shift-click=negative · <b>brush/erase</b>: drag to paint (brush auto-fills areas the stroke closes off) · <b>ctrl-z</b> undo · <b>scroll</b> zoom · <b>middle-drag</b> pan · <b>fit</b> resets · <b>← / →</b> scrub</div>
+  <div class="status" id="clickStatus"></div>
+</div>
+
+<div id="right">
+  <h2>add object</h2>
+  <div class="row"><label>id</label><br><input id="oid" placeholder="bag" style="width:95%"></div>
+  <div class="row"><label>label</label><br><input id="olabel" placeholder="bag_1" style="width:95%"></div>
+  <div class="row"><label>deformability</label>
+    <select id="odeform"><option value="rigid">rigid</option><option value="deformable">deformable</option></select>
+    <div class="hint">change type is derived from pre/post presence (removed / added / moved)</div>
+  </div>
+  <div class="row"><button onclick="addObject()" title="shortcut: a">add object (a)</button></div>
+  <hr>
+  <div class="row">
+    <button onclick="cloudDiff()" id="cdBtn"
+      title="ONE pass: geometric cloud diff (cd_* proposals) + change fields + DINOv3 texture diff on static surfaces (tex_* proposals) — everything arrives as reviewable objects">🔍 detect changes (cloud diff + texture diff)</button>
+    <button onclick="computeFields()"
+      title="diff the scans ONCE into per-state point fields: certified-STATIC (matched geometry = evidence of no change) and machine-CHANGED candidates (ungated). Powers the scene view's green/magenta layers (u key) and coverage stats.">🧾 compute change fields</button>
+    <input id="tauLo" type="number" step="0.005" placeholder="tau-lo m" style="width:66px"
+      title="hysteresis low threshold in metres for the fields: geometry differing by MORE than this is purple, matching within it is green. Empty = tau/3 = 0.033 m. Lower = more sensitive purple (more noise); higher = calmer purple (misses subtler changes).">
+    <span class="status" id="fieldsStatus"></span>
+    <span class="status" id="cdStatus"></span>
+  </div>
+  <div class="row" style="font-size:12px">
+    object size:
+    <button type="button" onclick="cdPreset('small')" title="e.g. 330 ml can, bottle, mug (~7–10 cm)">small (can)</button>
+    <button type="button" onclick="cdPreset('medium')" title="e.g. bag, box, monitor, backpack (~30–60 cm)">medium (bag)</button>
+    <button type="button" onclick="cdPreset('large')" title="e.g. chair, table, sofa (≥1 m)">large (furniture)</button>
+  </div>
+  <div class="row" style="font-size:12px; line-height:1.9">
+    voxel <input id="cdVoxel" type="number" step="0.005" value="0.02" style="width:56px"
+      title="cloud downsample size (m). SMALLER = finer detail, catches smaller/thinner objects. 0.01 for a can, 0.02 for furniture.">
+    tau <input id="cdTau" type="number" step="0.01" value="0.10" style="width:56px"
+      title="change threshold (m): a point counts as changed if it's this far from any point in the other scan. LOWER = more sensitive (more noise). Keep above the ~cm alignment error.">
+    min-cluster <input id="cdMinCluster" type="number" value="500" style="width:60px"
+      title="drop clusters with fewer points than this. 40 for a can, 150 for a bag, 500 for furniture. LOWER catches small objects but yields many false positives to triage.">
+    eps <input id="cdEps" type="number" step="0.01" value="0.10" style="width:50px"
+      title="DBSCAN cluster radius (m). SMALLER keeps nearby objects from merging into one cluster.">
+    min-frames <input id="cdMinFrames" type="number" value="5" min="1" style="width:46px"
+      title="keep only candidates the Aria glasses saw in at least this many frames (of a ~150-frame sample). LOWER surfaces small/briefly-seen objects; RAISE to keep only the most-looked-at.">
+    &nbsp;<label title="Remove the floor plane before clustering so objects float free — kills bogus floor-patch proposals and tightens boxes. Turn off for objects lying flat on the ground."><input type="checkbox" id="cdRemoveFloor" checked> remove floor</label>
+    &nbsp;<label title="Strict depth-based occlusion: only log a change where Aria had clear line of sight. Drops changes hidden behind walls/geometry that the glasses never actually saw."><input type="checkbox" id="cdStrictOcc" checked> strict occlusion</label>
+  </div>
+  <div class="hint"><span class="tip" title="PRESETS&#10;  330 ml can:  voxel 0.01, min-cluster 40&#10;  bag / box:   voxel 0.015, min-cluster 150&#10;  furniture:   voxel 0.02, min-cluster 500&#10;&#10;Smaller voxel + min-cluster → smaller objects, but more noise to triage.&#10;&#10;⚠ Translucent items (Nalgene bottles, glass) are barely seen by lidar and may not appear at all — annotate those manually.&#10;&#10;Per-cluster proposals: give a moved object's pre & post the same id to link them.">ⓘ presets &amp; tips</span></div>
+  <hr>
+  <h2>objects</h2>
+  <div class="row" id="groupBar" style="display:none">
+    <button id="groupBtn" onclick="doGroup()" title="any number of parts (2, 3, … 10+): tick each object's checkbox — to EXTEND an existing group, tick the GROUP HEADER's checkbox plus the new object's, then press this">group selected</button>
+    <span class="hint" style="margin:0">selected objects become ONE physical object (first selected keeps its id) — to grow an existing group, tick its HEADER checkbox + the new part</span>
+  </div>
+  <div id="objects"></div>
+  <hr>
+  <h2>purple blobs <span class="hint" style="margin:0">— unclaimed change; each must be promoted, merged, or dismissed</span></h2>
+  <div class="row"><button onclick="computeBlobs()" title="cluster the unclaimed changed-field points (minus objects' clusters and dismissals) into resolvable blobs">🟣 find unresolved blobs</button>
+    <button onclick="rebuildAll3d()" title="after sieving the junk: rebuild EVERY object's masks from its 3D consensus label, applied to geom/empty frames only">🧱 rebuild all from 3D</button>
+    <span class="status" id="blobStatus"></span></div>
+  <div id="blobs"></div>
+  <hr>
+  <div class="row"><button onclick="exportSegments()">export segments.json</button> <span class="status" id="exportStatus"></span></div>
+  <hr>
+  <div class="row"><button onclick="nukeWorkspace()" style="background:#b30000;color:#fff;border-color:#7a0000"
+    title="start this workspace over: every object, mask, seed, frontier and snapshot is moved aside on disk (recoverable by hand) and the object list goes blank">☢ nuke workspace</button>
+    <span class="status" id="nukeStatus"></span></div>
+</div>
+
+<script>
+const seedN = {{ seed_n }}, seedMinVis = {{ seed_min_vis }};
+let mode = 'annotate';     // 'annotate' | 'review'
+let frames = [];           // annotate: ['images/cam0/..jpg', ...]  review: [{name,session,px}, ...]
+let idx = 0;
+let reviewObj = null;      // object id under review
+let editing = false;       // review re-segment sub-mode
+let pos = [], neg = [];
+
+const view = document.getElementById('view');
+const slider = document.getElementById('slider');
+const maskCanvas = document.getElementById('maskCanvas');
+const maskCtx = maskCanvas.getContext('2d');
+let tool = 'point', brushSize = 40, reviewState = 'pre', gesture = null, lastPt = null;
+let smartPos = [], smartNeg = [], smartNegStroke = false;   // smart-brush scribble points
+let lineStart = null;                                       // line tool: previous clicked point
+let reviewFrontier = null;                                  // "confirmed up to here" frame name
+let gbPts = [];                                             // geom-brush stroke points
+let geomCache = {obj: null, frame: null, img: null, mode: null};   // per-frame geom+SAM result
+let undoStack = [];        // canvas snapshots for ctrl-z / ctrl-y (one per stroke / SAM apply)
+
+function curState(){ return document.querySelector('input[name=state]:checked').value; }
+function frameName(i){ return mode === 'review' ? frames[i].name : frames[i]; }
+function maskEditable(){ return mode === 'annotate' || (mode === 'review' && editing); }
+
+// ───────── annotate: scrub the current state's frames ─────────
+async function loadAnnotateFrames(){
+  exitReview();
+  const r = await fetch('/api/frames?state=' + curState());
+  frames = await r.json();
+  idx = 0;
+  setSliderMax(frames.length);
+  showFrame();
+}
+
+function showFrame(){
+  if(!frames.length){ view.src=''; document.getElementById('frameLabel').textContent='no frames'; return; }
+  pos = []; neg = [];
+  showMask(true);
+  setFrame('/frame?state=' + curState() + '&name=' + encodeURIComponent(frameName(idx)), clearMaskCanvas);
+  document.getElementById('clickStatus').textContent = '';
+  updateLabel();
+}
+function resetPoints(){ if(mode==='annotate'){ pos=[]; neg=[]; clearMaskCanvas(); document.getElementById('clickStatus').textContent=''; } }
+
+// ───────── review: scrub one object's propagated masks ─────────
+async function openReview(oid, stayFrame){
+  const r = await fetch('/api/object_frames?id=' + encodeURIComponent(oid));
+  const d = await r.json();
+  if(d.error){ alert(d.error); return; }
+  if(!d.count){ alert('no frames found for this object\'s session'); return; }
+  mode = 'review'; reviewObj = oid; frames = d.frames; editing = false; reviewState = d.state;
+  if(pendingObj && pendingObj !== oid) clearPending();          // pending is object-scoped
+  if(pendingObj === oid && pendingMap){                         // returning to a ready preview
+    document.getElementById('propControls').style.display = '';
+    updateApplyLabel();
+  }
+  reviewFrontier = (objsCache[oid] || {}).verified_until || null;
+  // stayFrame (e.g. after applying a propagation) keeps the user's place
+  // instead of snapping back to the object's first masked frame
+  const at = stayFrame ? frames.findIndex(f => f.name === stayFrame) : -1;
+  const first = frames.findIndex(f => f.has_mask);   // land on the propagated region
+  idx = at >= 0 ? at : (first >= 0 ? first : 0);
+  document.getElementById('annotateBar').style.display = 'none';
+  document.getElementById('reviewBar').style.display = '';
+  document.getElementById('annotateHint').style.display = 'none';
+  setEditUI(false);
+  setSliderMax(frames.length);
+  renderMaskmap();
+  highlightReviewing();
+  showReview();
+}
+function exitReview(){
+  mode = 'annotate'; reviewObj = null; editing = false;
+  document.getElementById('propControls').style.display = 'none';   // pending preview is object-scoped
+  document.getElementById('annotateBar').style.display = '';
+  document.getElementById('reviewBar').style.display = 'none';
+  document.getElementById('annotateHint').style.display = '';
+  document.getElementById('maskmap').style.display = 'none';
+  highlightReviewing();
+}
+function showReview(){
+  if(!frames.length){ exitReview(); loadAnnotateFrames(); return; }
+  pos = []; neg = [];
+  showMask(false); view.onload = null;
+  const f = frames[idx];
+  if(pendingMap && pendingObj === reviewObj && pendingMap.has(f.name)){
+    // pending-review: proposed mask (red fill) vs current mask (green contour)
+    view.src = '/api/prop_overlay?job_id=' + propJob + '&name=' + encodeURIComponent(f.name) + '&t=' + Date.now();
+    const fl = pendingMap.get(f.name) || {};
+    document.getElementById('reviewName').textContent = reviewObj + '  [PENDING'
+      + (pendingVeto.has(f.name) ? ' · VETOED' : '') + (fl.lowconf ? ' · LOWCONF' : '')
+      + (fl.legacy ? ' · legacy' : '') + ']';
+  } else {
+    view.src = '/api/overlay?id=' + encodeURIComponent(reviewObj) +
+               '&name=' + encodeURIComponent(f.name) + '&t=' + Date.now();
+    document.getElementById('reviewName').textContent = reviewObj;
+  }
+  document.getElementById('clickStatus').textContent = '';
+  updateLabel();
+  updateCoverInfo();
+  renderMaskmap();
+}
+function jumpMasked(dir){
+  for(let i = idx + dir; i >= 0 && i < frames.length; i += dir)
+    if(frames[i].has_mask){ gotoIdx(i); return; }
+}
+function updateCoverInfo(){
+  const masked = frames.filter(f => f.has_mask).length;
+  document.getElementById('coverInfo').textContent = `${masked}/${frames.length} masked`;
+  const has = frames.length && frames[idx].has_mask;
+  document.getElementById('delBtn').disabled = !has;
+  document.getElementById('editBtn').textContent = has ? 're-segment frame' : 'add mask here';
+}
+function renderMaskmap(){
+  const c = document.getElementById('maskmap');
+  if(mode !== 'review' || !frames.length){ c.style.display = 'none'; return; }
+  c.style.display = 'block';
+  if(c.width !== frames.length) c.width = frames.length;
+  const g = c.getContext('2d');
+  const pending = pendingMap && pendingObj === reviewObj;
+  for(let i = 0; i < frames.length; i++){
+    const n = frames[i].name;
+    if(pending && pendingMap.has(n)){
+      g.fillStyle = pendingVeto.has(n) ? '#a3f'                          // vetoed
+        : (pendingMap.get(n).lowconf ? '#fc0' : '#39f');                 // lowconf / proposed
+    } else {
+      g.fillStyle = frames[i].has_mask ? '#22aa77' : '#e6e6e6';
+    }
+    g.fillRect(i, 0, 1, c.height);
+  }
+  if(reviewFrontier){                    // g band: frames 0…g are confirmed (green overlay)
+    const fi = frames.findIndex(f => f.name === reviewFrontier);
+    if(fi >= 0){
+      g.fillStyle = 'rgba(0,150,50,0.45)';
+      g.fillRect(0, 0, fi + 1, c.height);
+      g.fillStyle = '#063';
+      g.fillRect(fi, 0, 2, c.height);    // the dropped g itself
+    }
+  }
+  g.fillStyle = '#d00';
+  g.fillRect(Math.min(frames.length - 1, idx), 0, 2, c.height);
+}
+
+// a DONE object is finished GT — protect it from fat-finger edits: every mutating
+// action must pass this gate, which requires typing 'r' (or 'review') to proceed.
+function guardDone(key){
+  const o = objsCache[key] || {};
+  if(!o.done) return true;
+  const t = prompt("are you a reviewer of this object? otherwise, be really careful not to " +
+                   "edit a done object. type 'r' to continue editing");
+  const v = (t || '').trim().toLowerCase();
+  return v === 'r' || v === 'review';
+}
+
+function startEdit(){
+  if(!guardDone(reviewObj)) return;
+  editing = true; pos = []; neg = []; setEditUI(true); showMask(true); resetUndo();
+  const f = frames[idx];
+  setFrame('/frame?state=' + reviewState + '&name=' + encodeURIComponent(f.name),
+    () => loadMaskFromUrl('/api/mask_png?id=' + encodeURIComponent(reviewObj) +
+                          '&name=' + encodeURIComponent(f.name) + '&t=' + Date.now()));
+  document.getElementById('clickStatus').textContent = 'SAM-click and/or brush·erase, then save';
+}
+function cancelEdit(){ editing = false; setEditUI(false); showReview(); }
+async function saveEdit(){
+  const f = frames[idx];
+  const r = await fetch('/api/save_edit', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({id: reviewObj, frame: f.name, mask: maskCanvas.toDataURL('image/png')})});
+  const d = await r.json();
+  if(d.error){ alert(d.error); return; }
+  frames[idx].has_mask = d.px > 0; frames[idx].px = d.px;
+  editing = false; setEditUI(false); refreshObjects(); showReview();
+}
+// ── propagate this fix: anchor = current frame's saved mask; preview -> confirm ──
+let propJob = null;
+async function propagateFix(){
+  const f = frames[idx];
+  if(!f.has_mask){ alert('this frame has no saved mask to propagate — fix & save it first'); return; }
+  const obj = reviewObj;              // CAPTURE the launch object: the poll below must
+                                      // never bind results to whatever is open later
+  const st = document.getElementById('coverInfo');
+  document.getElementById('propBtn').disabled = true;
+  document.getElementById('propControls').style.display = 'none';
+  clearPending();
+  const mode = document.getElementById('propSpanChk').checked ? 'span' : 'forward';
+  const r = await fetch('/api/propagate_fix', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({id: obj, frame: f.name, mode})});
+  const d = await r.json();
+  if(d.error){ alert(d.error); document.getElementById('propBtn').disabled = false; return; }
+  propJob = d.job_id;
+  const poll = setInterval(async () => {
+    const j = await (await fetch('/api/job/' + propJob)).json();
+    if(j.status === 'running'){ if(reviewObj === obj) st.textContent = j.msg || 'propagating …'; return; }
+    clearInterval(poll);
+    document.getElementById('propBtn').disabled = false;
+    if(j.status === 'error'){ if(reviewObj === obj) st.textContent = 'propagate error: ' + j.error; return; }
+    if(!j.n){ if(reviewObj === obj) st.textContent = j.msg || 'nothing to fill'; return; }
+    // enter pending review: scrub the proposals live (red fill = proposed,
+    // green contour = current) and veto per frame before applying
+    const pf = await (await fetch('/api/prop_frames?job_id=' + propJob)).json();
+    pendingMap = new Map((pf.frames || []).map(x => [x.name, x]));
+    pendingVeto = new Set(); pendingObj = obj;      // bound to the LAUNCH object
+    propPreview = j.preview ? j.preview + '?t=' + Date.now() : null;
+    updateApplyLabel();
+    if(reviewObj === obj){
+      st.textContent = `${j.anchors} anchor(s) → ${j.n} filled`
+        + (j.n_lowconf ? ` · ${j.n_lowconf} lowconf (yellow)` : '')
+        + (j.n_shrink ? ` · ${j.n_shrink} shrink-flagged (orange)` : '')
+        + (j.resumes ? ` · ${j.resumes} re-acquired after track loss` : '')
+        + (j.invisible ? ` · ${j.invisible} not visible (unmasked)` : '')
+        + ' — scrub: red=proposed, green=current · v=veto · then apply';
+      document.getElementById('propControls').style.display = '';
+      const first = frames.findIndex(fr => pendingMap.has(fr.name));
+      renderMaskmap();
+      if(first >= 0) gotoIdx(first); else showReview();
+    } else {
+      const cardSt = document.getElementById('st_' + obj);
+      if(cardSt) cardSt.textContent = 'propagation ready — open review to inspect';
+    }
+  }, 1500);
+}
+let propPreview = null;
+let pendingMap = null, pendingVeto = new Set(), pendingObj = null;
+// enter the pending preview/veto UI for a finished job (propagate or 3D rebuild)
+async function enterPending(jobId, obj, j, statusText){
+  const pf = await (await fetch('/api/prop_frames?job_id=' + jobId)).json();
+  pendingMap = new Map((pf.frames || []).map(x => [x.name, x]));
+  pendingVeto = new Set(); pendingObj = obj;
+  propPreview = j.preview ? j.preview + '?t=' + Date.now() : null;
+  updateApplyLabel();
+  if(reviewObj === obj){
+    document.getElementById('clickStatus').textContent = statusText;
+    document.getElementById('propControls').style.display = '';
+    const first = frames.findIndex(fr => pendingMap.has(fr.name));
+    renderMaskmap();
+    if(first >= 0) gotoIdx(first); else showReview();
+  } else {
+    const cardSt = document.getElementById('st_' + obj);
+    if(cardSt) cardSt.textContent = 'ready — open review to inspect';
+  }
+}
+// rebuild an object's masks from its 3D consensus label: every existing mask
+// votes at 3D addresses, points the views agree on are re-rendered into every
+// frame (fixes jitter, misses and inconsistent overflow in one pass)
+async function rebuild3d(key){
+  if(!guardDone(key)) return;
+  const cardSt = document.getElementById('st_' + key);
+  const r = await fetch('/api/rebuild3d', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({id: key})});
+  const d = await r.json();
+  if(d.error){ alert(d.error); return; }
+  const poll = setInterval(async () => {
+    const j = await (await fetch('/api/job/' + d.job_id)).json();
+    if(cardSt) cardSt.textContent = j.msg || j.status;
+    if(j.status === 'running') return;
+    clearInterval(poll);
+    if(j.status === 'error'){ if(cardSt) cardSt.textContent = 'rebuild error: ' + j.error; return; }
+    if(!j.n) return;
+    propJob = d.job_id;
+    if(mode !== 'review' || reviewObj !== key) await openReview(key);
+    enterPending(d.job_id, key, j, j.msg + ' — scrub: red=rebuilt, green=current · v=veto · then apply');
+  }, 1500);
+}
+async function rebuildAll3d(){
+  const t = prompt('Rebuild EVERY object from its 3D consensus?\n\nApplies straight to geom/empty frames (hand, propagated, remasked and behind-frontier frames are untouched; workspace snapshotted first).\n\nDo the blob sieve FIRST so junk objects are gone.\n\nType r to run:');
+  if((t || '').trim().toLowerCase() !== 'r') return;
+  const st = document.getElementById('blobStatus');
+  st.textContent = 'batch 3D rebuild …';
+  const r = await fetch('/api/rebuild3d', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({all: true})});
+  const d = await r.json();
+  const poll = setInterval(async () => {
+    const j = await (await fetch('/api/job/' + d.job_id)).json();
+    st.textContent = j.msg || j.status;
+    if(j.status !== 'running'){ clearInterval(poll); refreshObjects(); if(sceneView) updateSceneView(); }
+  }, 2000);
+}
+function clearPending(){ pendingMap = null; pendingVeto = new Set(); pendingObj = null; }
+function updateApplyLabel(){
+  if(!pendingMap) return;
+  const n = pendingMap.size - pendingVeto.size;
+  document.getElementById('propApplyBtn').textContent =
+    `apply ${n}` + (pendingVeto.size ? ` (−${pendingVeto.size} vetoed)` : '');
+}
+function toggleVeto(){
+  if(!pendingMap || mode !== 'review') return;
+  const n = frames[idx].name;
+  if(!pendingMap.has(n)) return;
+  pendingVeto.has(n) ? pendingVeto.delete(n) : pendingVeto.add(n);
+  updateApplyLabel(); renderMaskmap(); showReview();
+}
+function propShowPreview(){
+  if(!propPreview) return;
+  showMask(false); view.onload = null;                  // grid replaces the frame; scrub to return
+  view.src = propPreview;
+}
+async function propApply(){
+  const r = await fetch('/api/propagate_apply', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({job_id: propJob, exclude: [...pendingVeto]})});
+  const d = await r.json();
+  if(d.error){ alert(d.error); return; }
+  document.getElementById('propControls').style.display = 'none';
+  propPreview = null; clearPending();
+  document.getElementById('coverInfo').textContent =
+    `applied ${d.written} propagated masks` + (d.skipped_hand ? ` (${d.skipped_hand} kept)` : '');
+  refreshObjects();
+  openReview(reviewObj, frames[idx] ? frames[idx].name : null);  // stay put
+}
+async function propDiscard(){
+  await fetch('/api/propagate_discard', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({job_id: propJob})});
+  document.getElementById('propControls').style.display = 'none';
+  propPreview = null; clearPending();
+  renderMaskmap(); showReview();                        // restore the frame view
+}
+
+// frontier: everything up to the current frame is confirmed (green-lit) —
+// propagation will never touch it, and its mask becomes an approved anchor
+async function setFrontier(){
+  if(mode !== 'review') return;
+  const name = frames[idx].name;
+  const r = await fetch('/api/set_meta', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({id: reviewObj, verified_until: name})});
+  const d = await r.json();
+  if(d.error){ alert(d.error); return; }
+  reviewFrontier = name;
+  if(objsCache[reviewObj]) objsCache[reviewObj].verified_until = name;
+  document.getElementById('coverInfo').textContent = `frontier set @ frame ${idx + 1}`;
+  renderMaskmap();
+}
+
+// geom mask: lidar-cluster silhouette as the starting mask (edit mode)
+async function geomMask(){
+  if(mode !== 'review' || !editing) return;
+  const st = document.getElementById('clickStatus');
+  st.textContent = 'geom mask: projecting cluster … (first use per state loads the mesh — up to ~1 min; watch this line)';
+  let d;
+  try{
+    const r = await fetch('/api/geom_mask', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({id: reviewObj, frame: frames[idx].name})});
+    d = await r.json();
+  } catch(err){
+    st.textContent = 'geom mask: server did not answer with JSON — the running GUI is probably OLD code; restart it';
+    alert('geom mask failed: the running server likely predates this feature.\nRestart the GUI (Ctrl-C, relaunch) to load the latest code.');
+    return;
+  }
+  if(d.error){ st.textContent = 'geom mask: ' + d.error; alert('geom mask: ' + d.error); return; }
+  pushUndo();
+  loadMaskFromUrl(d.mask);
+  st.textContent = `geom mask [${d.mode || 'raw'}]: ${d.px.toLocaleString()} px from ${d.pts} lidar pts — touch up if needed, then save`;
+}
+
+async function deleteMask(skipConfirm){
+  const f = frames[idx];
+  if(!f.has_mask) return;
+  if(!guardDone(reviewObj)) return;
+  if(!skipConfirm && !confirm('delete mask on this frame?')) return;
+  let r = await fetch('/api/delete_mask', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({id: reviewObj, frame: f.name})});
+  let d = await r.json();
+  if(d.protected){                          // hand/frontier co-GT: server demands explicit confirm
+    if(!confirm('This mask is HUMAN-VERIFIED (hand-saved or behind your g frontier).\n\nReally delete it? (a backup is kept under masks/.deleted/)')) return;
+    r = await fetch('/api/delete_mask', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({id: reviewObj, frame: f.name, force: true})});
+    d = await r.json();
+  }
+  if(d.error){ alert(d.error); return; }
+  frames[idx].has_mask = false; frames[idx].px = null;
+  refreshObjects(); showReview();
+}
+function setEditUI(on){
+  document.getElementById('editControls').style.display = on ? '' : 'none';
+  document.getElementById('reviewControls').style.display = on ? 'none' : '';
+}
+
+// ───────── shared navigation ─────────
+function setSliderMax(n){
+  slider.max = Math.max(0, n - 1);
+  slider.value = idx;
+  const none = n === 0;
+  document.getElementById('prevBtn').disabled = none;
+  document.getElementById('nextBtn').disabled = none;
+  slider.disabled = none;
+}
+function gotoIdx(i){
+  if(!frames.length) return;
+  i = Math.max(0, Math.min(frames.length - 1, i));
+  if(i === idx && view.src) {} // allow re-show
+  idx = i; slider.value = i;
+  if(editing){ editing = false; setEditUI(false); }
+  endLine();                                    // a new frame starts a fresh line
+  mode === 'review' ? showReview() : showFrame();
+  updateEdgeOverlay();
+  if(sceneView) updateSceneView();
+  clearSceneArm();                                  // a new frame disarms m/g actions
+}
+
+// ── low-exposure aids: i cycles view filters (display-only — SAM, the mask
+// canvas and everything saved see the ORIGINAL pixels); e toggles the mesh
+// depth-edge outline, the one signal immune to exposure (black furniture keeps
+// a crisp geometric silhouette no matter how dark the RGB is).
+let viewFx = 0;
+const VIEW_FX = ['', 'brightness(1.9) contrast(1.12)', 'invert(1)'];
+const VIEW_FX_NAME = ['normal', 'shadow lift', 'inverted'];
+function cycleFx(){
+  viewFx = (viewFx + 1) % VIEW_FX.length;
+  view.style.filter = VIEW_FX[viewFx];
+  document.getElementById('clickStatus').textContent =
+    'view: ' + VIEW_FX_NAME[viewFx] + ' (i cycles — display only)';
+}
+let edgesOn = false;
+const edgeImg = document.getElementById('edgeOverlay');
+// two-step scene-view actions: shift-click/click ARMS (dark-red highlight),
+// m (merge) or g (dismiss) COMMITS, Esc cancels
+let sceneArm = null;
+const armImg = document.getElementById('armOverlay');
+function clearSceneArm(){ sceneArm = null; armImg.style.display = 'none'; armImg.src = '';
+                          armImg.style.filter = ''; }
+async function lift3d(){
+  if(mode !== 'review' || !editing){ alert('propagate in 3D works in review → edit mode (x), with your 2D fix on the canvas'); return; }
+  const st = document.getElementById('clickStatus');
+  st.textContent = 'lifting stroke to the point cloud …';
+  const body = {id: reviewObj, frame: frames[idx].name, mask: maskCanvas.toDataURL('image/png')};
+  const r = await fetch('/api/lift3d', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({...body, preview: true})});
+  const d = await r.json();
+  if(d.error){ st.textContent = 'lift3d: ' + d.error; return; }
+  sceneArm = {type: 'lift', body};
+  armImg.style.filter = '';
+  armImg.onload = () => { armImg.style.display = 'block'; };
+  armImg.src = d.preview;
+  st.textContent = `ARMED (orange): ${d.n_claim.toLocaleString()} cloud pts (${d.n_seed.toLocaleString()} from stroke, `
+    + `${d.n_static.toLocaleString()} static=green→red) → m labels them as ${reviewObj} globally · Esc cancels`;
+}
+async function commitSceneArm(kind){
+  const a = sceneArm;
+  if(!a || a.type !== kind) return false;
+  clearSceneArm();
+  const st = document.getElementById('clickStatus');
+  if(kind === 'newobj'){
+    const base = 'obj_' + String(Object.keys(objsCache || {}).length + 1).padStart(2, '0');
+    const id = prompt('New object id:', base);
+    if(!id){ st.textContent = 'new object cancelled'; return true; }
+    const r = await fetch('/api/add_object', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({id: id.trim(), label: '', deformability: 'rigid',
+                            state: a.state, frame: a.frame, points: [a.point], mask: a.mask})});
+    const d = await r.json();
+    if(d.error){ st.textContent = 'new object: ' + d.error; return true; }
+    await refreshObjects();
+    const key = id.trim() + '__' + a.state;
+    sceneView = 0; updateSceneView();
+    await openReview(key, a.frame);
+    st.textContent = `created ${key} — refine it here, '+ seed' other views, then rebuild 3D`;
+    return true;
+  }
+  if(kind === 'lift'){
+    const r = await fetch('/api/lift3d', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(a.body)});
+    const d = await r.json();
+    st.textContent = d.error ? ('lift3d: ' + d.error) : d.msg;
+    return true;
+  }
+  if(kind === 'merge'){
+    const r = await fetch('/api/claim_purple', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(a.body)});
+    const d = await r.json();
+    if(d.error){ st.textContent = 'merge: ' + d.error; return true; }
+    st.textContent = `merged +${d.added.toLocaleString()} px into ${a.body.id} (src=prop) — total ${d.px.toLocaleString()} px`;
+    frames[idx].has_mask = true; frames[idx].px = d.px;
+    showReview(); updateSceneView();
+  } else {
+    const r = await fetch('/api/dismiss_object', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({id: a.key})});
+    const d = await r.json();
+    if(d.error){ st.textContent = 'dismiss: ' + d.error; return true; }
+    st.textContent = `dismissed ${a.key} — masks moved to .trash` +
+      (d.greened ? ', region certified no-change (green)' : ' (no 3D cluster: region reverts to purple/uncoloured)');
+    if(reviewObj === a.key) exitReview();
+    refreshObjects(); updateSceneView();
+  }
+  return true;
+}
+// ── scene view (u): 0 off · 1 RED union of ALL objects' masks · 2 +GREEN
+// certified-static · 3 +MAGENTA machine-changed. While on, clicking IDENTIFIES
+// the owning object (card highlighted) instead of segmenting/painting.
+let sceneView = 0;
+const sceneImg = document.getElementById('sceneOverlay');
+const SCENE_NAME = ['off', 'all masks (red)', '+ certified static (green)',
+                    '+ machine-changed (magenta)'];
+function cycleSceneView(){
+  sceneView = (sceneView + 1) % 4;
+  clearSceneArm();
+  updateSceneView();
+}
+async function updateSceneView(){
+  if(!sceneView || !frames.length){ sceneImg.style.display = 'none';
+    if(!sceneView) document.getElementById('clickStatus').textContent = 'scene view: off';
+    return; }
+  const st = (mode === 'review') ? reviewState : curState();
+  sceneImg.onload = () => { sceneImg.style.display = 'block'; };
+  sceneImg.onerror = async () => { sceneImg.style.display = 'none';
+    document.getElementById('clickStatus').textContent =
+      'scene view: ' + (sceneView >= 2 ? "green/magenta need 'compute change fields' (cloud panel)"
+                                       : 'no masks on this frame yet'); };
+  sceneImg.src = '/api/scene_overlay?state=' + encodeURIComponent(st)
+               + '&frame=' + encodeURIComponent(frameName(idx)) + '&mode=' + sceneView
+               + '&t=' + Date.now();
+  let cov = '';
+  if(sceneView >= 2){
+    const r = await fetch('/api/scene_coverage?state=' + encodeURIComponent(st)
+                          + '&frame=' + encodeURIComponent(frameName(idx)));
+    const d = await r.json();
+    if(!d.error) cov = ` · annotated ${d.annotated}% · static ${d.static}% · `
+                     + `unclaimed ${d.unclaimed}% · no-evidence ${d.no_evidence}%`;
+  }
+  document.getElementById('clickStatus').textContent =
+    'scene view: ' + SCENE_NAME[sceneView] + cov + ' — click a red region to identify its object';
+}
+async function whoIsHereClick(e){
+  const [x, y] = evToNatural(e);
+  if(!inFrame(x, y)) return;
+  const st = (mode === 'review') ? reviewState : curState();
+  if(e.shiftKey){                                   // shift-click = ARM a purple merge
+    if(mode !== 'review'){ document.getElementById('clickStatus').textContent =
+      'claim purple: open the TARGET object in review first — shift-click arms the blob, m merges'; return; }
+    const body = {id: reviewObj, frame: frameName(idx), x: Math.round(x), y: Math.round(y)};
+    const r0 = await fetch('/api/claim_purple', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({...body, preview: true})});
+    const d0 = await r0.json();
+    if(d0.error){ clearSceneArm(); document.getElementById('clickStatus').textContent = 'claim purple: ' + d0.error; return; }
+    sceneArm = {type: 'merge', body};
+    armImg.style.filter = '';
+    armImg.onload = () => { armImg.style.display = 'block'; };
+    armImg.src = d0.preview;
+    document.getElementById('clickStatus').textContent =
+      `ARMED: ${d0.px.toLocaleString()} px purple blob (dark red) → press m to merge into ${reviewObj} · Esc cancels`;
+    return;
+  }
+  const r = await fetch('/api/who_is_here', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({state: st, frame: frameName(idx), x: Math.round(x), y: Math.round(y)})});
+  const d = await r.json();
+  document.querySelectorAll('.obj.reviewing, .grp.reviewing')
+    .forEach(el => el.classList.remove('reviewing'));
+  const found = (d.keys && d.keys.length) ? d.keys
+              : (d.territory && d.territory.length) ? d.territory : [];
+  if(!found.length){
+    // nothing owns this pixel: SAM it right here and arm a NEW object, so an
+    // unclaimed purple blob can become an object without leaving the scene view
+    document.getElementById('clickStatus').textContent = 'scene view: segmenting here …';
+    const sr = await fetch('/api/click', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({state: st, frame: frameName(idx), points: [[Math.round(x), Math.round(y)]], neg: []})});
+    const sd = await sr.json();
+    if(sd.error){ document.getElementById('clickStatus').textContent =
+      'scene view: nothing claims this pixel · ' + sd.error; return; }
+    sceneArm = {type: 'newobj', mask: sd.mask, state: st, frame: frameName(idx),
+                point: [Math.round(x), Math.round(y)]};
+    armImg.onload = () => { armImg.style.display = 'block'; };
+    armImg.style.filter = 'hue-rotate(150deg) saturate(2.5) brightness(1.3)';  // CYAN =
+    armImg.src = sd.mask;                       // freshly clicked, not yet an object
+    document.getElementById('clickStatus').textContent =
+      `unclaimed — SAM'd ${sd.px.toLocaleString()} px here (score ${sd.score.toFixed(2)}): `
+      + 'press n to make it a NEW object · Esc cancels';
+    return; }
+  found.forEach((k, i) => {
+    const el = document.querySelector(`[data-oid="${k}"]`);
+    if(el){ el.classList.add('reviewing'); if(i === 0) el.scrollIntoView({block: 'center'}); }
+  });
+  if(d.keys && d.keys.length){
+    // clicking an object in the u view drops back to the BASIC view with just
+    // that object's mask on the plain frame, at this same frame (u re-enters)
+    const stay = frameName(idx);
+    sceneView = 0; updateSceneView();
+    openReview(d.keys[0], stay);
+    document.getElementById('clickStatus').textContent =
+      'reviewing ' + d.keys[0] + ' — its mask alone on the plain sequence (press u to return to scene view)';
+  } else {
+    document.getElementById('clickStatus').textContent =
+      'purple here = territory of ' + found.join(', ') + ' (cluster projects here, no mask on this '
+      + 'frame yet) — card highlighted: propagate or review it';
+  }
+}
+async function textureCheck(){
+  const st = document.getElementById('fieldsStatus');
+  st.textContent = 'texture check …';
+  const r = await fetch('/api/texture_check', {method:'POST', headers:{'Content-Type':'application/json'}, body: '{}'});
+  const d = await r.json();
+  const poll = setInterval(async () => {
+    const j = await (await fetch('/api/job/' + d.job_id)).json();
+    st.textContent = j.status === 'running' ? (j.msg || '…')
+                   : j.status === 'error' ? ('texture error: ' + j.error)
+                   : `texture: ${j.n_proposals} proposal(s) added`;
+    if(j.status !== 'running'){ clearInterval(poll); refreshObjects(); }
+  }, 1500);
+}
+async function computeFields(){
+  const st = document.getElementById('fieldsStatus');
+  st.textContent = 'computing change fields …';
+  const tl = parseFloat(document.getElementById('tauLo').value);
+  const r = await fetch('/api/compute_fields', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({tau_lo: isNaN(tl) ? null : tl})});
+  const d = await r.json();
+  const poll = setInterval(async () => {
+    const j = await (await fetch('/api/job/' + d.job_id)).json();
+    st.textContent = j.status === 'running' ? (j.msg || '…')
+                   : j.status === 'error' ? ('fields error: ' + j.error) : (j.msg || 'fields ready');
+    if(j.status !== 'running'){ clearInterval(poll); if(sceneView) updateSceneView(); }
+  }, 1500);
+}
+function updateEdgeOverlay(){
+  if(!edgesOn || !frames.length){ edgeImg.style.display = 'none'; return; }
+  const st = (mode === 'review') ? reviewState : curState();
+  edgeImg.onload = () => { edgeImg.style.display = 'block'; };
+  edgeImg.onerror = () => { edgeImg.style.display = 'none'; };
+  edgeImg.src = '/api/depth_edges?state=' + encodeURIComponent(st)
+              + '&frame=' + encodeURIComponent(frameName(idx));
+}
+slider.addEventListener('input', () => gotoIdx(parseInt(slider.value)));
+
+function updateLabel(){
+  const total = frames.length;
+  let s = `frame ${total ? idx + 1 : 0}/${total}`;
+  if(total){
+    s += ' · ' + frameName(idx).split('/').pop();
+    if(mode === 'review') s += frames[idx].has_mask ? ` · ${frames[idx].px} px` : ' · no mask';
+  }
+  document.getElementById('frameLabel').textContent = s;
+}
+
+document.addEventListener('keydown', (e) => {
+  const t = document.activeElement.tagName;
+  if(t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT') return;
+  // ctrl+z AND ctrl+y both UNDO — Swiss/German QWERTZ swaps Z/Y, so the same
+  // muscle memory must land on the same action on either layout
+  if(('zZyY'.includes(e.key)) && (e.ctrlKey || e.metaKey) && !e.shiftKey){ e.preventDefault(); undoMask(); }
+  else if(e.key === 'ArrowRight'){ e.preventDefault(); gotoIdx(idx + 1); }
+  else if(e.key === 'ArrowLeft'){ e.preventDefault(); gotoIdx(idx - 1); }
+  else if((e.key === 'd' || e.key === 'D') && mode === 'review' && !editing){ e.preventDefault(); deleteMask(true); }
+  else if((e.key === 'a' || e.key === 'A') && mode === 'annotate'){ e.preventDefault(); addObject(); }
+  else if((e.key === 'x' || e.key === 'X') && mode === 'review' && !editing){ e.preventDefault(); startEdit(); }
+  // plain z = the fix loop: enter edit, and once editing, save. (ctrl/cmd+z stays undo, handled above)
+  else if((e.key === 'z' || e.key === 'Z') && !e.ctrlKey && !e.metaKey && mode === 'review'){
+    e.preventDefault(); editing ? saveEdit() : startEdit(); }
+  else if((e.key === 'Escape' || e.key === 'Enter') && (tool === 'line' || tool === 'linefill' || tool === 'eline' || tool === 'efill')){ e.preventDefault(); endLine(); document.getElementById('clickStatus').textContent = 'line finished'; }
+  else if((e.key === 'v' || e.key === 'V') && mode === 'review' && pendingMap){ e.preventDefault(); toggleVeto(); }
+  else if((e.key === 'g' || e.key === 'G') && mode === 'review' && !editing){ e.preventDefault(); setFrontier(); }
+  else if(sceneArm && e.key === 'Escape'){ e.preventDefault(); clearSceneArm();
+    document.getElementById('clickStatus').textContent = 'armed action cancelled'; }
+  else if(sceneArm && (sceneArm.type === 'merge' || sceneArm.type === 'lift') && (e.key === 'm' || e.key === 'M')){ e.preventDefault(); commitSceneArm(sceneArm.type); }
+  else if(sceneArm && sceneArm.type === 'newobj' && (e.key === 'n' || e.key === 'N')){ e.preventDefault(); commitSceneArm('newobj'); }
+  else if((e.key === 'u' || e.key === 'U') && !e.ctrlKey && !e.metaKey){ e.preventDefault(); cycleSceneView(); }
+  else if((e.key === 'i' || e.key === 'I') && !e.ctrlKey && !e.metaKey){ e.preventDefault(); cycleFx(); }
+  else if((e.key === 'e' || e.key === 'E') && !e.ctrlKey && !e.metaKey){ e.preventDefault();
+    edgesOn = !edgesOn; updateEdgeOverlay();
+    document.getElementById('clickStatus').textContent =
+      'depth edges: ' + (edgesOn ? 'ON — cyan = mesh silhouettes (exposure-immune; first use per state loads the mesh, ~1 min)' : 'off'); }
+  else if((e.key === 'q' || e.key === 'Q') && !e.repeat){ e.preventDefault(); peek(true); }   // hold q = peek original
+});
+document.addEventListener('keyup', (e) => { if(e.key === 'q' || e.key === 'Q') peek(false); });
+
+// hold-to-peek: transiently hide the mask so you see the original image underneath
+let peeking = false, peekSrc = null;
+function peek(on){
+  if(on === peeking) return;
+  peeking = on;
+  // q = the CLEAN original: also blank the scene-view and depth-edge layers
+  sceneImg.style.visibility = on ? 'hidden' : 'visible';
+  edgeImg.style.visibility = on ? 'hidden' : 'visible';
+  armImg.style.visibility = on ? 'hidden' : 'visible';
+  if(mode === 'review' && !editing){          // browse mode: mask is baked into /api/overlay
+    if(on){ peekSrc = view.src; view.src = '/frame?state=' + reviewState +
+              '&name=' + encodeURIComponent(frames[idx].name); }
+    else if(peekSrc){ view.src = peekSrc; peekSrc = null; }
+  } else {                                     // annotate/edit: mask is on the canvas
+    maskCanvas.style.visibility = on ? 'hidden' : 'visible';
+  }
+}
+
+document.getElementById('maskmap').addEventListener('click', (e) => {
+  if(mode !== 'review' || !frames.length) return;
+  const r = e.currentTarget.getBoundingClientRect();
+  gotoIdx(Math.round((e.clientX - r.left) / r.width * (frames.length - 1)));
+});
+
+// ───────────────────────── zoom & pan ─────────────────────────
+const viewport = document.getElementById('viewport');
+let zoom = 1, panX = 0, panY = 0;
+function applyTransform(){
+  const W = viewport.clientWidth, H = viewport.clientHeight;
+  panX = Math.min(0, Math.max(W * (1 - zoom), panX));   // keep image covering the viewport
+  panY = Math.min(0, Math.max(H * (1 - zoom), panY));
+  const t = `translate(${panX}px, ${panY}px) scale(${zoom})`;
+  view.style.transform = t; maskCanvas.style.transform = t;   // mask layer tracks the image
+  edgeImg.style.transform = t;                                // depth-edge layer too
+  sceneImg.style.transform = t;                               // scene-view layer too
+  armImg.style.transform = t;
+}
+function resetView(){ zoom = 1; panX = 0; panY = 0; applyTransform(); }
+viewport.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const r = viewport.getBoundingClientRect();
+  const cx = e.clientX - r.left, cy = e.clientY - r.top;     // zoom toward the cursor
+  const nz = Math.min(20, Math.max(1, zoom * (e.deltaY < 0 ? 1.2 : 1 / 1.2)));
+  panX = cx - (cx - panX) * (nz / zoom);
+  panY = cy - (cy - panY) * (nz / zoom);
+  zoom = nz; applyTransform();
+}, {passive: false});
+
+// brush-size cursor preview (shows where/how big you'll paint before you click)
+viewport.addEventListener('mousemove', (e) => {
+  const c = document.getElementById('brushCursor');
+  const painty = (tool === 'brush' || tool === 'erase' || tool === 'smart' || tool === 'line' || tool === 'linefill' || tool === 'geombrush' || tool === 'eline' || tool === 'efill');
+  if(!maskEditable() || !painty){ c.style.display = 'none'; return; }
+  const vr = viewport.getBoundingClientRect(), r = view.getBoundingClientRect();
+  const scale = r.width / (view.naturalWidth || r.width);
+  const d = (tool === 'smart') ? 16 : 2 * brushSize * scale;   // smart = small pointer dot
+  c.style.width = d + 'px'; c.style.height = d + 'px';
+  c.style.left = (e.clientX - vr.left) + 'px'; c.style.top = (e.clientY - vr.top) + 'px';
+  c.style.borderColor = (tool === 'erase' || tool === 'eline' || tool === 'efill' || (tool === 'smart' && e.shiftKey))
+      ? 'rgba(255,80,80,.9)'
+      : tool === 'geombrush' ? 'rgba(160,80,255,.9)'   // purple = geometry fix
+      : 'rgba(0,200,255,.9)';                          // red = removing/exclude, cyan = adding
+  c.style.display = 'block';
+});
+viewport.addEventListener('mouseleave', () => { document.getElementById('brushCursor').style.display = 'none'; });
+
+// ───────────────────────── mask canvas (brush / eraser / SAM) ─────────────────────────
+function setTool(t){
+  tool = t;
+  document.querySelectorAll('.toolbtn').forEach(b => b.classList.toggle('active', b.dataset.tool === t));
+  if(t !== 'point'){ pos = []; neg = []; }                  // brushing starts a fresh SAM interaction
+  endLine();                                                // switching tools finishes any open line
+  view.style.cursor = (t === 'point' || t === 'msam') ? 'crosshair' : 'cell';
+}
+function ensureMaskSize(){
+  if(view.naturalWidth && (maskCanvas.width !== view.naturalWidth || maskCanvas.height !== view.naturalHeight)){
+    maskCanvas.width = view.naturalWidth; maskCanvas.height = view.naturalHeight;
+  }
+}
+function clearMaskCanvas(){ ensureMaskSize(); maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height); resetUndo(); }
+// ── undo history (ctrl-z): snapshot the mask canvas before each mutating move ──
+function resetUndo(){ undoStack = []; }
+function pushUndo(){
+  ensureMaskSize();
+  try { undoStack.push(maskCtx.getImageData(0, 0, maskCanvas.width, maskCanvas.height)); }
+  catch(err){ return; }                                   // e.g. canvas not yet sized
+  if(undoStack.length > 20) undoStack.shift();            // cap memory (full-res snapshots)
+}
+function undoMask(){
+  if(!maskEditable() || !undoStack.length) return;
+  const s = undoStack.pop();
+  ensureMaskSize();
+  if(s.width !== maskCanvas.width || s.height !== maskCanvas.height) return;   // frame changed
+  maskCtx.putImageData(s, 0, 0);
+}
+function showMask(on){ maskCanvas.style.display = on ? 'block' : 'none'; }
+function loadMaskFromUrl(url){
+  const im = new Image();
+  im.onload = () => { ensureMaskSize(); maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+                      maskCtx.drawImage(im, 0, 0, maskCanvas.width, maskCanvas.height); };
+  im.src = url;
+}
+// multi-SAM stamp: draw WITHOUT clearing — union by default, subtract carves
+// (the PNG's alpha covers only the mask, so destination-out erases exactly it)
+function stampMaskFromUrl(url, subtract){
+  const im = new Image();
+  im.onload = () => { ensureMaskSize();
+    maskCtx.globalCompositeOperation = subtract ? 'destination-out' : 'source-over';
+    maskCtx.drawImage(im, 0, 0, maskCanvas.width, maskCanvas.height);
+    maskCtx.globalCompositeOperation = 'source-over'; };
+  im.src = url;
+}
+function setFrame(src, afterLoad){ view.onload = () => { ensureMaskSize(); if(afterLoad) afterLoad(); }; view.src = src; }
+function evToNatural(e){
+  const r = view.getBoundingClientRect();           // reflects zoom/pan -> full-res coords
+  return [(e.clientX - r.left) * (view.naturalWidth / r.width),
+          (e.clientY - r.top) * (view.naturalHeight / r.height)];
+}
+function inFrame(x, y){ return x >= 0 && y >= 0 && x < view.naturalWidth && y < view.naturalHeight; }
+
+// ── smart brush: collect rough scribble points; SAM refines on release ──
+function addScribble(e){
+  const [x, y] = evToNatural(e);
+  if(!inFrame(x, y)) return;                 // SAM prompts must be in-frame
+  (smartNegStroke ? smartNeg : smartPos).push([x, y]);
+}
+async function refineSmart(){
+  if(!smartPos.length && !smartNeg.length) return;
+  const st = document.getElementById('clickStatus');
+  st.textContent = 'smart brush: refining …';
+  const state = (mode === 'review') ? reviewState : curState();
+  const body = {state, frame: frameName(idx), pos: smartPos, neg: smartNeg,
+                mask: maskCanvas.toDataURL('image/png')};
+  smartPos = []; smartNeg = [];
+  const r = await fetch('/api/refine', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  const d = await r.json();
+  if(d.error){ st.textContent = d.error; return; }
+  pushUndo();                                          // ctrl-z reverts the refine
+  loadMaskFromUrl(d.mask);
+  st.textContent = `smart brush: refined · ${d.px} px`;
+}
+
+function paintAt(e){
+  const [x, y] = evToNatural(e);
+  if(tool === 'erase'){ maskCtx.globalCompositeOperation = 'destination-out'; maskCtx.fillStyle = maskCtx.strokeStyle = '#000'; }
+  else { maskCtx.globalCompositeOperation = 'source-over'; maskCtx.fillStyle = maskCtx.strokeStyle = 'rgba(255,0,0,0.51)'; }
+  maskCtx.lineCap = 'round';
+  maskCtx.beginPath(); maskCtx.arc(x, y, brushSize, 0, 7); maskCtx.fill();
+  if(lastPt){ maskCtx.lineWidth = 2 * brushSize; maskCtx.beginPath(); maskCtx.moveTo(lastPt[0], lastPt[1]); maskCtx.lineTo(x, y); maskCtx.stroke(); }
+  lastPt = [x, y];
+  maskCtx.globalCompositeOperation = 'source-over';
+}
+
+let down = false, moved = false, sx = 0, sy = 0, spx = 0, spy = 0;
+// listen on the VIEWPORT (not the image): a huge brush can start OUTSIDE the frame
+// and only its overlap paints — the canvas clips out-of-bounds strokes naturally
+viewport.addEventListener('mousedown', (e) => {
+  if(e.button !== 0 && e.button !== 1) return;
+  if(e.button === 0 && sceneView > 0){               // scene view: clicks IDENTIFY, never paint
+    gesture = 'scene'; down = true; moved = false; sx = e.clientX; sy = e.clientY;
+    spx = panX; spy = panY;
+  } else if(e.button === 0 && tool === 'smart' && maskEditable()){   // smart brush: collect scribble
+    if(!view.complete){ document.getElementById('clickStatus').textContent =
+      'frame still loading — smart brush would use a stale mask as prior'; return; }
+    ensureMaskSize();
+    gesture = 'smart'; down = true; smartNegStroke = e.shiftKey; smartPos = []; smartNeg = []; addScribble(e);
+  } else if(e.button === 0 && tool === 'geombrush' && maskEditable()){  // geom brush: local geometry fix
+    if(mode !== 'review' || !editing){ document.getElementById('clickStatus').textContent =
+      'geom brush works in review → edit mode (x), on an object with a stored cluster'; return; }
+    if(!view.complete) return;
+    gesture = 'geombrush'; down = true; ensureMaskSize(); pushUndo(); gbPts = []; gbFeedback(e);
+  } else if(e.button === 0 && (tool === 'line' || tool === 'linefill' || tool === 'eline' || tool === 'efill') && maskEditable()){  // click tools
+    gesture = tool; down = true; moved = false; sx = e.clientX; sy = e.clientY;
+  } else if(e.button === 0 && (tool === 'brush' || tool === 'erase') && maskEditable()){
+    gesture = 'paint'; down = true; lastPt = null; ensureMaskSize(); pushUndo(); paintAt(e);
+  } else {                                                            // middle, or point/pan
+    gesture = (e.button === 0 && (tool === 'point' || tool === 'msam') && maskEditable()) ? 'point' : 'pan';
+    down = true; moved = false; sx = e.clientX; sy = e.clientY; spx = panX; spy = panY;
+    if(e.button === 1) e.preventDefault();
+  }
+});
+window.addEventListener('mousemove', (e) => {
+  if(!down) return;
+  if(gesture === 'paint'){ paintAt(e); return; }
+  if(gesture === 'smart'){ addScribble(e); return; }
+  if(gesture === 'geombrush'){ gbFeedback(e); return; }
+  if(gesture === 'line' || gesture === 'linefill' || gesture === 'eline' || gesture === 'efill'){ if(Math.hypot(e.clientX - sx, e.clientY - sy) > 4) moved = true; return; }
+  if(gesture === 'scene'){ const dx = e.clientX - sx, dy = e.clientY - sy;
+    if(!moved && Math.hypot(dx, dy) > 4) moved = true;
+    if(moved){ panX = spx + dx; panY = spy + dy; applyTransform(); } return; }
+  const dx = e.clientX - sx, dy = e.clientY - sy;
+  if(!moved && Math.hypot(dx, dy) > 4) moved = true;
+  if(moved){ panX = spx + dx; panY = spy + dy; applyTransform(); }
+});
+window.addEventListener('mouseup', (e) => {
+  if(!down) return;
+  down = false;
+  if(gesture === 'scene' && !moved) whoIsHereClick(e);
+  if(gesture === 'point' && !moved) handleClick(e);
+  if(gesture === 'smart') refineSmart();
+  if(gesture === 'line' && !moved) doLine(e);         // line = stroke only, no auto-fill
+  if(gesture === 'linefill' && !moved && doLine(e)) autoFillEnclosed();  // closing segment fills the loop
+  if(gesture === 'eline' && !moved) doLine(e, true);  // erase line = square-edged cut only
+  if(gesture === 'efill' && !moved && doLine(e, true)) autoDropIsolated();  // cut splits mask -> drop islands
+  if(gesture === 'paint' && tool === 'brush') autoFillEnclosed();
+  if(gesture === 'geombrush') applyGeomBrush();
+  gesture = null; lastPt = null;
+});
+
+// ── geom brush: live purple feedback while stroking; on release the stroked
+// region — and ONLY that region — is replaced by the geometry(+SAM) mask ──
+function gbFeedback(e){
+  const [x, y] = evToNatural(e);
+  gbPts.push([x, y]);
+  maskCtx.globalCompositeOperation = 'source-over';
+  maskCtx.strokeStyle = maskCtx.fillStyle = 'rgba(160,80,255,0.35)';
+  maskCtx.lineCap = 'round';
+  maskCtx.beginPath(); maskCtx.arc(x, y, brushSize, 0, 7); maskCtx.fill();
+  if(gbPts.length > 1){
+    const p = gbPts[gbPts.length - 2];
+    maskCtx.lineWidth = 2 * brushSize;
+    maskCtx.beginPath(); maskCtx.moveTo(p[0], p[1]); maskCtx.lineTo(x, y); maskCtx.stroke();
+  }
+}
+async function fetchGeomMask(){
+  const name = frames[idx].name;
+  if(geomCache.obj === reviewObj && geomCache.frame === name && geomCache.img) return geomCache;
+  const st = document.getElementById('clickStatus');
+  st.textContent = 'geom brush: computing geometry mask … (first use per state loads the mesh, ~1 min)';
+  let d;
+  try{
+    const r = await fetch('/api/geom_mask', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({id: reviewObj, frame: name})});
+    d = await r.json();
+  } catch(err){ st.textContent = 'geom brush: server did not answer with JSON — restart the GUI?'; return null; }
+  if(d.error){ st.textContent = 'geom brush: ' + d.error; return null; }
+  const img = new Image();
+  await new Promise(res => { img.onload = res; img.src = d.mask; });
+  geomCache = {obj: reviewObj, frame: name, img, mode: d.mode || 'geom'};
+  return geomCache;
+}
+async function applyGeomBrush(){
+  const before = undoStack[undoStack.length - 1];
+  const pts = gbPts; gbPts = [];
+  if(before && before.width === maskCanvas.width) maskCtx.putImageData(before, 0, 0);  // wipe feedback
+  if(!pts.length) return;
+  const g = await fetchGeomMask();
+  if(!g) return;                                    // error already shown; canvas restored
+  const W = maskCanvas.width, H = maskCanvas.height;
+  const rc = document.createElement('canvas'); rc.width = W; rc.height = H;   // stroke region R
+  const rg = rc.getContext('2d');
+  rg.lineCap = rg.lineJoin = 'round'; rg.strokeStyle = rg.fillStyle = '#fff'; rg.lineWidth = 2 * brushSize;
+  rg.beginPath(); rg.arc(pts[0][0], pts[0][1], brushSize, 0, 7); rg.fill();
+  for(let i = 1; i < pts.length; i++){
+    rg.beginPath(); rg.moveTo(pts[i-1][0], pts[i-1][1]); rg.lineTo(pts[i][0], pts[i][1]); rg.stroke();
+    rg.beginPath(); rg.arc(pts[i][0], pts[i][1], brushSize, 0, 7); rg.fill();
+  }
+  const tc = document.createElement('canvas'); tc.width = W; tc.height = H;   // geom ∩ R
+  const tg = tc.getContext('2d');
+  tg.drawImage(g.img, 0, 0, W, H);
+  tg.globalCompositeOperation = 'destination-in';
+  tg.drawImage(rc, 0, 0);
+  maskCtx.globalCompositeOperation = 'destination-out';   // clear R on the working mask
+  maskCtx.drawImage(rc, 0, 0);
+  maskCtx.globalCompositeOperation = 'source-over';       // paste geometry's answer into R
+  maskCtx.drawImage(tc, 0, 0);
+  document.getElementById('clickStatus').textContent =
+    `geom brush [${g.mode}]: stroked region replaced by geometry — ctrl-z reverts`;
+}
+
+// brush auto-fill: when a stroke closes off an unpainted area — against the existing
+// mask, or by looping on itself — fill that area. Compares border-reachability of
+// unpainted pixels before vs after the stroke, so only areas THIS stroke sealed get
+// filled; a pre-existing enclosed hole (deliberately unmasked see-through gap) is
+// never touched. Mutates the canvas after the stroke's mousedown snapshot, so one
+// ctrl-z reverts stroke + fill together.
+function autoFillEnclosed(){
+  const W = maskCanvas.width, H = maskCanvas.height;
+  const before = undoStack[undoStack.length - 1];
+  if(!before || before.width !== W || before.height !== H) return;
+  const im = maskCtx.getImageData(0, 0, W, H), a = im.data;
+  const openBefore = borderReach(before.data, W, H);
+  const openAfter = borderReach(a, W, H);
+  let n = 0;
+  for(let p = 0; p < W * H; p++){
+    if(a[p * 4 + 3] === 0 && openBefore[p] && !openAfter[p]){
+      a[p * 4] = 255; a[p * 4 + 1] = 0; a[p * 4 + 2] = 0; a[p * 4 + 3] = 130; n++;
+    }
+  }
+  if(!n) return;
+  maskCtx.putImageData(im, 0, 0);
+  document.getElementById('clickStatus').textContent = `brush: auto-filled ${n.toLocaleString()} px`;
+}
+// flood from every border pixel across unpainted (alpha=0) pixels; returns a
+// per-pixel map of "reachable from the border" (0 = painted or enclosed).
+function borderReach(a, W, H){
+  const open = new Uint8Array(W * H), stack = [];
+  const push = (p) => { if(!open[p] && a[p * 4 + 3] === 0){ open[p] = 1; stack.push(p); } };
+  for(let x = 0; x < W; x++){ push(x); push((H - 1) * W + x); }
+  for(let y = 0; y < H; y++){ push(y * W); push(y * W + W - 1); }
+  while(stack.length){
+    const p = stack.pop(), x = p % W;
+    if(x > 0) push(p - 1);
+    if(x < W - 1) push(p + 1);
+    if(p >= W) push(p - W);
+    if(p < W * (H - 1)) push(p + W);
+  }
+  return open;
+}
+
+// line tool: 1st click sets the start; each next click fills a thick straight
+// stroke (brush width) from the previous point, chaining into a polyline.
+// erase=true cuts instead (square caps: a crisp rectangular carve, no round bulges).
+function doLine(e, erase){
+  let [x, y] = evToNatural(e);
+  x = Math.max(0, Math.min(view.naturalWidth - 1, x));    // clamp: line may be aimed off-frame
+  y = Math.max(0, Math.min(view.naturalHeight - 1, y));
+  ensureMaskSize();
+  if(lineStart === null){ lineStart = [x, y];
+    document.getElementById('clickStatus').textContent =
+      (erase ? 'erase line' : 'line') + ': click the end point (chains; Esc/Enter finishes)'; return false; }
+  pushUndo();
+  if(erase){ maskCtx.globalCompositeOperation = 'destination-out';
+             maskCtx.strokeStyle = '#000'; }
+  else { maskCtx.globalCompositeOperation = 'source-over';
+         maskCtx.strokeStyle = 'rgba(255,0,0,0.51)'; }
+  maskCtx.lineCap = 'round';
+  maskCtx.lineWidth = 2 * brushSize;
+  maskCtx.beginPath(); maskCtx.moveTo(lineStart[0], lineStart[1]); maskCtx.lineTo(x, y); maskCtx.stroke();
+  maskCtx.globalCompositeOperation = 'source-over';
+  lineStart = [x, y];   // chain
+  return true;          // painted a segment -> mouseup runs the auto-fill/drop check
+}
+function endLine(){ lineStart = null; }
+
+// erase-fill companion of autoFillEnclosed: when THIS cut splits a mask
+// component, keep the largest piece and delete the rest — carve off the
+// unnecessary part and the island vanishes. An erase stroke only removes
+// pixels, so every surviving pixel keeps its pre-stroke component identity:
+// label components before and after, group after-pieces by their before-label,
+// and erase every piece in a group except the biggest. Pre-existing SEPARATE
+// components (an object split by an occluder) are separate groups — untouched.
+// Mutates the canvas after doLine's pushUndo, so ctrl-z reverts cut + deletion.
+function autoDropIsolated(){
+  const W = maskCanvas.width, H = maskCanvas.height;
+  const before = undoStack[undoStack.length - 1];
+  if(!before || before.width !== W || before.height !== H) return;
+  const im = maskCtx.getImageData(0, 0, W, H), a = im.data;
+  const labBefore = labelComponents(before.data, W, H);
+  const labAfter = labelComponents(a, W, H);
+  // per after-piece: size + owning before-component (uniform across the piece)
+  const size = new Map(), owner = new Map();
+  for(let p = 0; p < W * H; p++){
+    const l = labAfter.lab[p];
+    if(!l) continue;
+    size.set(l, (size.get(l) || 0) + 1);
+    if(!owner.has(l)) owner.set(l, labBefore.lab[p]);
+  }
+  const keep = new Map();                      // before-label -> biggest after-piece
+  for(const [l, s] of size){
+    const o = owner.get(l);
+    if(!keep.has(o) || s > size.get(keep.get(o))) keep.set(o, l);
+  }
+  let n = 0, k = 0;
+  const dropped = new Set();
+  for(const [l] of size){
+    if(keep.get(owner.get(l)) !== l){ dropped.add(l); k++; }
+  }
+  if(!dropped.size) return;
+  for(let p = 0; p < W * H; p++){
+    if(dropped.has(labAfter.lab[p])){ a[p * 4 + 3] = 0; n++; }
+  }
+  maskCtx.putImageData(im, 0, 0);
+  document.getElementById('clickStatus').textContent =
+    `erase fill: dropped ${k} island(s), ${n.toLocaleString()} px`;
+}
+// 4-connected component labeling over painted (alpha>0) pixels
+function labelComponents(a, W, H){
+  const lab = new Int32Array(W * H);
+  let next = 0;
+  const stack = [];
+  for(let s = 0; s < W * H; s++){
+    if(lab[s] || a[s * 4 + 3] === 0) continue;
+    lab[s] = ++next; stack.push(s);
+    while(stack.length){
+      const p = stack.pop(), x = p % W;
+      const tryP = (q) => { if(!lab[q] && a[q * 4 + 3] !== 0){ lab[q] = next; stack.push(q); } };
+      if(x > 0) tryP(p - 1);
+      if(x < W - 1) tryP(p + 1);
+      if(p >= W) tryP(p - W);
+      if(p < W * (H - 1)) tryP(p + W);
+    }
+  }
+  return {lab, count: next};
+}
+
+// ───────────────────────── click to segment (SAM) ─────────────────────────
+async function handleClick(e){
+  if(!frames.length) return;
+  if(mode === 'review' && !editing) return;       // review browse = read-only
+  const [x, y] = evToNatural(e);
+  if(!inFrame(x, y)) return;                      // SAM point prompts must be in-frame
+  if(tool === 'msam'){
+    // multi-SAM: every click is its OWN fresh SAM interaction (one positive
+    // point, no accumulated context — so a second ball can't stretch the first
+    // ball's mask into an overflow bridge) and the result UNIONS onto the
+    // canvas. shift-click subtracts (un-sam a stamped thing). Many separate
+    // things become ONE object at save time — 'blob1' is legal GT.
+    const url = (mode === 'review') ? '/api/edit_click' : '/api/click';
+    const body = (mode === 'review')
+      ? {id: reviewObj, frame: frames[idx].name, points: [[x, y]], neg: []}
+      : {state: curState(), frame: frameName(idx), points: [[x, y]], neg: []};
+    const resp = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    const d = await resp.json();
+    if(d.error){ document.getElementById('clickStatus').textContent = d.error; return; }
+    pushUndo();                                   // ctrl-z reverts THIS stamp only
+    stampMaskFromUrl(d.mask, e.shiftKey);
+    document.getElementById('clickStatus').textContent =
+      `multi-SAM: ${e.shiftKey ? 'subtracted' : 'stamped'} ${d.px} px (score ${d.score.toFixed(3)}) — keep clicking; each click is independent`;
+    return;
+  }
+  (e.shiftKey ? neg : pos).push([x, y]);
+  if(pos.length === 0) return;
+  const url = (mode === 'review') ? '/api/edit_click' : '/api/click';
+  const body = (mode === 'review')
+    ? {id: reviewObj, frame: frames[idx].name, points: pos, neg: neg}
+    : {state: curState(), frame: frameName(idx), points: pos, neg: neg};
+  const resp = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  const d = await resp.json();
+  if(d.error){ document.getElementById('clickStatus').textContent = d.error; return; }
+  pushUndo();                                       // let ctrl-z revert to the pre-SAM mask
+  loadMaskFromUrl(d.mask);                          // draw the SAM mask into the editable canvas
+  document.getElementById('clickStatus').textContent = `mask ${d.px} px · score ${d.score.toFixed(3)} · ${pos.length}+ / ${neg.length}-`;
+}
+
+// ───────── objects sidebar ─────────
+async function addObject(){
+  // a scene-view selection (cyan) lives in the arm overlay, not the mask canvas —
+  // accept it here too so 'add object' works straight from the u view
+  if(sceneArm && sceneArm.type === 'newobj'){
+    const id0 = document.getElementById('oid').value.trim();
+    if(!id0){ alert('give the object an id first (or press n to be prompted)'); return; }
+    const r0 = await fetch('/api/add_object', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({id: id0, label: document.getElementById('olabel').value,
+        deformability: document.getElementById('odeform').value,
+        state: sceneArm.state, frame: sceneArm.frame, points: [sceneArm.point],
+        mask: sceneArm.mask})});
+    const d0 = await r0.json();
+    if(d0.error){ alert(d0.error); return; }
+    const key0 = id0 + '__' + sceneArm.state;
+    clearSceneArm();
+    document.getElementById('oid').value=''; document.getElementById('olabel').value='';
+    await refreshObjects();
+    sceneView = 0; updateSceneView();
+    openReview(key0, frameName(idx));
+    return;
+  }
+  if(mode !== 'annotate'){ alert('switch to annotate (← back to annotate) to add an object'); return; }
+  const id = document.getElementById('oid').value;
+  const body = { id, label: document.getElementById('olabel').value,
+    deformability: document.getElementById('odeform').value,
+    state: curState(), frame: frameName(idx), points: pos,
+    mask: maskCanvas.toDataURL('image/png') };          // SAM + brush/eraser result
+  const r = await fetch('/api/add_object', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  const d = await r.json();
+  if(d.error){ alert(d.error); return; }
+  document.getElementById('oid').value=''; document.getElementById('olabel').value='';
+  if(mode==='annotate') showFrame();
+  refreshObjects();
+}
+
+async function addSeed(key){
+  if(mode !== 'annotate'){ alert('switch to annotate (← back to annotate) to add a seed frame'); return; }
+  if(!guardDone(key)) return;
+  const body = { id: key, state: curState(), frame: frameName(idx),
+    points: pos, mask: maskCanvas.toDataURL('image/png') };
+  const r = await fetch('/api/add_seed', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  const d = await r.json();
+  if(d.error){ alert(d.error); return; }
+  document.getElementById('st_'+key).textContent = `${d.n_seeds} seed frames — propagate when ready`;
+  showFrame(); refreshObjects();
+}
+
+let objsCache = {};          // last-fetched objects, for the done/reviewed confirmation
+async function refreshObjects(){
+  const d = await (await fetch('/api/objects')).json();
+  objsCache = d.objects;
+  renderObjects(d.objects);
+}
+// moved pairs share a stable color, derived from the instance id (same across refreshes)
+const PAIR_COLORS = ['#e6194b','#3cb44b','#4363d8','#f58231','#911eb4','#01875f','#9a6324','#008080'];
+function pairColor(iid){ let h = 0; for(const ch of iid) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+                         return PAIR_COLORS[h % PAIR_COLORS.length]; }
+
+// ── objects list: units ──────────────────────────────────────────────────────
+// Every non-ghost object belongs to its instance id; 2+ members sharing an
+// instance = a GROUP (one physical object: a moved pre/post pair, or several
+// part-annotations like a curtain split into left/right). A group renders as
+// ONE container card (pre | post member columns) so members never drift apart
+// in the ranking and asymmetric groups (1 pre vs 2 post) are visible at a glance.
+let groupUnits = {};   // iid -> [keys]  (rebuilt each render; drives group/ungroup)
+let groupSel = [];     // ordered iid selection for the 'group selected' button
+
+function renderObjects(objs){
+  const a = document.activeElement;                   // never clobber in-progress typing
+  if(a && a.classList && a.classList.contains('ident')){ renderDeferred = true; return; }
+  const box = document.getElementById('objects'); box.innerHTML='';
+  groupUnits = {};
+  const byInst = {};
+  Object.entries(objs).forEach(([k, o]) => {
+    const iid = o.ghost ? 'ghost:' + k : (o.instance || o.id);
+    (byInst[iid] = byInst[iid] || []).push([k, o]);
+  });
+  const units = Object.entries(byInst).map(([iid, members]) => ({
+    iid, members: members.sort((a, b) => a[0] < b[0] ? -1 : 1),
+    rank: Math.max(...members.map(([, o]) => o.n_masks || 0)),
+  }));
+  units.sort((a, b) => (b.rank - a.rank) || (a.iid < b.iid ? -1 : 1));
+  units.forEach(u => {
+    groupUnits[u.iid] = u.members.map(([k]) => k);
+    box.appendChild(u.members.length === 1
+      ? objCard(u.members[0][0], u.members[0][1], false)
+      : groupCard(u));
+  });
+  groupSel = groupSel.filter(iid => groupUnits[iid]);   // drop stale selections
+  updateGroupBar();
+  highlightReviewing();
+}
+
+// one object card; member=true renders the compact in-group variant (the group
+// header owns instance id / label / change type / deformability)
+function objCard(key, o, member){
+  const finished = !!o.done;   // done ⇒ collapse working controls; uncheck to get them back
+  const div = document.createElement('div'); div.dataset.oid = key;
+  div.className = 'obj' + (o.done ? ' f-done' : '') + (o.reviewed ? ' f-reviewed' : '');
+  const flags = `<span class="flags">
+    <label title="annotator: masks for this object are finished"><input type="checkbox"
+      ${o.done ? 'checked' : ''} onchange="setFlag('${key}','done',this.checked,this)"> done</label>
+    <label title="second person: independently verified this object's masks"><input type="checkbox"
+      ${o.reviewed ? 'checked' : ''} onchange="setFlag('${key}','reviewed',this.checked,this)"> reviewed</label>
+  </span>`;
+  const masks = o.n_masks ? `<span class="pill">${o.n_masks} masks</span>` : '';
+  const seeds = o.n_seeds > 1 ? `<span class="pill">${o.n_seeds} seeds</span>` : '';
+  const cd = o.source === 'cloud_diff' ? '<span class="pill">cloud-diff</span>' : '';
+  const seedProp = (o.ghost || finished) ? '' : `
+    <button onclick="addSeed('${key}')" title="add the current frame as another seed view — for cloud-diff objects too: seeds + your hand masks + the diff cluster union into one completed 3D object">+ seed</button>
+    <button onclick="propagate('${key}')" title="re-seed from the completed geometry (cluster + hand masks + seeds) and re-run per-frame SAM on geom/empty frames only — hand, propagated and remasked frames survive">propagate</button>
+    <button onclick="rebuild3d('${key}')" title="rebuild from 3D consensus: every existing mask votes at 3D addresses, points ≥60% of the views agree on are re-rendered into EVERY frame — fixes jitter, misses and inconsistent overflow at once (preview → apply)">rebuild 3D</button>`;
+  const iid = (o.instance || o.id);
+  const remaskBtn = (o.ghost || finished) ? '' : `<button onclick="remask('${key}')"
+    title="re-segment by concept from the label — pulls in thin legs/base the click-mask drops; keeps the current mask on frames it can't match">label → remask</button>`;
+  const metaRow = member ? (remaskBtn && `<div class="row">${remaskBtn}</div>`)
+    : (o.ghost ? '' : `
+    <div class="row">
+      <input id="iid_${key}" class="ident" value="${iid.replace(/"/g, '&quot;')}" placeholder="id" style="width:76px"
+        title="objects sharing the SAME id are one physical object — Enter or click away saves (green flash = saved)"
+        oninput="this.classList.add('dirty')" onkeydown="identKey(event)" onblur="identSave('${key}')">
+      <input id="lbl_${key}" class="ident" value="${(o.label || '').replace(/"/g, '&quot;')}" placeholder="label e.g. chair" style="width:96px"
+        title="label — Enter or click away saves (green flash = saved)"
+        oninput="this.classList.add('dirty')" onkeydown="identKey(event)" onblur="identSave('${key}')">
+      ${finished ? '' : remaskBtn}
+    </div>`);
+  const deformUI = (o.ghost || finished) ? o.deformability : `<select style="font-size:11px;padding:0"
+      onchange="setDeform('${key}', this.value)"
+      title="editable — kept in sync across the whole group">
+      <option value="rigid" ${o.deformability === 'rigid' ? 'selected' : ''}>rigid</option>
+      <option value="deformable" ${o.deformability === 'deformable' ? 'selected' : ''}>deformable</option>
+    </select>`;
+  const metaLine = member ? '' : `<div class="meta">${o.change_type} · ${deformUI}</div>`;
+  const title = member ? o.id : `${o.ghost ? '👻 ' : ''}${iid} · ${o.state}`;
+  div.innerHTML = `${flags}<h4 ondblclick="editIdentFrom(this,'${key}')"
+    title="the bold name is the object's instance id (+ state) — double-click to edit it; the label box below is the semantic name">${title} ${cd} ${seeds} ${masks}</h4>
+    ${metaLine}${metaRow}${seedProp}
+    <button onclick="openReview('${key}')" ${o.n_masks ? '' : 'disabled'}>review / edit</button>
+    ${finished ? '' : `<button onclick="deleteObject('${key}')" class="del" title="remove this object — its seeds/masks are moved to .trash (recoverable on disk)">delete</button>
+    <button onclick="dismissObject('${key}')" class="del" style="background:#2a7;color:#fff"
+      title="certify this object's region as NO-CHANGE: masks are removed (recoverable) and its geometry turns GREEN in the scene view — for proposals that definitely did not change">dismiss ⇢ green</button>`}
+    <span class="status" id="st_${key}"></span>
+    <div id="res_${key}"></div>`;
+  if(!member && !o.ghost) attachSelBox(div.querySelector('h4'), iid);
+  return div;
+}
+
+function groupCard(u){
+  const iid = u.iid, keys = u.members.map(([k]) => k);
+  const col = pairColor(iid);
+  const first = u.members[0][1];
+  const label = u.members.map(([, o]) => o.label).find(l => l) || '';
+  const pre = u.members.filter(([, o]) => o.state === 'pre');
+  const post = u.members.filter(([, o]) => o.state === 'post');
+  const div = document.createElement('div');
+  div.className = 'grp';
+  div.style.boxShadow = 'inset 4px 0 0 ' + col;
+  const allDone = u.members.every(([, o]) => o.done);   // done ⇒ masks/structure locked,
+  const head = document.createElement('div'); head.className = 'grp-head';   // identity stays editable
+  head.innerHTML = `
+    <input class="giid ident" value="${iid.replace(/"/g, '&quot;')}" style="width:86px"
+      title="group id — the export's object id. Enter or click away saves to EVERY member (green flash = saved)">
+    <input class="glbl ident" value="${label.replace(/"/g, '&quot;')}" placeholder="label e.g. curtain" style="width:96px"
+      title="group label — Enter or click away saves to EVERY member (green flash = saved)">
+    <span class="pill" style="background:${col};color:#fff" title="derived from the group: any pre + any post = moved">${first.change_type}</span>
+    <span class="pill">${pre.length} pre · ${post.length} post</span>` + (allDone ? `
+    <span class="pill">${first.deformability}</span>` : `
+    <select class="gdeform" style="font-size:11px;padding:0" title="one physical object — applies to every member">
+      <option value="rigid" ${first.deformability === 'rigid' ? 'selected' : ''}>rigid</option>
+      <option value="deformable" ${first.deformability === 'deformable' ? 'selected' : ''}>deformable</option>
+    </select>
+    <button class="gungroup" title="dissolve the group — each member's id reverts to its own; masks untouched">ungroup</button>`);
+  for(const el of [head.querySelector('.giid'), head.querySelector('.glbl')]){
+    el.oninput = () => el.classList.add('dirty');
+    el.onkeydown = identKey;
+    el.onblur = () => groupIdentSave(head, keys);
+  }
+  if(!allDone){
+    attachSelBox(head, iid);
+    head.querySelector('.gdeform').onchange = (e) => setDeform(keys[0], e.target.value);  // server syncs the group
+    head.querySelector('.gungroup').onclick = () => unGroup(iid, keys.length);
+  }
+  const cols = document.createElement('div'); cols.className = 'grp-cols';
+  [['PRE', pre], ['POST', post]].forEach(([tag, members]) => {
+    const c = document.createElement('div'); c.className = 'grp-col';
+    c.innerHTML = `<div class="col-tag">${tag} (${members.length})</div>`;
+    members.forEach(([k, o]) => c.appendChild(objCard(k, o, true)));
+    if(!members.length) c.innerHTML += `<div class="col-tag">—</div>`;
+    cols.appendChild(c);
+  });
+  div.append(head, cols);
+  return div;
+}
+
+// ☢ nuke: wipe the whole workspace (moved aside on disk, recoverable by hand).
+// The typed 'proceed' is forwarded and re-checked SERVER-side — nothing else
+// can trigger the endpoint.
+async function nukeWorkspace(){
+  const t = prompt("☢ NUKE THIS WORKSPACE ☢\n\nEvery object, mask, seed, frontier and " +
+                   "snapshot in this workspace will be moved aside on disk and the " +
+                   "object list starts blank.\n\nType 'proceed' to nuke:");
+  if((t || '').trim().toLowerCase() !== 'proceed') return;
+  const r = await fetch('/api/nuke_workspace', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify({confirm: t.trim()})});
+  const d = await r.json();
+  if(d.error){ alert(d.error); return; }
+  clearPending();
+  if(mode === 'review') exitReview();
+  document.getElementById('nukeStatus').textContent =
+    'nuked — old workspace moved to ' + d.moved_to;
+  refreshObjects();
+}
+
+async function dismissObject(key){
+  const t = prompt('DISMISS ' + key + ' as NO-CHANGE?\n\nIts masks are removed (recoverable in .trash) and its region is certified UNCHANGED (green) for the export.\n\n⚠ Review the WHOLE sequence first: dismissal applies everywhere this object appears.\n\nType g to confirm:');
+  if((t || '').trim().toLowerCase() !== 'g') return;
+  const r = await fetch('/api/dismiss_object', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({id: key})});
+  const d = await r.json();
+  if(d.error){ alert(d.error); return; }
+  if(reviewObj === key) exitReview();
+  document.getElementById('clickStatus').textContent = 'dismissed ' + key +
+    (d.greened ? ' — region now green' : ' (no 3D cluster: region stays purple/uncoloured)');
+  refreshObjects(); if(sceneView) updateSceneView();
+}
+async function computeBlobs(){
+  const st = document.getElementById('blobStatus');
+  st.textContent = 'clustering unclaimed purple …';
+  const r = await fetch('/api/purple_blobs', {method:'POST', headers:{'Content-Type':'application/json'}, body: '{}'});
+  const d = await r.json();
+  if(d.error){ st.textContent = d.error; return; }
+  st.textContent = d.blobs.length + ' unresolved blob(s)';
+  renderBlobs(d.blobs);
+}
+function renderBlobs(blobs){
+  const box = document.getElementById('blobs'); box.innerHTML = '';
+  blobs.forEach(b => {
+    const div = document.createElement('div'); div.className = 'obj';
+    div.innerHTML = `<h4>${b.id} · ${b.state} · ${b.n.toLocaleString()} pts</h4>
+      <div class="meta">extent ${b.sig.extent_m.join(' × ')} m @ ${b.sig.centroid.join(', ')}</div>
+      <button onclick="resolveBlob('${b.id}','promote')" title="becomes a real object with seeds + SAM masks">promote to object</button>
+      <button onclick="resolveBlob('${b.id}','merge')" title="its 3D points join an existing object's cluster — run propagate there afterwards">merge into…</button>
+      <button onclick="resolveBlob('${b.id}','dismiss')" class="del" style="background:#2a7;color:#fff" title="certified no-change: turns green">dismiss ⇢ green</button>`;
+    box.appendChild(div);
+  });
+}
+async function resolveBlob(bid, action){
+  let target = null;
+  if(action === 'merge'){
+    target = prompt('Merge ' + bid + " into which object? (exact key, e.g. cd_post_03__post)");
+    if(!target) return;
+  }
+  if(action === 'dismiss'){
+    const t = prompt('DISMISS ' + bid + ' as NO-CHANGE (green)?\n⚠ check it across the sequence first.\nType g to confirm:');
+    if((t || '').trim().toLowerCase() !== 'g') return;
+  }
+  const st = document.getElementById('blobStatus');
+  st.textContent = action + ' ' + bid + ' …';
+  const r = await fetch('/api/resolve_blob', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({id: bid, action, target})});
+  const d = await r.json();
+  if(d.error){ st.textContent = d.error; return; }
+  st.textContent = d.msg + ' · ' + d.remaining + ' blob(s) left';
+  const rr = await (await fetch('/api/purple_blobs')).json();
+  renderBlobs(rr.blobs || []);
+  refreshObjects(); if(sceneView) updateSceneView();
+}
+
+// double-click on the bold name -> edit the id in place: single cards focus
+// their own id box; in-group members focus the group header's (it owns identity)
+function editIdentFrom(el, key){
+  const own = document.getElementById('iid_' + key);
+  if(own){ own.focus(); own.select(); return; }
+  const g = el.closest('.grp');
+  const gi = g && g.querySelector('.giid');
+  if(gi){ gi.focus(); gi.select(); }
+}
+
+// ── grouping actions ──
+function attachSelBox(host, iid){
+  const cb = document.createElement('input');
+  cb.type = 'checkbox'; cb.className = 'selbox';
+  cb.ondblclick = e => e.stopPropagation();   // dblclick-to-edit lives on the h4
+  cb.title = 'select, then use "group selected" to merge into one physical object';
+  cb.checked = groupSel.includes(iid);
+  cb.onchange = () => { groupSel = groupSel.filter(x => x !== iid); if(cb.checked) groupSel.push(iid); updateGroupBar(); };
+  host.prepend(cb);
+}
+function updateGroupBar(){
+  const n = groupSel.length;
+  document.getElementById('groupBar').style.display = n ? '' : 'none';
+  const btn = document.getElementById('groupBtn');
+  btn.textContent = `group selected (${n}) as one object`;
+  btn.disabled = n < 2;
+}
+async function doGroup(){
+  const keys = groupSel.flatMap(iid => groupUnits[iid] || []);
+  if(keys.length < 2) return;
+  // header-only truth: resolve the group's label AT merge time — never silently
+  // inherit whichever member happens to sort first
+  const labels = [...new Set(keys.map(k => (objsCache[k] || {}).label).filter(l => l))];
+  let label = labels[0] || '';
+  if(labels.length > 1){
+    const pick = prompt(`Members have different labels: ${labels.join('  /  ')}\n\nType the label for the whole group:`, labels[0]);
+    if(pick === null) return;                         // cancelled -> abort grouping
+    label = pick.trim();
+  }
+  if(!confirm(`Group ${keys.length} objects as ONE physical object "${groupSel[0]}"`
+    + (label ? ` (label: "${label}")` : '') + `?\n\n`
+    + 'They will export as a single instance (change type derived from the whole group). '
+    + 'Masks stay untouched and each part remains editable — reversible with ungroup.')) return;
+  const d = await (await fetch('/api/group', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({keys})})).json();
+  if(d.error){ alert(d.error); return; }
+  for(const k of keys){                                // normalize every member's label
+    await fetch('/api/set_meta', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({id: k, label})});
+  }
+  groupSel = [];
+  refreshObjects();
+}
+async function groupIdentSave(head, keys){
+  const gi = head.querySelector('.giid'), gl = head.querySelector('.glbl');
+  const instance = gi.value.trim(), label = gl.value.trim();
+  const o = objsCache[keys[0]] || {};
+  if(instance === (o.instance || o.id) && label === (o.label || '')){
+    gi.classList.remove('dirty'); gl.classList.remove('dirty');
+    maybeRunDeferred(); return;                       // nothing changed
+  }
+  for(const k of keys){
+    const d = await (await fetch('/api/set_meta', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({id: k, instance, label})})).json();
+    if(d.error){ alert(d.error); refreshObjects(); return; }
+    if(objsCache[k]){ objsCache[k].instance = instance; objsCache[k].label = label; }
+  }
+  flashSaved(gi); flashSaved(gl);
+  renderDeferred = true;                              // re-render once typing is over
+  maybeRunDeferred();
+}
+async function unGroup(iid, n){
+  if(!confirm(`Ungroup "${iid}"?\n\nIts ${n} members become separate objects again (ids revert to their own; masks untouched).`)) return;
+  const d = await (await fetch('/api/ungroup', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({instance: iid})})).json();
+  if(d.error){ alert(d.error); return; }
+  refreshObjects();
+}
+function highlightReviewing(){
+  document.querySelectorAll('.obj').forEach(el =>
+    el.classList.toggle('reviewing', mode==='review' && el.dataset.oid===reviewObj));
+}
+
+async function propagate(id){
+  if(!guardDone(id)) return;
+  if(!confirm('Are you sure you wish to propagate?\n\nYour manually added masks may be impacted (overwritten in place — there is no undo).')) return;
+  const st = document.getElementById('st_'+id);
+  st.textContent = `seeds (geometry, ${seedN > 0 ? '~'+seedN+' frames' : 'all frames'}) + SAM … this can take a minute`;
+  const r = await fetch('/api/propagate', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({id})});
+  const {job_id} = await r.json();
+  const poll = setInterval(async () => {
+    const j = await (await fetch('/api/job/'+job_id)).json();
+    if(j.status==='done'){ clearInterval(poll); st.textContent = `done · ${j.n_masks} masks`;
+      document.getElementById('res_'+id).innerHTML = `<img src="${j.contact}?t=${Date.now()}">`;
+      refreshObjects(); }
+    else if(j.status==='error'){ clearInterval(poll); st.textContent = 'error: ' + j.error; }
+  }, 1500);
+}
+
+// change-type-aware confirmation: the classic GT error is a MOVED object sitting as
+// added/removed because its counterpart in the other sequence was never checked/linked.
+function flagConfirmMsg(key, flag){
+  const o = objsCache[key] || {};
+  const iid = o.instance || o.id || key;
+  const head = `Mark "${iid}" as ${flag.toUpperCase()}?\n\n`;
+  if(o.change_type === 'removed')
+    return head + 'This object is classified as REMOVED — it appears only in the PRE sequence.\n\n' +
+      'Have you double-checked the POST sequence to confirm it is truly gone, and not just moved?\n' +
+      'If it moved, add/link its post-state counterpart with the same id instead.';
+  if(o.change_type === 'added')
+    return head + 'This object is classified as ADDED — it appears only in the POST sequence.\n\n' +
+      'Have you double-checked the PRE sequence to confirm it was not there before, and not just moved?\n' +
+      'If it moved, add/link its pre-state counterpart with the same id instead.';
+  if(o.change_type === 'moved')
+    return head + 'This object is classified as MOVED — linked across both sequences.\n\n' +
+      'Have you double-checked that the pre and post masks show the same physical object?';
+  return head + 'Have you double-checked this object against the other sequence?';
+}
+
+async function setFlag(key, flag, val, el){
+  if(val && !confirm(flagConfirmMsg(key, flag))){   // confirm only when checking, not unchecking
+    if(el) el.checked = false;
+    return;
+  }
+  const r = await fetch('/api/set_meta', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({id: key, [flag]: val})});
+  const d = await r.json();
+  if(d.error){ alert(d.error); refreshObjects(); return; }
+  // keep objsCache truthful — guardDone() and the done-collapse read it — then
+  // re-render (sort key is n_masks, unchanged by flags, so no jarring re-sort)
+  if(objsCache[key]){ objsCache[key].done = d.done; objsCache[key].reviewed = d.reviewed; }
+  renderObjects(objsCache);
+}
+
+async function setDeform(key, val){
+  const r = await fetch('/api/set_meta', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({id: key, deformability: val})});
+  const d = await r.json();
+  if(d.error){ alert(d.error); }
+  refreshObjects();          // re-render so a linked pair's other half shows the synced value
+}
+
+// ── identity auto-save: Enter or click-away saves; yellow outline = unsaved
+// typing, green flash = confirmed on the server. No save buttons. ──
+let renderDeferred = false;
+function identKey(e){ if(e.key === 'Enter'){ e.preventDefault(); e.target.blur(); } }
+function flashSaved(el){
+  if(!el) return;
+  el.classList.remove('dirty'); el.classList.add('saved');
+  setTimeout(() => el.classList.remove('saved'), 900);
+}
+function maybeRunDeferred(){
+  setTimeout(() => {
+    const a = document.activeElement;
+    if(renderDeferred && !(a && a.classList && a.classList.contains('ident'))){
+      renderDeferred = false; refreshObjects();
+    }
+  }, 120);
+}
+async function identSave(key){
+  const iidEl = document.getElementById('iid_' + key);
+  const lblEl = document.getElementById('lbl_' + key);
+  if(!iidEl && !lblEl) return;
+  const o = objsCache[key] || {};
+  const instance = (iidEl ? iidEl.value : (o.instance || o.id) || '').trim();
+  const label = (lblEl ? lblEl.value : o.label || '').trim();
+  if(instance === (o.instance || o.id) && label === (o.label || '')){
+    if(iidEl) iidEl.classList.remove('dirty');
+    if(lblEl) lblEl.classList.remove('dirty');
+    maybeRunDeferred(); return;                       // nothing changed
+  }
+  if(o.done && instance !== (o.instance || o.id) && groupUnits[instance]
+     && !(groupUnits[instance] || []).includes(key)){
+    if(!confirm(`"${instance}" already names another object/group — saving would MERGE this done object into it (its change type may change). Continue?`)){
+      if(iidEl) iidEl.value = o.instance || o.id;
+      if(lblEl) lblEl.value = o.label || '';
+      return;
+    }
+  }
+  const d = await (await fetch('/api/set_meta', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({id: key, instance, label})})).json();
+  if(d.error){ alert(d.error); refreshObjects(); return; }
+  if(objsCache[key]){ objsCache[key].instance = d.instance; objsCache[key].label = label; }
+  flashSaved(iidEl); flashSaved(lblEl);
+  renderDeferred = true;                              // re-render once typing is over
+  maybeRunDeferred();
+}
+
+async function remask(key){
+  const inp = document.getElementById('lbl_' + key);   // group members have no own input:
+  const lbl = (inp ? inp.value : (objsCache[key] || {}).label || '').trim();  // use the group label
+  if(!lbl){ alert('type a label first (e.g. chair, table)' + (inp ? '' : ' — type it in the group header (Enter saves)')); return; }
+  if(!guardDone(key)) return;
+  if(!confirm(`Are you sure you wish to remask as "${lbl}"?\n\nYour manually added masks may be impacted (frames the concept matches are overwritten in place — there is no undo).`)) return;
+  const st = document.getElementById('st_' + key);
+  st.textContent = `remasking as "${lbl}" … concept segmentation, ~1–2 min`;
+  const r = await fetch('/api/remask', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({id: key, label: lbl})});
+  const d = await r.json();
+  if(d.error){ st.textContent = 'error: ' + d.error; return; }
+  const poll = setInterval(async () => {
+    const j = await (await fetch('/api/job/' + d.job_id)).json();
+    if(j.status === 'running'){ st.textContent = j.msg || 'working …'; }
+    else if(j.status === 'done'){ clearInterval(poll);
+      st.textContent = `done · ${j.accepted} improved, ${j.kept} kept · ${j.n_masks} masks`;
+      document.getElementById('res_' + key).innerHTML = `<img src="${j.contact}?t=${Date.now()}">`;
+      refreshObjects(); }
+    else if(j.status === 'error'){ clearInterval(poll); st.textContent = 'error: ' + j.error; }
+  }, 1500);
+}
+
+const CD_PRESETS = {   // object-size presets → (voxel, tau, min-cluster, eps, min-frames)
+  small:  {v: 0.01,  t: 0.05, c: 40,  e: 0.05, f: 3},   // 330 ml can / bottle / mug
+  medium: {v: 0.015, t: 0.07, c: 150, e: 0.08, f: 4},   // bag / box / monitor
+  large:  {v: 0.02,  t: 0.10, c: 500, e: 0.10, f: 5},   // chair / table / sofa
+};
+function cdPreset(k){
+  const p = CD_PRESETS[k];
+  document.getElementById('cdVoxel').value = p.v;
+  document.getElementById('cdTau').value = p.t;
+  document.getElementById('cdMinCluster').value = p.c;
+  document.getElementById('cdEps').value = p.e;
+  document.getElementById('cdMinFrames').value = p.f;
+}
+
+async function cloudDiff(){
+  const btn = document.getElementById('cdBtn'), st = document.getElementById('cdStatus');
+  if(!confirm('Run cloud-diff change detection?\n\nDiffs the two NavVis point clouds, keeps only changes the Aria glasses actually looked at, and adds each as a reviewable object. Takes a few minutes.')) return;
+  btn.disabled = true; st.textContent = 'starting …';
+  const body = {
+    voxel:       parseFloat(document.getElementById('cdVoxel').value)      || 0.02,
+    tau:         parseFloat(document.getElementById('cdTau').value)        || 0.10,
+    min_cluster: parseInt(document.getElementById('cdMinCluster').value)   || 500,
+    eps:         parseFloat(document.getElementById('cdEps').value)        || 0.10,
+    min_frames:  parseInt(document.getElementById('cdMinFrames').value)    || 5,
+    remove_floor: document.getElementById('cdRemoveFloor').checked,
+    strict_occ: document.getElementById('cdStrictOcc').checked,
+    tau_lo: (v => isNaN(v) ? null : v)(parseFloat(document.getElementById('tauLo').value)),
+  };
+  const r = await fetch('/api/cloud_diff', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  const {job_id} = await r.json();
+  const poll = setInterval(async () => {
+    const j = await (await fetch('/api/job/'+job_id)).json();
+    if(j.status==='running'){ st.textContent = j.msg || 'working …'; }
+    else if(j.status==='done'){ clearInterval(poll); btn.disabled=false;
+      st.textContent = `done · ${j.n_proposals} proposals added`; refreshObjects(); }
+    else if(j.status==='error'){ clearInterval(poll); btn.disabled=false; st.textContent = 'error: ' + j.error; }
+  }, 1500);
+}
+
+async function deleteObject(key){
+  if(!guardDone(key)) return;
+  if(!confirm(`Delete object "${key}"?\n\nIt is removed from the annotation set and its seeds/masks are moved to .trash (recoverable on disk).`)) return;
+  const r = await fetch('/api/delete_object', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({id:key})});
+  if(!r.ok){ alert('delete failed: ' + (await r.json()).error); return; }
+  if(mode==='review' && reviewObj===key) exitReview();
+  refreshObjects();
+}
+
+async function exportSegments(){
+  const d = await (await fetch('/api/export', {method:'POST'})).json();
+  document.getElementById('exportStatus').textContent = `wrote ${d.n} objects → ${d.path}`;
+}
+
+document.querySelectorAll('input[name=state]').forEach(el => el.addEventListener('change', loadAnnotateFrames));
+loadAnnotateFrames();
+refreshObjects();
+</script>
+</body>
+</html>

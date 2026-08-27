@@ -1,0 +1,466 @@
+"""Cloud-diff change PROPOSER.
+
+Detect candidate changed objects between two states by differencing their raw
+NavVis point clouds, gate/rank them by how much the Aria glasses actually looked
+at each one, and hand every survivor to the existing per-frame masking pipeline
+(geom_sam_prototype) so it lands in the GUI as a reviewable object.
+
+Why the RAW clouds, not the meshes: NavVis surface meshing drops most changed
+objects (see point_ghost_prototype.py's docstring); the raw lidar scan keeps them.
+Why a diff works: a moved/added/removed object is orders of magnitude larger than
+the cm-scale NavVis->NavVis control-point alignment residual, so a generous
+nearest-neighbour distance threshold cleanly isolates the change.
+Why the Aria-attention gate is essential: the two NavVis scans cover a whole
+building floor, so a raw diff over-proposes everywhere. But GT lives ONLY in Aria
+image space -- a change the glasses never looked at is unannotatable and yields
+zero masks. So visible-frame count is both the relevance filter and a hard
+annotatability test; it collapses the building-wide diff to the walked region.
+
+Pipeline:
+  1. load both raw clouds; bring `post` into the `pre` (ref) frame via the rigid
+     NavVis->NavVis bridge; restrict to the volume both scans observed;
+  2. two-way nearest-neighbour distance (scipy cKDTree), threshold `tau`:
+       pre  points with no post neighbour -> old-location set (native to pre)
+       post points with no pre  neighbour -> new-location set (native to post)
+  3. DBSCAN each side into candidate clusters (keep every cluster >= min size);
+  4. per cluster, reproject into its NATIVE state's Aria frames (occlusion-tested,
+     geom_sam_prototype._seeds_for_session) -> visible-frame count = attention;
+     drop clusters below `min_frames`, keep the rest ranked;
+  5. write each survivor's per-frame seeds as a GUI-reviewable object.
+
+MODE B (current): each cluster is proposed as its OWN object (unique id). A moved
+object therefore arrives as a pre-state and a post-state object with DIFFERENT
+ids; you link them (shared id -> "moved") in the GUI. MODE A (auto-association of
+old/new-location pairs into one moved instance) is a later refinement.
+
+Standalone dev harness (the annotator drives this from the GUI button):
+  PYTHONPATH=~/repos/lamaria-indoor GEOM_OUT=changes/geom_sam_out_1_2_sangwoo \
+    ~/annotator_env/bin/python cloud_diff_prototype.py propose \
+      --capture /media/lamaria_indoor/captures/changes/dlab_open_space
+"""
+import argparse
+import json
+from pathlib import Path
+
+import numpy as np
+
+import geom_sam_prototype as G
+
+
+# ───────────────────────────── cloud helpers ─────────────────────────────
+def _load_cloud(capture, ref, voxel, verbose=True):
+    """Raw NavVis cloud for `ref`, voxel-downsampled. Returns (N,3) float64."""
+    import open3d as o3d
+    p = Path(capture) / "sessions" / ref / "raw_data" / "pointcloud.ply"
+    if verbose:
+        print(f"  [{ref}] loading {p} ...", flush=True)
+    pcd = o3d.io.read_point_cloud(str(p))
+    if voxel:
+        pcd = pcd.voxel_down_sample(voxel)
+    P = np.asarray(pcd.points, dtype=np.float64)
+    if verbose:
+        print(f"  [{ref}] {len(P):,} points @ voxel {voxel} m", flush=True)
+    return P
+
+
+def _cluster(P, eps, min_points, min_cluster, verbose, tag, core=None, core_min=0):
+    """DBSCAN -> list of (M,3) clusters with >= min_cluster points, largest first.
+    With `core` (bool per point, hysteresis): a cluster must ALSO contain >=
+    core_min confidently-changed points — band points (weak diff evidence, e.g.
+    an object's contact side carved to near-zero distance by the surface it
+    touches) may fatten a real object's cluster but can never form one alone."""
+    import open3d as o3d
+    if len(P) == 0:
+        return []
+    pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(P))
+    lab = np.asarray(pcd.cluster_dbscan(eps=eps, min_points=min_points))
+    out = []
+    for c in (range(lab.max() + 1) if lab.max() >= 0 else []):
+        m = lab == c
+        if m.sum() < min_cluster:
+            continue
+        nc = int(core[m].sum()) if core is not None else -1
+        if core is not None and nc < core_min:
+            continue
+        out.append((P[m], nc))
+    out.sort(key=lambda t: len(t[0]), reverse=True)
+    if verbose:
+        kept = ", ".join(f"{len(c)}" + (f"({nc} core)" if nc >= 0 else "")
+                         for c, nc in out) or "none"
+        print(f"    [{tag}] -> {len(out)} clusters >= {min_cluster} pts: [{kept}]")
+    return [c for c, _ in out]
+
+
+def _signature(pts):
+    c = pts.mean(0)
+    ext = np.sqrt(np.clip(np.linalg.eigvalsh(np.cov((pts - c).T)), 0, None))[::-1]
+    return {"n": int(len(pts)),
+            "centroid": [round(float(v), 3) for v in c],
+            "extent_m": [round(float(v), 3) for v in ext]}
+
+
+# ───────────────────────────── detect ─────────────────────────────
+def _floor_plane(P, tol, verbose, tag):
+    """RANSAC the dominant near-horizontal floor plane (clouds are gravity-aligned).
+    Returns the normalized plane [a,b,c,d] (a x+b y+c z+d=0) or None if none is
+    horizontal. Used to DROP floor points from the changed set (see detect) -- NOT
+    to pre-filter the clouds, which would break the nearest-neighbour diff."""
+    import open3d as o3d
+    if len(P) < 500:
+        return None
+    rem = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(P))
+    for _ in range(4):
+        pl, inl = rem.segment_plane(tol, 3, 300)
+        n = np.asarray(pl[:3], float); nn = np.linalg.norm(n) + 1e-12
+        if abs(n[2] / nn) >= 0.9:                             # horizontal => floor
+            if verbose:
+                print(f"    [{tag}] floor plane z≈{-pl[3] / n[2]:.2f} m")
+            return np.asarray(pl, float) / nn
+        rem = rem.select_by_index(inl, invert=True)           # skip a wall, refit
+        if len(rem.points) < 500:
+            break
+    if verbose:
+        print(f"    [{tag}] no horizontal floor plane found")
+    return None
+
+
+def _floor_keep(pts, plane, tol):
+    """Bool mask: True where a point is NOT within `tol` of the floor plane."""
+    if plane is None or len(pts) == 0:
+        return np.ones(len(pts), bool)
+    return np.abs(pts @ plane[:3] + plane[3]) > tol
+
+
+def _drop_floor(pts, plane, tol):
+    """Drop points within `tol` of the floor plane (objects float free of the ground;
+    legs above the plane survive). No-op if plane is None."""
+    return pts[_floor_keep(pts, plane, tol)]
+
+
+def detect(capture, pre_ref, post_ref, bridge_path, *, tau=0.10, voxel=0.02,
+           eps=0.10, min_points=10, min_cluster=500, overlap_margin=0.0,
+           remove_floor=True, floor_tol=0.04, tau_lo=None, core_min=None,
+           verbose=True):
+    """Two-way cloud diff -> {'old_clusters','new_clusters'} (each cluster's points
+    in its NATIVE state's world frame: old in pre/ref, new in post/ref).
+
+    Hysteresis (tau_lo < tau): candidates are extracted at the LOW threshold and
+    clustered; a cluster survives only if it holds >= core_min points above the
+    HIGH threshold. This annexes an object's contact side — a tray flat on a
+    table has its whole underside within tau of the table and used to be carved
+    down to a sub-min_cluster fragment — while band-only noise (registration
+    ripple) has no confident core and still dies. tau_lo=None -> tau/3;
+    tau_lo=tau reproduces the plain single-threshold diff exactly."""
+    from scipy.spatial import cKDTree
+
+    P1 = _load_cloud(capture, pre_ref, voxel, verbose)        # pre (ref) frame
+    P2 = _load_cloud(capture, post_ref, voxel, verbose)       # post (ref) frame
+    # fit (do NOT remove) each state's floor plane; we drop floor from the CHANGED
+    # set after the diff -- removing it before would orphan the ground and blow up NN.
+    plane1 = _floor_plane(P1, floor_tol, verbose, pre_ref) if remove_floor else None
+    plane2 = _floor_plane(P2, floor_tol, verbose, post_ref) if remove_floor else None
+    T = G._load_T(bridge_path)                                # T_pre_from_post
+    P2in1 = G._apply_T(T, P2)                                 # post cloud in pre frame
+
+    lo = np.maximum(P1.min(0), P2in1.min(0)) - overlap_margin
+    hi = np.minimum(P1.max(0), P2in1.max(0)) + overlap_margin
+    in1 = np.all((P1 >= lo) & (P1 <= hi), axis=1)
+    in2 = np.all((P2in1 >= lo) & (P2in1 <= hi), axis=1)
+    P1o, P2o = P1[in1], P2in1[in2]
+
+    d_old = cKDTree(P2o).query(P1o, workers=-1)[0]
+    d_new = cKDTree(P1o).query(P2o, workers=-1)[0]
+    if tau_lo is None:
+        tau_lo = tau / 3.0
+    tau_lo = min(tau_lo, tau)
+    if core_min is None:
+        core_min = max(min_points, 50)
+    sel_o, sel_n = d_old > tau_lo, d_new > tau_lo
+    old = P1o[sel_o]                                          # old location, pre frame
+    core_o = d_old[sel_o] > tau
+    new = G._apply_T(T.inverse(), P2o[sel_n])                 # new location -> post frame
+    core_n = d_new[sel_n] > tau
+    if remove_floor:                                          # float objects free of the ground
+        n0o, n0n = len(old), len(new)
+        k = _floor_keep(old, plane1, floor_tol)               # old in pre frame  -> plane1
+        old, core_o = old[k], core_o[k]
+        k = _floor_keep(new, plane2, floor_tol)               # new in post frame -> plane2
+        new, core_n = new[k], core_n[k]
+        if verbose:
+            print(f"  floor dropped from changed set: old {n0o:,}->{len(old):,}  "
+                  f"new {n0n:,}->{len(new):,}")
+    if verbose:
+        print(f"  changed points  old(pre)={len(old):,} ({int(core_o.sum()):,} core)  "
+              f"new(post)={len(new):,} ({int(core_n.sum()):,} core)  "
+              f"(tau={tau} m, tau_lo={tau_lo:.3f} m)")
+    return {"old_clusters": _cluster(old, eps, min_points, min_cluster, verbose,
+                                     "old/pre", core=core_o, core_min=core_min),
+            "new_clusters": _cluster(new, eps, min_points, min_cluster, verbose,
+                                     "new/post", core=core_n, core_min=core_min)}
+
+
+def _candidates_from_diff(res, prefix):
+    """Flat per-cluster candidates (MODE B): each cluster is its own object with a
+    unique id. old -> pre/'removed', new -> post/'added' (final change_type is
+    derived from id presence in the GUI; unique ids => removed/added until you
+    link a pair by giving them a shared id)."""
+    cands = []
+    for i, pts in enumerate(res["old_clusters"], 1):
+        cands.append({"id": f"{prefix}_pre_{i:02d}", "state": "pre",
+                      "change_type": "removed", "pts": pts, "sig": _signature(pts)})
+    for i, pts in enumerate(res["new_clusters"], 1):
+        cands.append({"id": f"{prefix}_post_{i:02d}", "state": "post",
+                      "change_type": "added", "pts": pts, "sig": _signature(pts)})
+    return cands
+
+
+def compute_fields(capture, pre_ref, post_ref, out_dir, tau=0.10, tau_lo=None,
+                   voxel=0.02, progress=None):
+    """Persist per-state CERTIFIED-STATIC and CHANGED-CANDIDATE point fields
+    (scene view / trimap layers). Static = matched within tau_lo both ways PLUS
+    the floor plane unconditionally (floor is static by definition; its
+    registration ripple must not leave naked holes). Changed = hysteresis
+    candidates, floor dropped. Outputs are VOXEL-uniform (static 0.04 m,
+    changed 0.03 m), not randomly capped — random subsampling starves the
+    near-field splat (measured: speckle instead of surfaces on climate f8)."""
+    import open3d as o3d
+    from scipy.spatial import cKDTree
+    say = progress or (lambda s: None)
+    if tau_lo is None:
+        tau_lo = tau / 3.0
+    bridge = _bridge(capture, pre_ref, post_ref, None)
+    say(f"loading {pre_ref} …")
+    P1 = _load_cloud(capture, pre_ref, voxel, verbose=False)
+    say(f"loading {post_ref} …")
+    P2 = _load_cloud(capture, post_ref, voxel, verbose=False)
+    T = G._load_T(bridge)
+    P2in1 = G._apply_T(T, P2)
+    say("differencing (two-way NN) …")
+    d1 = cKDTree(P2in1).query(P1, workers=-1)[0]
+    d2 = cKDTree(P1).query(P2in1, workers=-1)[0]
+    plane1 = _floor_plane(P1, 0.04, False, pre_ref)
+    plane2 = _floor_plane(P2, 0.04, False, post_ref)
+    P2n = G._apply_T(T.inverse(), P2in1)
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    def dump(name, pts, vx):
+        pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts))
+        P = np.asarray(pcd.voxel_down_sample(vx).points, np.float32)
+        np.save(out / name, P)
+        return len(P)
+
+    say("writing fields …")
+    n = {}
+    n["static_pre"] = dump("static_pre.npy",
+                           P1[(d1 <= tau_lo) | ~_floor_keep(P1, plane1, 0.04)], 0.04)
+    ch1 = P1[d1 > tau_lo]
+    n["changed_pre"] = dump("changed_pre.npy", ch1[_floor_keep(ch1, plane1, 0.04)], 0.03)
+    n["static_post"] = dump("static_post.npy",
+                            P2n[(d2 <= tau_lo) | ~_floor_keep(P2n, plane2, 0.04)], 0.04)
+    ch2 = P2n[d2 > tau_lo]
+    n["changed_post"] = dump("changed_post.npy", ch2[_floor_keep(ch2, plane2, 0.04)], 0.03)
+    return n
+
+
+# ───────────────────────── attention (Aria visibility) ─────────────────────────
+def _ctx_for_states(capture, states, cands):
+    """{state: (capo, sess, renderer)} for the states present among candidates;
+    renderer holds that state's NavVis mesh for the occlusion test."""
+    from scantools.proc.rendering import Renderer
+    from scantools.utils.io import read_mesh
+    ctx = {}
+    for state in ("pre", "post"):
+        if any(c["state"] == state for c in cands):
+            ref, sid = states[state]["ref"], states[state]["session"]
+            capo, sess = G._session(capture, sid, ref)
+            mesh = capo.proc_path(ref) / capo.sessions[ref].proc.meshes["mesh"]
+            ctx[state] = (capo, sess, Renderer(read_mesh(mesh)))
+    return ctx
+
+
+def _seed(cands, states, ctx, n, min_vis, occ_scale, dbg_root, occ_tol=0.10, min_frac=0.0):
+    """For each candidate, reproject its cluster into its native state's Aria
+    frames (n=0 = all, N>0 subsample). Sets c['seeds'] (per-frame point+box) and
+    c['n_frames'] (the Aria-attention score). occ_tol/min_frac tighten the
+    depth-based occlusion test so changes hidden behind geometry aren't logged."""
+    for c in cands:
+        capo, sess, renderer = ctx[c["state"]]
+        seeds = G._seeds_for_session(c["pts"], sess, renderer, capo,
+                                     states[c["state"]]["session"], n, min_vis,
+                                     dbg_root, occ_tol=occ_tol, occ_scale=occ_scale,
+                                     min_frac=min_frac, write_dbg=False)
+        c["seeds"], c["n_frames"] = seeds, len(seeds)
+
+
+# ───────────────────────────── propose ─────────────────────────────
+def propose(capture, states, bridge_path, *, tau=0.10, voxel=0.02, eps=0.10,
+            min_points=10, min_cluster=500, remove_floor=True, floor_tol=0.04,
+            tau_lo=None, core_min=None,
+            gate_n=150, min_vis=5, occ_scale=0.5, occ_tol=0.05, min_frac=0.3,
+            min_frames=3, prefix="cd", progress=None, verbose=True):
+    """Full proposer up to (not including) SAM: diff -> per-cluster candidates ->
+    Aria-attention gate (cheap subsample) -> full-frame seeds on survivors ->
+    write <GEOM_OUT>/<id>__<state>/seeds.json. Returns a list of
+    (key, session, gui_entry, n_frames) sorted by attention, most-seen first.
+    SAM per-frame masks are run by the caller (the GUI reuses its shared model)."""
+    say = progress or (lambda s: None)
+    dbg_root = Path(capture) / "changes" / "cloud_diff" / "seed_dbg"
+
+    say("differencing point clouds …")
+    res = detect(capture, states["pre"]["ref"], states["post"]["ref"], bridge_path,
+                 tau=tau, voxel=voxel, eps=eps, min_points=min_points,
+                 min_cluster=min_cluster, remove_floor=remove_floor,
+                 floor_tol=floor_tol, tau_lo=tau_lo, core_min=core_min,
+                 verbose=verbose)
+    cands = _candidates_from_diff(res, prefix)
+    say(f"{len(cands)} raw candidates; building geometry contexts …")
+    ctx = _ctx_for_states(capture, states, cands)
+
+    say(f"gating {len(cands)} candidates by Aria visibility (~{gate_n} frames) …")
+    _seed(cands, states, ctx, gate_n, min_vis, occ_scale, dbg_root,
+          occ_tol=occ_tol, min_frac=min_frac)
+    survivors = sorted((c for c in cands if c["n_frames"] >= min_frames),
+                       key=lambda c: -c["n_frames"])
+    say(f"{len(survivors)}/{len(cands)} candidates seen by Aria "
+        f"(>= {min_frames} frames); seeding all frames on survivors …")
+    _seed(survivors, states, ctx, 0, min_vis, occ_scale, dbg_root,
+          occ_tol=occ_tol, min_frac=min_frac)
+
+    out = []
+    for c in survivors:
+        key = f"{c['id']}__{c['state']}"
+        od = G.out_dir(capture, key)                         # respects GEOM_OUT
+        json.dump(c["seeds"], open(od / "seeds.json", "w"), indent=1)
+        # persist the raw-cloud cluster: the dense on-object geometry the seeds'
+        # centroid+box throws away — powers the GUI "geom mask" silhouette
+        np.save(od / "cluster.npy", c["pts"].astype(np.float32))
+        entry = {"id": c["id"], "label": "", "deformability": "rigid",
+                 "state": c["state"], "frame": next(iter(c["seeds"])),
+                 "points": [], "seed_frames": [], "source": "cloud_diff"}
+        out.append((key, states[c["state"]]["session"], entry, c["n_frames"]))
+    say(f"wrote seeds for {len(out)} proposals")
+    return out
+
+
+# ───────────────────────────── CLI (dev harness) ─────────────────────────────
+def _bridge(capture, pre_ref, post_ref, override):
+    return override or str(Path(capture) / "changes" / f"{post_ref}_to_{pre_ref}"
+                           / f"T_{pre_ref}_from_{post_ref}.txt")
+
+
+def _states(a):
+    return {"pre": {"session": a.pre_session, "ref": a.pre_ref},
+            "post": {"session": a.post_session, "ref": a.post_ref}}
+
+
+def cmd_diff(a):
+    """Geometry-only: diff -> candidate clusters, saved as .ply for inspection."""
+    import open3d as o3d
+    res = detect(a.capture, a.pre_ref, a.post_ref,
+                 _bridge(a.capture, a.pre_ref, a.post_ref, a.bridge),
+                 tau=a.tau, voxel=a.voxel, eps=a.eps, min_points=a.min_points,
+                 min_cluster=a.min_cluster, remove_floor=not a.keep_floor,
+                 floor_tol=a.floor_tol, tau_lo=a.tau_lo, core_min=a.core_min)
+    cands = _candidates_from_diff(res, a.prefix)
+    root = Path(a.capture) / "changes" / "cloud_diff"
+    root.mkdir(parents=True, exist_ok=True)
+    for c in cands:
+        o3d.io.write_point_cloud(str(root / f"{c['id']}__{c['state']}.ply"),
+            o3d.geometry.PointCloud(o3d.utility.Vector3dVector(c["pts"])))
+    json.dump([{k: v for k, v in c.items() if k != "pts"} for c in cands],
+              open(root / "candidates.json", "w"), indent=1)
+    print(f"\n  {len(cands)} candidates -> {root}")
+
+
+def cmd_attention(a):
+    """diff -> per-cluster -> Aria-visibility ranking (no seeds written)."""
+    res = detect(a.capture, a.pre_ref, a.post_ref,
+                 _bridge(a.capture, a.pre_ref, a.post_ref, a.bridge),
+                 tau=a.tau, voxel=a.voxel, eps=a.eps, min_points=a.min_points,
+                 min_cluster=a.min_cluster, remove_floor=not a.keep_floor,
+                 floor_tol=a.floor_tol, tau_lo=a.tau_lo, core_min=a.core_min)
+    cands = _candidates_from_diff(res, a.prefix)
+    ctx = _ctx_for_states(a.capture, _states(a), cands)
+    _seed(cands, _states(a), ctx, a.n, a.min_vis, a.occ_scale,
+          Path(a.capture) / "changes" / "cloud_diff" / "seed_dbg",
+          occ_tol=a.occ_tol, min_frac=a.min_frac)
+    print(f"\n  Aria attention (visible frames{'' if a.n == 0 else f', ~{a.n} sampled'}):")
+    for c in sorted(cands, key=lambda c: -c["n_frames"]):
+        print(f"    {c['id']:12s} [{c['change_type']:7s}] {c['n_frames']:4d}f  "
+              f"{c['sig']['n']}pts @ {c['sig']['centroid']}")
+
+
+def cmd_propose(a):
+    """Full propose (writes seeds + merges gui_objects.json in the GEOM_OUT
+    workspace). SAM masks are NOT run here -- launch the GUI (or its
+    /api/cloud_diff button) to fill them with the shared model."""
+    out = propose(a.capture, _states(a),
+                  _bridge(a.capture, a.pre_ref, a.post_ref, a.bridge),
+                  tau=a.tau, voxel=a.voxel, eps=a.eps, min_points=a.min_points,
+                  min_cluster=a.min_cluster,
+                  remove_floor=not a.keep_floor, floor_tol=a.floor_tol,
+                  tau_lo=a.tau_lo, core_min=a.core_min,
+                  gate_n=a.gate_n, min_vis=a.min_vis,
+                  occ_scale=a.occ_scale, min_frames=a.min_frames, prefix=a.prefix,
+                  progress=lambda s: print("  ·", s, flush=True))
+    gp = G.out_dir(a.capture) / "gui_objects.json"
+    gobj = json.load(open(gp)) if gp.exists() else {}
+    for key, _sid, entry, _n in out:
+        gobj[key] = entry
+    json.dump(gobj, open(gp, "w"), indent=1)
+    print(f"\n  {len(out)} proposals -> {gp}  (workspace {G.OUT})")
+    for key, _sid, _e, n in out:
+        print(f"    {key:18s} {n:4d} frames")
+    print("  launch the GUI on this workspace and run SAM (button / review) to fill masks.")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name in ("diff", "attention", "propose"):
+        p = sub.add_parser(name)
+        p.add_argument("--capture", required=True)
+        p.add_argument("--pre-session", default="dlab_open_space_1_rgb")
+        p.add_argument("--pre-ref", default="navvis_1")
+        p.add_argument("--post-session", default="dlab_open_space_2_rgb")
+        p.add_argument("--post-ref", default="navvis_2")
+        p.add_argument("--bridge", default=None)
+        p.add_argument("--tau", type=float, default=0.10)
+        p.add_argument("--voxel", type=float, default=0.02)
+        p.add_argument("--eps", type=float, default=0.10)
+        p.add_argument("--min-points", type=int, default=10)
+        p.add_argument("--min-cluster", type=int, default=500)
+        p.add_argument("--tau-lo", type=float, default=None,
+                       help="hysteresis low threshold (m): candidates above this "
+                            "cluster together but need >= core-min points above "
+                            "--tau to survive. Default tau/3; set equal to --tau "
+                            "to disable")
+        p.add_argument("--core-min", type=int, default=None,
+                       help="confident (d > tau) points a cluster must contain "
+                            "(default max(min-points, 50))")
+        p.add_argument("--keep-floor", action="store_true",
+                       help="do NOT remove the floor plane before clustering (default: remove it)")
+        p.add_argument("--floor-tol", type=float, default=0.04,
+                       help="floor-plane slab thickness removed (m)")
+        p.add_argument("--prefix", default="cd")
+        if name == "attention":
+            p.add_argument("--n", type=int, default=0)
+            p.add_argument("--min-vis", type=int, default=5)
+            p.add_argument("--occ-scale", type=float, default=0.5)
+            p.add_argument("--occ-tol", type=float, default=0.05,
+                           help="depth tolerance (m) for occlusion; lower = stricter")
+            p.add_argument("--min-frac", type=float, default=0.3,
+                           help="min fraction of in-frustum object points unoccluded to keep a frame")
+        if name == "propose":
+            p.add_argument("--gate-n", type=int, default=150)
+            p.add_argument("--min-vis", type=int, default=5)
+            p.add_argument("--occ-scale", type=float, default=0.5)
+            p.add_argument("--min-frames", type=int, default=3)
+    a = ap.parse_args()
+    {"diff": cmd_diff, "attention": cmd_attention, "propose": cmd_propose}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    main()
