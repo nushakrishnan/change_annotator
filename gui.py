@@ -532,7 +532,7 @@ def api_depth_propagate():
         PROP_PENDING.pop(jid, None); PROP_FLAGS.pop(jid, None)
     job_id = uuid.uuid4().hex[:8]
     JOBS[job_id] = {"status": "running", "obj": oid, "mode": "forward",
-                    "msg": "tracking windows forward …"}
+                    "msg": "tracking regions forward …"}
     threading.Thread(target=_propagate_fix_job, args=(job_id, oid, frame, "forward"),
                      daemon=True).start()
     return jsonify(job_id=job_id)
@@ -615,9 +615,47 @@ def _propagate_fix_job(job_id, oid, frame, mode):
         od = G.out_dir(CFG["capture"], oid)
         cb = lambda s: JOBS[job_id].update(msg=s)
         cb("loading video tracker (first use takes ~1 min) …")
-        results, flags, meta = PF.propagate(
-            CFG["capture"], od, frame, mode=mode,
-            frontier_name=OBJECTS[oid].get("verified_until"), progress=cb)
+        pe = od / "masks" / ".preedit" / frame.replace("/", "_")
+        mi0_path = od / "masks_index.json"
+        mi0 = json.load(open(mi0_path)) if mi0_path.exists() else {}
+        if pe.exists() and frame in mi0:
+            # SURGICAL: propagate only the windows this fix TOUCHED. Diff the
+            # saved (new) mask against the pre-edit (old) one; the changed
+            # windows are re-tracked, the rest keep their masks. Track the NEW
+            # touched windows forward (add) and the OLD ones (subtract), then
+            # per frame: base & ~old_track | new_track.
+            new = cv2.imread(str(od / mi0[frame]["mask_file"]), 0) > 127
+            old = cv2.imread(str(pe), 0) > 127
+            xor = cv2.dilate((new ^ old).astype(np.uint8),
+                             np.ones((9, 9), np.uint8)) > 0
+            t_new = [w for w in PF._window_components(new) if (w & xor).any()]
+            t_old = [w for w in PF._window_components(old) if (w & xor).any()]
+            cb(f"surgical fix: {len(t_new)} edited region(s)")
+            fr = OBJECTS[oid].get("verified_until")
+            res_new, flags, meta = PF.propagate(
+                CFG["capture"], od, frame, mode="forward", seed_components=t_new,
+                frontier_name=fr, progress=cb) if t_new else ({}, {}, {"anchors": 1, "span": 0, "stops": []})
+            res_old = (PF.propagate(CFG["capture"], od, frame, mode="forward",
+                       seed_components=t_old, frontier_name=fr)[0]) if t_old else {}
+            results = {}
+            for n in set(res_new) | set(res_old):
+                e = mi0.get(n)
+                base = (cv2.imread(str(od / e["mask_file"]), 0) > 127) if e else None
+                gn = res_new.get(n); go = res_old.get(n)
+                if base is None:
+                    out = gn if gn is not None else np.zeros_like(go)
+                else:
+                    out = base.copy()
+                    if go is not None:
+                        out &= ~go
+                    if gn is not None:
+                        out |= gn
+                results[n] = out
+            pe.unlink(missing_ok=True)                       # consumed
+        else:
+            results, flags, meta = PF.propagate(
+                CFG["capture"], od, frame, mode=mode,
+                frontier_name=OBJECTS[oid].get("verified_until"), progress=cb)
         if not results:
             JOBS[job_id].update(status="done", n=0,
                                 msg="nothing to fill (span already hand-covered?)")
@@ -2097,6 +2135,11 @@ def api_save_edit():
         return jsonify(error="no pending edit for this frame"), 400
     (od / "masks").mkdir(exist_ok=True)
     flat = name.replace("/", "_")
+    prev = od / (m["mask_file"] if m else f"masks/{flat}")   # snapshot the pre-edit
+    if prev.exists():                                        # mask for diff-based
+        pe = od / "masks" / ".preedit"                       # surgical propagate
+        pe.mkdir(exist_ok=True)
+        shutil.copy(prev, pe / flat)
     if mask.any():
         cv2.imwrite(str(od / "masks" / flat), (mask * 255).astype(np.uint8))
         # src="hand": human-verified — propagation must never silently overwrite these
@@ -2399,10 +2442,11 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=5000)
     ap.add_argument("--depth", action="store_true",
-                    help="DEPTH MODE: annotate depth regions (windows/glass "
-                         "pierce/unobserved). Writes to capture/depth/ — a sibling of "
-                         "changes/, fully isolated; export makes per-frame depth "
-                         "masks, NOT segments.json/change_mask. Default is change mode.")
+                    help="DEPTH MODE: annotate regions where NavVis depth is unreliable "
+                         "(glass pierce, unobserved). Workspace is derived automatically: "
+                         "changes/depth/<pre-session>__<post-session>/ (GEOM_OUT ignored). "
+                         "Export = per-frame depth masks there, never segments.json/"
+                         "change_mask. Default is change mode.")
     args = ap.parse_args()
 
     CFG.update(capture=args.capture, tier=args.tier, depth=args.depth,
@@ -2410,11 +2454,38 @@ def main():
                states={"pre": {"session": args.pre_session, "ref": args.pre_ref},
                        "post": {"session": args.post_session, "ref": args.post_ref}},
                seed={"n": args.n, "min_vis": args.min_vis})
-    if args.depth:                                   # force the workspace under depth/
-        go = os.environ.get("GEOM_OUT", "geom_sam_out")
-        go = go.split("/", 1)[1] if go.startswith("changes/") else go
-        G.OUT = f"changes/depth/{go}"
-        print(f"DEPTH MODE — workspace {G.OUT} (isolated subtree; capture root is not writable)", flush=True)
+    if args.depth:
+        # DEPTH MODE workspace is DERIVED from the walk pair — nothing to type,
+        # per-walk-pair separation automatic, and it can never land in a change
+        # workspace: changes/depth/<pre-session>__<post-session>/. (Under
+        # changes/ because the capture root is not group-writable.)
+        auto = f"changes/depth/{args.pre_session}__{args.post_session}"
+        new_dir = Path(args.capture) / auto
+        depth_root = Path(args.capture) / "changes" / "depth"
+        if os.environ.get("GEOM_OUT"):
+            print("DEPTH MODE — GEOM_OUT is ignored in depth mode (workspace is derived "
+                  "from the sessions)", flush=True)
+        if not new_dir.exists() and depth_root.exists():
+            # one-time migration of a pre-rename workspace (changes/depth/geom_sam_out_*):
+            # the one named by GEOM_OUT if given, else the single legacy dir present.
+            cands = []
+            if os.environ.get("GEOM_OUT"):
+                n = os.environ["GEOM_OUT"]
+                n = n.split("/", 1)[1] if n.startswith("changes/") else n
+                if (depth_root / n).is_dir():
+                    cands = [depth_root / n]
+            if not cands:
+                cands = sorted(p for p in depth_root.glob("geom_sam_out*") if p.is_dir())
+            if len(cands) == 1:
+                os.replace(cands[0], new_dir)
+                print(f"DEPTH MODE — migrated legacy workspace {cands[0].name} -> {auto}",
+                      flush=True)
+            elif len(cands) > 1:
+                print("DEPTH MODE — several legacy depth workspaces found, not migrating "
+                      "automatically: " + ", ".join(p.name for p in cands)
+                      + f"\n  -> mv the right one to {auto}", flush=True)
+        G.OUT = auto
+        print(f"DEPTH MODE — workspace {G.OUT}", flush=True)
 
     gobj = G.out_dir(args.capture) / "gui_objects.json"           # workspace-scoped (GEOM_OUT)
     legacy = Path(args.capture) / "changes" / "gui_objects.json"

@@ -43,13 +43,33 @@ BLESSED_EXTRA_CAP = 40
 # OWN object in the same session (SAM3 is natively multi-object, so it is one
 # parallel pass, not N runs); the per-frame output is their UNION, so nothing
 # downstream sees parts. Capped so a pathological split can't explode memory.
-MULTIPART_CAP = 96
+MULTIPART_CAP = 160
+# smallest blob that gets its own track once an object is multi-part (absolute)
+MULTIPART_MIN_PX = 600
+# objects tracked per SAM3 pass — bounds GPU memory; groups are run in one
+# session (frames encoded once), per-object memory reset between groups.
+MULTIPART_BATCH = 16
 
 
 def _split_components(mask, min_area=120):
     """Connected components of a bool mask, each >= min_area px (else the whole
     mask as one). cv2 import is local to keep this module's top clean."""
     n, lab = cv2.connectedComponents(mask.astype(np.uint8))
+    out = [lab == i for i in range(1, n) if int((lab == i).sum()) >= min_area]
+    return out or [mask.astype(bool)]
+
+
+def _window_components(mask, close_px=17, min_area=600):
+    """One blob PER WINDOW. SAM slices a single window into pieces along the
+    mullion/arch bars; a plain connected-components counts each sliver as its
+    own window (20 real windows read as ~67 tracks). Morphologically CLOSE first
+    (kernel bridges the thin mullion gaps but not the wider wall between separate
+    windows), so each window becomes ONE component — the 'outermost' region. The
+    returned blob is the closed (filled) window, so tracking a whole window is
+    also more stable than tracking a sliver."""
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_px, close_px))
+    closed = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_CLOSE, k)
+    n, lab = cv2.connectedComponents(closed)
     out = [lab == i for i in range(1, n) if int((lab == i).sum()) >= min_area]
     return out or [mask.astype(bool)]
 
@@ -117,7 +137,7 @@ def _gate(m, prev, seed, iou_floor):
 
 
 def propagate(capture, obj_dir, anchor_name, iou_floor=0.2, max_span=600,
-              mode="forward", frontier_name=None,
+              mode="forward", frontier_name=None, seed_components=None,
               progress=None, tracker=None, window=None):
     """Fill the gaps between hand anchors across the object's visible span.
 
@@ -230,49 +250,77 @@ def propagate(capture, obj_dir, anchor_name, iou_floor=0.2, max_span=600,
             # (that keeps the strong single-object multi-anchor path). A blob
             # counts if it is >= 25% of the largest and >= 800 px; >=2 such =
             # multi-part.
-            click_comps = _split_components(_anchor_mask(click_local))
-            big = max((int(c.sum()) for c in click_comps), default=0)
-            parts = [c for c in click_comps
-                     if int(c.sum()) >= max(800, 0.25 * big)]
-            if len(parts) < 2:
-                for al in anchors:                   # single-object, multi-anchor
-                    tr.add_new_mask(st, frame_idx=al, obj_id=1,
-                                    mask=torch.from_numpy(_anchor_mask(al).astype(np.float32)))
-                n_obj = 1
+            # SURGICAL: an explicit component list (the windows a human just
+            # touched) — track ONLY those forward, anchored at the clicked frame.
+            if seed_components is not None:
+                comps = [c for c in seed_components if c.any()]
+                if len(comps) <= 1:
+                    specs = [(click_local, comps[0], 1)] if comps else []
+                    single = True
+                else:
+                    specs = [(click_local, c, None) for c in comps]
+                    single = False
+                n_obj = len(specs)
+                say(f"surgical: {n_obj} edited region(s) forward")
             else:
-                # seed EVERY drawn blob from EVERY anchor frame — a window seen
-                # only in another seed frame (e.g. the lower windows) would
-                # otherwise never be tracked. Redundant tracks of the same window
-                # across frames just re-vote into the union (harmless); capped
-                # biggest-first so memory stays bounded.
-                plan = []                            # (area, frame_idx, comp)
-                for al in anchors:
-                    am = _anchor_mask(al)
-                    cc = _split_components(am)
-                    b = max((int(c.sum()) for c in cc), default=0)
-                    for c in cc:
-                        if int(c.sum()) >= max(600, 0.12 * b):
-                            plan.append((int(c.sum()), al, c))
-                plan.sort(reverse=True, key=lambda t: t[0])
-                for oid, (_a, al, c) in enumerate(plan[:MULTIPART_CAP], start=1):
-                    tr.add_new_mask(st, frame_idx=al, obj_id=oid,
-                                    mask=torch.from_numpy(c.astype(np.float32)))
-                n_obj = min(len(plan), MULTIPART_CAP)
-                say(f"multi-part: {len(plan)} blobs across {len(anchors)} anchor "
-                    f"frame(s) -> {n_obj} component tracks (capped {MULTIPART_CAP})")
+                # one blob PER WINDOW (merge SAM's mullion slices) for the trigger
+                click_comps = _window_components(_anchor_mask(click_local))
+                big = max((int(c.sum()) for c in click_comps), default=0)
+                parts = [c for c in click_comps
+                         if int(c.sum()) >= max(800, 0.25 * big)]
+                # single-object: one object (id 1) fed at every anchor (multi-anchor
+                # memory). multi-part: EVERY window >= MULTIPART_MIN_PX from EVERY
+                # anchor is its own track (a window seen only in another seed frame
+                # must still be tracked). Size bar is ABSOLUTE (a relative bar
+                # dropped 9/20 windows). The relative test is only the TRIGGER.
+                if len(parts) < 2:
+                    specs = [(al, _anchor_mask(al), 1) for al in anchors]
+                    n_obj = 1
+                    single = True
+                else:
+                    plan = []                        # (dist_to_click, -area, al, comp)
+                    for al in anchors:
+                        for c in _window_components(_anchor_mask(al)):
+                            a = int(c.sum())
+                            if a >= MULTIPART_MIN_PX:
+                                plan.append((abs(al - click_local), -a, al, c))
+                    plan.sort(key=lambda t: (t[0], t[1]))   # nearest click first
+                    plan = plan[:MULTIPART_CAP]
+                    specs = [(al, c, None) for _d, _a, al, c in plan]
+                    n_obj = len(specs)
+                    single = False
+                    say(f"multi-part: {n_obj} region(s) across {len(anchors)} anchor frame(s)")
+
             passes = ([(False, fwd, click_local)] if mode == "forward" else
                       [(False, fwd, anchors[0]), (True, bwd, anchors[-1])])
-            for reverse, store, start in passes:
-                say(f"propagating {'backward' if reverse else 'forward'} "
-                    f"({len(win)} frames) …")
-                for fi, _oids, _lr, vrm, _sc in tr.propagate_in_video(
-                        st, start_frame_idx=start,
-                        max_frame_num_to_track=len(win),
-                        propagate_preflight=True, reverse=reverse):
-                    if fi in anchor_set or win[fi] in hand:
-                        continue
-                    a = (vrm > 0).cpu().numpy()      # [n_obj, 1, H, W] (or [1,..])
-                    store[fi] = a.reshape(-1, a.shape[-2], a.shape[-1]).any(0)
+
+            # BATCH the objects: N tracks x per-frame memory over a long walk can
+            # OOM a 32 GB GPU. Track in groups of MULTIPART_BATCH, resetting
+            # per-object memory between groups while KEEPING cached image features
+            # (frames encoded once). Peak memory scales with the batch. Union.
+            batch_sz = len(specs) if single else MULTIPART_BATCH
+            groups = ([specs[i:i + batch_sz] for i in range(0, len(specs), batch_sz)]
+                      if specs else [])
+            for gi, group in enumerate(groups):
+                if gi > 0:
+                    tr._reset_tracking_results(st)   # clears per-obj memory, keeps
+                                                     # cached_features (no re-encode)
+                for j, (al, m, fixed) in enumerate(group):
+                    oid = fixed if fixed is not None else j + 1
+                    tr.add_new_mask(st, frame_idx=al, obj_id=oid,
+                                    mask=torch.from_numpy(m.astype(np.float32)))
+                for reverse, store, start in passes:
+                    say(f"propagating {'backward' if reverse else 'forward'} "
+                        f"(group {gi + 1}/{len(groups)}, {len(win)} frames) …")
+                    for fi, _oids, _lr, vrm, _sc in tr.propagate_in_video(
+                            st, start_frame_idx=start,
+                            max_frame_num_to_track=len(win),
+                            propagate_preflight=True, reverse=reverse):
+                        if fi in anchor_set or win[fi] in hand:
+                            continue
+                        a = (vrm > 0).cpu().numpy()  # [n_obj, 1, H, W] (or [1,..])
+                        u = a.reshape(-1, a.shape[-2], a.shape[-1]).any(0)
+                        store[fi] = u if fi not in store else (store[fi] | u)
 
     # merge the two passes: each frame takes the pass whose anchor side is nearer
     def _pick(i):

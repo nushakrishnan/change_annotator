@@ -89,7 +89,7 @@
       &nbsp;|&nbsp; <span class="status">click the object to re-segment this frame</span>
       <button onclick="geomMask()" title="geom+SAM: project the object's lidar cluster, then SAM snaps it to the image edge — recovers legs/parts RGB drops (shadows/exposure). Refuses when the geometry is too sparse in this view.">geom mask</button>
       <button onclick="saveEdit()" title="shortcut: z">save mask (z)</button>
-      <button onclick="lift3d()" title="edit once in 2D, propagate in 3D: lifts the CURRENT canvas mask onto the state's point cloud (in-stroke + line-of-sight points, bounded 3D grow), press m to confirm the orange preview — the label then renders in EVERY frame and walk">propagate in 3D</button>
+      {% if not depth %}<button onclick="lift3d()" title="edit once in 2D, propagate in 3D: lifts the CURRENT canvas mask onto the state's point cloud (in-stroke + line-of-sight points, bounded 3D grow), press m to confirm the orange preview — the label then renders in EVERY frame and walk">propagate in 3D</button>{% endif %}
       <button onclick="cancelEdit()">cancel</button>
     </span>
     <span id="reviewControls">
@@ -1657,7 +1657,7 @@ function highlightReviewing(){
 
 async function depthPropagate(key, frame){
   const cardSt = document.getElementById('st_' + key);
-  if(cardSt) cardSt.textContent = 'tracking windows forward …';
+  if(cardSt) cardSt.textContent = 'tracking regions forward …';
   const r = await fetch('/api/depth_propagate', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({id: key})});
   const d = await r.json();
