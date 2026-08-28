@@ -465,6 +465,110 @@ objects that grow hugely as you approach, scenes needing heavy hand annotation.
 
 ---
 
+## Appendix — depth mode commands
+
+Run from `~/repos/change_annotator-sangwoo`. Each writes to `<capture>/depth/<pre>__<post>/`. Add `--port 5001` if 5000 is taken.
+
+**climate_day — walk 1**
+```bash
+PYTHONPATH=~/repos/lamaria-indoor ~/annotator_env/bin/python gui.py \
+  --capture /media/lamaria_indoor/captures/changes/climate_day \
+  --pre-session climate_day_1_1_rgb --pre-ref navvis_2 \
+  --post-session climate_day_2_1_rgb --post-ref navvis_3 --depth
+```
+
+**climate_day — walk 2**
+```bash
+PYTHONPATH=~/repos/lamaria-indoor ~/annotator_env/bin/python gui.py \
+  --capture /media/lamaria_indoor/captures/changes/climate_day \
+  --pre-session climate_day_1_2_rgb --pre-ref navvis_2 \
+  --post-session climate_day_2_2_rgb --post-ref navvis_3 --depth
+```
+
+**climate_day — walk 3**
+```bash
+PYTHONPATH=~/repos/lamaria-indoor ~/annotator_env/bin/python gui.py \
+  --capture /media/lamaria_indoor/captures/changes/climate_day \
+  --pre-session climate_day_1_3_rgb --pre-ref navvis_2 \
+  --post-session climate_day_2_3_rgb --post-ref navvis_3 --depth
+```
+
+**cvg_kitchen**
+```bash
+PYTHONPATH=~/repos/lamaria-indoor ~/annotator_env/bin/python gui.py \
+  --capture /media/lamaria_indoor/captures/changes/cvg_kitchen \
+  --pre-session cvg_kitchen_1_rgb --pre-ref navvis_1 \
+  --post-session cvg_kitchen_2_rgb --post-ref navvis_2 --depth
+```
+
+**billiards — 1↔2**
+```bash
+PYTHONPATH=~/repos/lamaria-indoor ~/annotator_env/bin/python gui.py \
+  --capture /media/lamaria_indoor/captures/changes/billiards \
+  --pre-session billiards_1_1_rgb --pre-ref navvis_1 \
+  --post-session billiards_2_1_rgb --post-ref navvis_2 --depth
+```
+
+**cab_kitchen**
+```bash
+PYTHONPATH=~/repos/lamaria-indoor ~/annotator_env/bin/python gui.py \
+  --capture /media/lamaria_indoor/captures/changes/cab_kitchen \
+  --pre-session cab_kitchen_1_rgb --pre-ref navvis_1 \
+  --post-session cab_kitchen_2_rgb --post-ref navvis_2 --depth
+```
+
+**g66**
+```bash
+PYTHONPATH=~/repos/lamaria-indoor ~/annotator_env/bin/python gui.py \
+  --capture /media/lamaria_indoor/captures/changes/g66 \
+  --pre-session g66_1_rgb --pre-ref navvis_1 \
+  --post-session g66_2_rgb --post-ref navvis_2 --depth
+```
+
+**dlab_open_space — 1↔2**
+```bash
+PYTHONPATH=~/repos/lamaria-indoor ~/annotator_env/bin/python gui.py \
+  --capture /media/lamaria_indoor/captures/changes/dlab_open_space \
+  --pre-session dlab_open_space_1_rgb --pre-ref navvis_1 \
+  --post-session dlab_open_space_2_rgb --post-ref navvis_2 --depth
+```
+
+**dlab_open_space — 2↔3**
+```bash
+PYTHONPATH=~/repos/lamaria-indoor ~/annotator_env/bin/python gui.py \
+  --capture /media/lamaria_indoor/captures/changes/dlab_open_space \
+  --pre-session dlab_open_space_2_rgb --pre-ref navvis_2 \
+  --post-session dlab_open_space_3_rgb --post-ref navvis_3 --depth
+```
+
+**no_sofa_area — 1↔2**
+```bash
+PYTHONPATH=~/repos/lamaria-indoor ~/annotator_env/bin/python gui.py \
+  --capture /media/lamaria_indoor/captures/changes/no_sofa_area \
+  --pre-session no_sofa_1_rgb --pre-ref navvis_1 \
+  --post-session no_sofa_2_rgb --post-ref navvis_2 --depth
+```
+
+**no_sofa_area — 2↔3**
+```bash
+PYTHONPATH=~/repos/lamaria-indoor ~/annotator_env/bin/python gui.py \
+  --capture /media/lamaria_indoor/captures/changes/no_sofa_area \
+  --pre-session no_sofa_2_rgb --pre-ref navvis_2 \
+  --post-session no_sofa_3_rgb --post-ref navvis_3 --depth
+```
+
+**no_sofa_area — 3↔4**
+```bash
+PYTHONPATH=~/repos/lamaria-indoor ~/annotator_env/bin/python gui.py \
+  --capture /media/lamaria_indoor/captures/changes/no_sofa_area \
+  --pre-session no_sofa_3_rgb --pre-ref navvis_3 \
+  --post-session no_sofa_4_rgb --post-ref navvis_4 --depth
+```
+
+Not sure of a scene's names? `ls /media/lamaria_indoor/captures/changes/<scene>/sessions/`
+
+---
+
 ## Acknowledgements
 
 Built on [SAM 3](https://github.com/facebookresearch/sam3) and the LaMAR geometry stack.

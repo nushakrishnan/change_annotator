@@ -49,6 +49,10 @@ MULTIPART_MIN_PX = 600
 # objects tracked per SAM3 pass — bounds GPU memory; groups are run in one
 # session (frames encoded once), per-object memory reset between groups.
 MULTIPART_BATCH = 16
+# forward multi-part: how many hand anchors BEHIND the click also seed tracks (appearance
+# memory only — frames behind the click are never written). 1 = fast (measured 95 s vs
+# ~10 min for all anchors, at ~2/3 of the frame coverage); 3 = middle ground.
+FORWARD_BEHIND_ANCHORS = 1
 
 
 def _split_components(mask, min_area=120):
@@ -134,6 +138,31 @@ def _gate(m, prev, seed, iou_floor):
         if cover_m >= 0.8 and border:
             temporal_ok = "exit"
     return geo_ok, temporal_ok
+
+
+def _blob_temporal_ok(m, prev, min_frac=0.5, iou=0.3):
+    """Multi-part temporal test: instead of ONE bbox around all blobs (which
+    swings wildly as windows enter/leave the view), match blob-to-blob. A prev
+    blob is 'kept' if some blob in m overlaps its bbox (IoU >= iou) OR it
+    touched the image border (it may legitimately have exited). The frame
+    passes if >= min_frac of prev's blobs are kept AND m has at least one blob.
+    Measured: the union-bbox test rejected 23% of consecutive CORRECT window
+    masks; blob matching is what a human would judge."""
+    pb = [_mask_bbox(c) for c in _window_components(prev)]
+    mb = [_mask_bbox(c) for c in _window_components(m)]
+    if not mb:
+        return False
+    if not pb:
+        return True
+    H, W = m.shape
+    kept = 0
+    for b in pb:
+        if b is None:
+            continue
+        border = b[0] <= 2 or b[1] <= 2 or b[2] >= W - 3 or b[3] >= H - 3
+        if border or any(_box_iou_cover(b, c)[0] >= iou for c in mb if c is not None):
+            kept += 1
+    return kept >= min_frac * max(1, sum(b is not None for b in pb))
 
 
 def propagate(capture, obj_dir, anchor_name, iou_floor=0.2, max_span=600,
@@ -278,8 +307,21 @@ def propagate(capture, obj_dir, anchor_name, iou_floor=0.2, max_span=600,
                     n_obj = 1
                     single = True
                 else:
+                    # FORWARD mode: frames behind the click are protected (never
+                    # proposed), so blobs seeded from anchors behind the click can
+                    # only add appearance memory — for windows that is pure cost
+                    # (measured: 30 behind-click anchors = 282 of 288 tracks, the
+                    # click frame itself had 6). Seed from the click frame, the
+                    # nearest anchor behind it (a little memory), and every anchor
+                    # AFTER it (windows that only appear later). Span mode keeps all.
+                    if mode == "forward":
+                        behind = [al for al in anchors if al < click_local]
+                        seed_anchors = sorted({click_local, *behind[-FORWARD_BEHIND_ANCHORS:],
+                                               *[al for al in anchors if al > click_local]})
+                    else:
+                        seed_anchors = anchors
                     plan = []                        # (dist_to_click, -area, al, comp)
-                    for al in anchors:
+                    for al in seed_anchors:
                         for c in _window_components(_anchor_mask(al)):
                             a = int(c.sum())
                             if a >= MULTIPART_MIN_PX:
@@ -289,7 +331,7 @@ def propagate(capture, obj_dir, anchor_name, iou_floor=0.2, max_span=600,
                     specs = [(al, c, None) for _d, _a, al, c in plan]
                     n_obj = len(specs)
                     single = False
-                    say(f"multi-part: {n_obj} region(s) across {len(anchors)} anchor frame(s)")
+                    say(f"multi-part: {n_obj} region(s) from {len(seed_anchors)} of {len(anchors)} anchor frame(s)")
 
             passes = ([(False, fwd, click_local)] if mode == "forward" else
                       [(False, fwd, anchors[0]), (True, bwd, anchors[-1])])
@@ -335,6 +377,7 @@ def propagate(capture, obj_dir, anchor_name, iou_floor=0.2, max_span=600,
 
     results, flags, stops = {}, {}, []
     invisible = 0
+    has_geom = bool(seeds)               # depth/glass objects have none -> temporal-only world
     say("gating & merging …")
 
     def _consider(i, prev):
@@ -347,6 +390,8 @@ def propagate(capture, obj_dir, anchor_name, iou_floor=0.2, max_span=600,
         if m.sum() < 200:
             return "invisible"
         geo_ok, temporal_ok = _gate(m, prev, seeds.get(win[i]), iou_floor)
+        if not single and not temporal_ok:          # many blobs: judge blob-by-blob,
+            temporal_ok = _blob_temporal_ok(m, prev)  # not one union bbox
         return m, geo_ok, temporal_ok
 
     def _accept(i, m, ok):
@@ -398,6 +443,7 @@ def propagate(capture, obj_dir, anchor_name, iou_floor=0.2, max_span=600,
         prev = _anchor_mask(a_edge)
         misses, buffered = 0, []          # buffered: gate-failed (i, m) awaiting recovery
         lost, pend = False, None          # pend: first geo-confirmed frame while lost
+        last_m = None                     # tracker's previous output (no-geometry resume)
         for i in rng:
             got = _consider(i, prev)
             if got is None:
@@ -405,13 +451,21 @@ def propagate(capture, obj_dir, anchor_name, iou_floor=0.2, max_span=600,
             if got == "invisible":
                 invisible += 1
                 pend = None               # an off-screen gap breaks a confirmation pair
+                last_m = None
                 continue
             m, geo_ok, temporal_ok = got
             if lost:
-                if geo_ok:
+                # resume on 2 consecutive confirmations. With geometry that is
+                # geo_ok (seed re-acquired). WITHOUT geometry (depth/glass
+                # objects have no seeds, so geo_ok can never fire and 'lost' was
+                # permanent — measured: runs died in short bursts), confirm via
+                # temporal consistency against the tracker's OWN previous output.
+                if geo_ok or (not has_geom and last_m is not None
+                              and (_gate(m, last_m, None, iou_floor)[1]
+                                   or (not single and _blob_temporal_ok(m, last_m)))):
                     if pend is None:
                         pend = (i, m)
-                    else:                 # 2nd consecutive geo pass -> resume
+                    else:                 # 2nd consecutive pass -> resume
                         _accept(pend[0], pend[1], True)
                         _accept(i, m, True)
                         prev = m
@@ -419,7 +473,9 @@ def propagate(capture, obj_dir, anchor_name, iou_floor=0.2, max_span=600,
                         resumes.append(win[i])
                 else:
                     pend = None
+                last_m = m
                 continue
+            last_m = m
             if geo_ok or temporal_ok:
                 for bi, bm in buffered:
                     _accept(bi, bm, False)
