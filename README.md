@@ -105,6 +105,9 @@ Then open `http://127.0.0.1:5000`.
 state-pair (and each annotator) its own: `geom_sam_out_1_2_sangwoo`, `geom_sam_out_2_3_...`.
 Workspaces are independent and disposable; the raw capture is never touched.
 
+**Depth mode** — add `--depth` and drop `GEOM_OUT`; the workspace is derived from the
+sessions automatically. See §5.
+
 **Naming varies by scene.** Check what exists first:
 
 ```bash
@@ -142,12 +145,12 @@ Best when a handful of discrete things changed (a room, an office, a lab).
 When *most* of the scene was reconfigured, per-object triage stops being an aid and becomes
 a burden. Here the object is just a tool for making masks — the deliverable is the pixels.
 
-1. **🔍 detect changes** at a coarse preset (see §7).
+1. **🔍 detect changes** at a coarse preset (see §8).
 2. **Sieve** — dismiss the proposals you don't care about; press **🟣 find unresolved
    blobs** and resolve each leftover (promote to an object / merge into an existing one /
    dismiss to green).
 3. **🧱 rebuild all from 3D** — every object's masks are re-derived from multi-view
-   consensus and re-rendered consistently across all frames (see §6).
+   consensus and re-rendered consistently across all frames (see §7).
 4. **Spot-fix** what consensus can't: draw the correction on one frame and press
    **propagate in 3D** — it applies to every frame at once.
 5. Work with the scene view on (`u`), driving purple to zero.
@@ -157,7 +160,95 @@ one "blob" object. Identity is optional when nobody can meaningfully name 200 sh
 
 ---
 
-## 5. The tools
+## 5. Depth mode
+
+A second product, kept strictly apart from the change ground truth: **masks of where the
+NavVis-derived depth cannot be trusted** in an Aria frame. The lidar goes straight through
+glass, so at a window the mesh "surface" is the building across the courtyard — a depth
+value that is confidently wrong. Unobserved regions and mirrors are the same story. A depth
+method trained or scored against NavVis depth must ignore those pixels; depth mode is how
+you mark them.
+
+The object machinery is only a tool here: the deliverable is one per-frame mask, and an
+"object" is just a convenient bag of blobs (e.g. all the windows on a wall).
+
+### Launch
+
+Your change command, minus `GEOM_OUT`, plus `--depth`:
+
+```bash
+cd ~/repos/change_annotator-sangwoo
+PYTHONPATH=~/repos/lamaria-indoor ~/annotator_env/bin/python gui.py \
+  --capture /media/lamaria_indoor/captures/changes/<scene> \
+  --pre-session <walk>_rgb  --pre-ref navvis_<a> \
+  --post-session <walk>_rgb --post-ref navvis_<b> \
+  --depth
+```
+
+The workspace is created for you at `<capture>/depth/<pre-session>__<post-session>/`
+— one per walk pair, nothing to name. `GEOM_OUT` is ignored in depth mode (a note is printed),
+so a stale variable in a saved command can never redirect writes into a change workspace.
+A purple **DEPTH MODE** badge at the top of the page confirms which mode you are in.
+
+### Workflow
+
+1. **Draw** — on a frame where the glass is visible, pick **multi-SAM** and click each
+   window until it is solidly red. Separate clicks stay separate blobs; that is what you
+   want. **add object**, give it any id (`windows`).
+2. **Seed a few more frames** — open the object, scrub to a different viewpoint, `x` to edit,
+   multi-SAM the windows there, `z` to save. Two to five frames spread along the walk, and
+   between them they should see *every* window you care about (a lower row only visible
+   from one spot needs a seed from that spot).
+3. **Propagate** — the object card's **propagate** tracks every blob forward through the
+   walk. Each blob gets its own tracker memory, so a small window cannot be swallowed by a
+   big one, and blobs are run in batches to stay inside GPU memory. Scrub the preview
+   (red = proposed, green = existing), `v` to veto a frame, **apply**.
+4. **Verify and lock** — walk forward; where the masks are right, press **`g`** so nothing
+   automatic can touch them again.
+5. **Fix** — on a frame where a blob drifted, `x`, correct it, `z`, then **propagate this
+   fix**. This is *surgical*: it compares your saved mask with the one you replaced, re-tracks
+   only the regions you actually changed, and leaves every other blob's masks byte-for-byte
+   as they were. Fixing two windows out of twenty costs two tracks, not twenty.
+6. **Export depth masks** — writes the per-frame union of all depth objects to
+   `depth/masks/<state>/<frame>.jpg` (white = depth unreliable) plus
+   `depth/depth_index.json`. `segments.json` and `change_mask/` are never written in
+   depth mode.
+
+Panels that only make sense for change annotation — detect changes, change fields, purple
+blobs, rebuild-from-3D, propagate in 3D — are hidden in depth mode. Glass has no lidar
+points to lift onto, so the 3D tools have nothing to work with here.
+
+### What to expect, honestly
+
+- **Runtime scales with blob count.** Twenty windows seeded from five frames is on the order
+  of a hundred tracks; a full-walk propagate on a long walk can take ten-plus minutes. The
+  card `propagate` therefore runs **forward only**; tick **whole span** in edit mode when
+  you also want frames before the seed filled. The surgical fix is fast because it tracks
+  only what you changed.
+- **Pending previews live in server memory.** A propagation you have not applied is lost
+  if the server stops (or the machine reboots). Apply before you walk away.
+- **Each walk is annotated on its own.** We measured every way of carrying window masks
+  from one walk to another automatically — mesh holes, wall-plane projection, RGB
+  feature matching — and none is reliable on curved glass walls the lidar pierces. Windows
+  sit in fixed places, so seeding the second walk is a few clicks; there is no
+  "port and it's done".
+- **The mask format is provisional** — per-frame binary "depth unreliable" masks today;
+  classes (glass / unobserved / mirror) are a possible later refinement.
+
+### Where things live
+
+| Path | What |
+|---|---|
+| `depth/<pre>__<post>/<id>__<state>/` | the working object (seeds, masks, index) — same layout as a change object |
+| `depth/masks/<state>/*.jpg` | **the deliverable**: per-frame depth-unreliable mask |
+| `depth/depth_index.json` | which frames have a mask |
+
+Depth mode and change mode never write to each other's folders — `<capture>/depth/` and
+`<capture>/changes/` are siblings; both read the raw capture read-only.
+
+---
+
+## 6. The tools
 
 Everything below is display-and-canvas work — nothing is written to disk until you press
 save (`z`), or apply a preview.
@@ -174,7 +265,7 @@ save (`z`), or apply a preview.
 | **line** / **line fill** | Click start, click end — a straight stroke at brush width, chained. `line fill` also fills a loop when you close one. Good for thin legs and cables. |
 | **erase line** / **erase fill** | Same, but removing. `erase fill` deletes an island the moment your cut separates it — carve off a wrongly-included neighbour and it vanishes. |
 | **geom brush** | Paint over a wrong region and only there the mask is replaced by the lidar geometry's answer. |
-| **propagate in 3D** | Lifts your current mask onto the 3D point cloud → applies to *every* frame and walk (§6). |
+| **propagate in 3D** | Lifts your current mask onto the 3D point cloud → applies to *every* frame and walk (§7). |
 
 ### Keys
 
@@ -196,7 +287,7 @@ save (`z`), or apply a preview.
 
 ---
 
-## 6. How masks spread across frames
+## 7. How masks spread across frames
 
 Four mechanisms, from most human to most automatic.
 
@@ -235,7 +326,7 @@ never erases them**.
 
 ---
 
-## 7. Detection settings
+## 8. Detection settings
 
 The **🔍 detect changes (cloud diff + texture diff)** button runs three things: the
 geometric scan diff (proposals named `cd_*`), the change fields that power the scene view,
@@ -263,7 +354,7 @@ with a new `GEOM_OUT`.
 
 ---
 
-## 8. Deciding what *didn't* change
+## 9. Deciding what *didn't* change
 
 Two buttons, easy to confuse, opposite meanings:
 
@@ -278,7 +369,7 @@ When in doubt, **delete** — the system will re-ask.
 
 ---
 
-## 9. Your work is safe
+## 10. Your work is safe
 
 - **The raw capture is never modified.** Everything under `sessions/` — the point clouds,
   the meshes, the images — is opened read-only. Every write goes into your `changes/<workspace>/`
@@ -297,7 +388,7 @@ When in doubt, **delete** — the system will re-ask.
 
 ---
 
-## 10. Output
+## 11. Output
 
 Written under `<capture>/changes/`:
 
@@ -309,6 +400,7 @@ Written under `<capture>/changes/`:
 | `<workspace>/<id>__<state>/masks_index.json` | Which frames have masks, their tier (`src`) and pixel counts |
 | `<workspace>/gui_objects.json` | Object list, labels, done/reviewed flags, frontiers |
 | `<workspace>/fields/` | The green/purple point fields, dismissals, and 3D labels |
+| `depth/masks/<state>/*.jpg` + `depth/depth_index.json` | Depth mode only: per-frame depth-unreliable masks (see §5) |
 
 `segments.json` in short:
 
@@ -334,7 +426,7 @@ export; it is annotation bookkeeping, not ground truth.
 
 ---
 
-## 11. What this tool is good at — and where it struggles
+## 12. What this tool is good at — and where it struggles
 
 **Designed for:** a room-scale scene where 5–30 discrete, rigid, opaque objects changed
 between two well-registered scans, filmed by a walk that revisits them in decent light.
@@ -356,7 +448,7 @@ objects that grow hugely as you approach, scenes needing heavy hand annotation.
 
 ---
 
-## 12. File map
+## 13. File map
 
 | File | Role |
 |---|---|

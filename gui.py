@@ -2336,7 +2336,7 @@ def _export_depth():
     """DEPTH-mode export: OR every non-ghost object's masks per frame into one
     depth mask per state -> capture/depth/masks/<state>/<frame>.png +
     depth_index.json. The object is only a tool; the deliverable is the union."""
-    base = Path(CFG["capture"]) / "changes" / "depth" / "masks"
+    base = Path(CFG["capture"]) / "depth" / "masks"
     unions = {}                                      # (state, frame) -> bool mask
     for key, o in OBJECTS.items():
         if o.get("ghost"):
@@ -2357,7 +2357,7 @@ def _export_depth():
         cv2.imwrite(str(d / flat), (mb.astype(np.uint8) * 255))
         idx.setdefault(state, {})[name] = f"masks/{state}/{flat}"
         n += 1
-    ddir = Path(CFG["capture"]) / "changes" / "depth"
+    ddir = Path(CFG["capture"]) / "depth"
     ddir.mkdir(parents=True, exist_ok=True)
     json.dump(idx, open(ddir / "depth_index.json", "w"), indent=1)
     return n, base
@@ -2444,7 +2444,7 @@ def main():
     ap.add_argument("--depth", action="store_true",
                     help="DEPTH MODE: annotate regions where NavVis depth is unreliable "
                          "(glass pierce, unobserved). Workspace is derived automatically: "
-                         "changes/depth/<pre-session>__<post-session>/ (GEOM_OUT ignored). "
+                         "<capture>/depth/<pre-session>__<post-session>/ (GEOM_OUT ignored). "
                          "Export = per-frame depth masks there, never segments.json/"
                          "change_mask. Default is change mode.")
     args = ap.parse_args()
@@ -2457,16 +2457,30 @@ def main():
     if args.depth:
         # DEPTH MODE workspace is DERIVED from the walk pair — nothing to type,
         # per-walk-pair separation automatic, and it can never land in a change
-        # workspace: changes/depth/<pre-session>__<post-session>/. (Under
-        # changes/ because the capture root is not group-writable.)
-        auto = f"changes/depth/{args.pre_session}__{args.post_session}"
-        new_dir = Path(args.capture) / auto
-        depth_root = Path(args.capture) / "changes" / "depth"
+        # workspace: <capture>/depth/<pre-session>__<post-session>/ — a SIBLING
+        # of changes/, so the depth product is never nested inside the change one.
+        auto = f"depth/{args.pre_session}__{args.post_session}"
+        cap_p = Path(args.capture)
+        depth_root = cap_p / "depth"
+        new_dir = cap_p / auto
         if os.environ.get("GEOM_OUT"):
             print("DEPTH MODE — GEOM_OUT is ignored in depth mode (workspace is derived "
                   "from the sessions)", flush=True)
-        if not new_dir.exists() and depth_root.exists():
-            # one-time migration of a pre-rename workspace (changes/depth/geom_sam_out_*):
+        # one-time migration of the OLD location (changes/depth/, used while the
+        # capture roots were not group-writable): move the whole tree across.
+        old_root = cap_p / "changes" / "depth"
+        if old_root.is_dir() and (not depth_root.exists() or not any(depth_root.iterdir())):
+            if depth_root.exists():
+                depth_root.rmdir()
+            os.replace(old_root, depth_root)
+            print("DEPTH MODE — moved legacy changes/depth -> depth/", flush=True)
+        depth_root.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(depth_root, 0o2775)             # group-writable, setgid (shared dir)
+        except OSError:
+            pass
+        if not new_dir.exists():
+            # one-time migration of a pre-rename workspace (depth/geom_sam_out_*):
             # the one named by GEOM_OUT if given, else the single legacy dir present.
             cands = []
             if os.environ.get("GEOM_OUT"):
