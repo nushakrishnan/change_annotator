@@ -248,10 +248,20 @@ def propagate(capture, obj_dir, anchor_name, iou_floor=0.2, max_span=600,
     anchors = sorted(win.index(n) for n in anchor_names)
 
     def _writable(i):
-        """May frame i be proposed? Not hand, not at/behind the frontier, and in
-        forward mode only frames after the clicked fix."""
+        """May frame i be proposed? Never a hand frame, never at/behind the
+        frontier. Beyond that the BORDER is the frontier when the annotator set
+        one ('good up to here' is the decisive line), else the clicked frame.
+
+        The cursor used to be the border in forward mode, which left the stretch
+        between the frontier and wherever the annotator was standing unreachable:
+        unprotected by the frontier rule, yet excluded by the cursor rule
+        (measured: 0 of 24 such frames filled, g66 cd_post_05__post). Only 16% of
+        real objects carry a frontier, so the cursor rule still guards the past
+        for the other 84% — there it is the only protection they have."""
         if win[i] in hand or (lo + i) <= frontier_glob:
             return False
+        if frontier_glob >= 0:            # g is set: everything past it is fair game
+            return True
         return mode == "span" or i > click_local
 
     say(f"{len(anchors)} anchor(s), span {len(win)} frames, mode={mode}"
@@ -333,8 +343,24 @@ def propagate(capture, obj_dir, anchor_name, iou_floor=0.2, max_span=600,
                     single = False
                     say(f"multi-part: {n_obj} region(s) from {len(seed_anchors)} of {len(anchors)} anchor frame(s)")
 
-            passes = ([(False, fwd, click_local)] if mode == "forward" else
-                      [(False, fwd, anchors[0]), (True, bwd, anchors[-1])])
+            # (reverse, store, start, max_frames). Forward mode tracks forward from
+            # the cursor AND, when a frontier is set, backward from the cursor down
+            # to it — the writable rule alone cannot fill that stretch because a
+            # single forward pass produces no output for frames before its start
+            # (verified: the rule change alone left the gap at 0/24). The backward
+            # pass is capped at the distance to the frontier so it does not walk
+            # the whole window for nothing.
+            if mode == "forward":
+                passes = [(False, fwd, click_local, len(win))]
+                back_lo = max(0, frontier_glob - lo + 1) if frontier_glob >= 0 else None
+                if back_lo is not None and click_local > back_lo:
+                    n_back = click_local - back_lo + 1
+                    passes.append((True, bwd, click_local, n_back))
+                    say(f"frontier is the border: also filling back {n_back - 1} "
+                        f"frame(s) to it")
+            else:
+                passes = [(False, fwd, anchors[0], len(win)),
+                          (True, bwd, anchors[-1], len(win))]
 
             # BATCH the objects: N tracks x per-frame memory over a long walk can
             # OOM a 32 GB GPU. Track in groups of MULTIPART_BATCH, resetting
@@ -351,12 +377,12 @@ def propagate(capture, obj_dir, anchor_name, iou_floor=0.2, max_span=600,
                     oid = fixed if fixed is not None else j + 1
                     tr.add_new_mask(st, frame_idx=al, obj_id=oid,
                                     mask=torch.from_numpy(m.astype(np.float32)))
-                for reverse, store, start in passes:
+                for reverse, store, start, nmax in passes:
                     say(f"propagating {'backward' if reverse else 'forward'} "
-                        f"(group {gi + 1}/{len(groups)}, {len(win)} frames) …")
+                        f"(group {gi + 1}/{len(groups)}, {nmax} frames) …")
                     for fi, _oids, _lr, vrm, _sc in tr.propagate_in_video(
                             st, start_frame_idx=start,
-                            max_frame_num_to_track=len(win),
+                            max_frame_num_to_track=nmax,
                             propagate_preflight=True, reverse=reverse):
                         if fi in anchor_set or win[fi] in hand:
                             continue

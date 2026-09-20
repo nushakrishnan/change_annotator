@@ -210,9 +210,16 @@ A purple **DEPTH MODE** badge at the top of the page confirms which mode you are
    only the regions you actually changed, and leaves every other blob's masks byte-for-byte
    as they were. Fixing two windows out of twenty costs two tracks, not twenty.
 6. **Export depth masks** — writes the per-frame union of all depth objects to
-   `depth/masks/<state>/<frame>.jpg` (white = depth unreliable) plus
-   `depth/depth_index.json`. `segments.json` and `change_mask/` are never written in
+   `depth/sessions/<session>/_export/<frame>.jpg` (white = depth unreliable) plus a
+   `depth_index.json` beside it. `segments.json` and `change_mask/` are never written in
    depth mode.
+
+A depth-unreliable region belongs to **one walk**, not to a walk pair, so both the working
+objects and the deliverable are stored per session. The same walk is the `post` of one pair
+and the `pre` of the next — `no_sofa_2_rgb` is the post of 1↔2 and the pre of 2↔3 — so
+opening the next pair shows that walk **already annotated**, with its masks, labels and
+frontiers intact, and there is nothing to import. Annotate only the walk that is new to you.
+Edits from either pair land on the same files, so the two can never disagree.
 
 Panels that only make sense for change annotation — detect changes, change fields, purple
 blobs, rebuild-from-3D, propagate in 3D — are hidden in depth mode. Glass has no lidar
@@ -239,9 +246,12 @@ points to lift onto, so the 3D tools have nothing to work with here.
 
 | Path | What |
 |---|---|
-| `depth/<pre>__<post>/<id>__<state>/` | the working object (seeds, masks, index) — same layout as a change object |
-| `depth/masks/<state>/*.jpg` | **the deliverable**: per-frame depth-unreliable mask |
-| `depth/depth_index.json` | which frames have a mask |
+| `depth/sessions/<session>/<id>/` | the working object (seeds, masks, index, `object.json`) — same layout as a change object, but keyed by **walk**, so every pair that walk belongs to shares it |
+| `depth/sessions/<session>/_export/*.jpg` | **the deliverable**: per-frame depth-unreliable mask for that walk |
+| `depth/sessions/<session>/_export/depth_index.json` | which frames have a mask, and the session they belong to |
+| `depth/<pre>__<post>/` | the pair you launch with. Holds no masks; `gui_objects.json` here is a derived roster (`.premigration` is the pre-store backup) |
+
+Names starting with `_` or `.` under `depth/sessions/<session>/` are generated, never objects.
 
 Depth mode and change mode never write to each other's folders — `<capture>/depth/` and
 `<capture>/changes/` are siblings; both read the raw capture read-only.
@@ -400,7 +410,7 @@ Written under `<capture>/changes/`:
 | `<workspace>/<id>__<state>/masks_index.json` | Which frames have masks, their tier (`src`) and pixel counts |
 | `<workspace>/gui_objects.json` | Object list, labels, done/reviewed flags, frontiers |
 | `<workspace>/fields/` | The green/purple point fields, dismissals, and 3D labels |
-| `depth/masks/<state>/*.jpg` + `depth/depth_index.json` | Depth mode only: per-frame depth-unreliable masks (see §5) |
+| `depth/sessions/<session>/_export/` (masks + `depth_index.json`) | Depth mode only: per-frame depth-unreliable masks, stored per walk (see §5) |
 
 `segments.json` in short:
 

@@ -84,6 +84,7 @@ def _save_working():
     tmp = p.with_name(f".{p.name}.{os.getpid()}.tmp")
     json.dump(OBJECTS, open(tmp, "w"), indent=1)
     os.replace(tmp, p)
+    _save_working_depth_hook()
 
 
 def _objdir(key):
@@ -91,6 +92,142 @@ def _objdir(key):
     so the key IS the objdir. One physical object (id) may have a 'pre' and a 'post'
     entry (a moved object); they're linked by id and merged at export."""
     return key if key in OBJECTS else None
+
+
+def _save_working_depth_hook():
+    """Called at the end of _save_working: in DEPTH mode the authoritative copy
+    of an object's metadata lives with its masks in the per-session store, and
+    the pair's gui_objects.json is a derived roster only."""
+    if CFG.get("depth"):
+        _save_depth_objects()
+
+
+def _obj_dir(key):
+    """The one directory holding an object's masks, seeds and index.
+
+    CHANGE mode: <capture>/<GEOM_OUT>/<id>__<state> — unchanged; the key IS the
+    subdir name (see _objdir).
+
+    DEPTH mode: <capture>/depth/sessions/<session>/<id>. A depth-unreliable
+    region (glass, ceiling, unobserved) is a property of ONE walk, not of a walk
+    PAIR: no_sofa_2_rgb is the 'post' of 1<->2 and the 'pre' of 2<->3. Stored
+    per pair, that walk's masks forked into two directories that silently
+    diverged — fix the ceiling while working 2<->3 and pair 1<->2 still exports
+    the stale version, with nothing to detect it. Keyed by session there is one
+    product per walk: both pairs read and write it, and opening a new pair finds
+    the walk already annotated instead of blank. Nothing inside the directory
+    needs rewriting, because every masks_index entry already records its own
+    'session' — the pair folder was the only thing that never did."""
+    if not CFG.get("depth"):
+        return G.out_dir(CFG["capture"], key)
+    oid, _, state = str(key).rpartition("__")
+    st = CFG["states"].get(state) if oid else None
+    if not st:                      # not an '<id>__<state>' key — leave it alone
+        return G.out_dir(CFG["capture"], key)
+    d = Path(CFG["capture"]) / "depth" / "sessions" / st["session"] / oid
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+# Everything under depth/sessions/<sid>/ is an object dir EXCEPT these, and
+# except anything starting with '_' or '.'. '_export' holds the deliverable (the
+# union masks): it must never be mistaken for an object when the store is
+# scanned, or an object whose label collided with it would silently vanish on
+# the next reload. Generated names are '_'-prefixed so a typed label cannot
+# reach them by accident.
+DEPTH_RESERVED = ("_export", ".trash")
+DEPTH_MARKERS = ("object.json", "masks_index.json", "src_index.json", "seeds.json")
+
+
+def _save_depth_objects():
+    """DEPTH mode: an object's metadata describes the WALK, so it lives beside
+    the masks in the per-session store. Everything travels except 'state' —
+    that is the object's role in whichever pair you happen to have open, and is
+    re-derived from the session directory the object was found in."""
+    for key, o in OBJECTS.items():
+        oid, _, state = key.rpartition("__")
+        if not oid or state not in CFG["states"]:
+            continue
+        d = _obj_dir(key)
+        meta = {k: v for k, v in o.items() if k != "state"}
+        tmp = d / f".object.json.{os.getpid()}.tmp"
+        json.dump(meta, open(tmp, "w"), indent=1)
+        os.replace(tmp, d / "object.json")
+
+
+def _load_depth_objects(cap):
+    """Rebuild OBJECTS from the per-session store: every object dir under the
+    two walks of the open pair, with 'state' set by which walk it came from. An
+    object annotated in an EARLIER pair is picked up here — that is the whole
+    point of the store, and why no import step has to exist."""
+    n = 0
+    for state in ("pre", "post"):
+        sid = (CFG["states"].get(state) or {}).get("session")
+        if not sid:
+            continue
+        root = Path(cap) / "depth" / "sessions" / sid
+        if not root.is_dir():
+            continue
+        for d in sorted(x for x in root.iterdir() if x.is_dir()):
+            if d.name in DEPTH_RESERVED or d.name[0] in "._":
+                continue
+            if not any((d / m).exists() for m in DEPTH_MARKERS):
+                continue
+            mp = d / "object.json"
+            try:
+                o = json.load(open(mp)) if mp.exists() else {}
+            except Exception as e:
+                print(f"warn: bad {mp}: {e}", flush=True)
+                o = {}
+            o.pop("change_type", None)
+            o["id"] = o.get("id") or d.name
+            o["state"] = state
+            o.setdefault("label", o["id"])
+            o.setdefault("instance", o["id"])
+            OBJECTS[f"{o['id']}__{state}"] = o
+            n += 1
+    return n
+
+
+def _migrate_pair_to_store(cap, gobj):
+    """One-time move of a per-PAIR depth workspace into the per-session store.
+    Nothing is deleted: directories are MOVED and the pair roster is kept as
+    gui_objects.json.premigration, so the step is reversible by hand. A walk
+    already present in the store is never overwritten — that case is reported
+    and left alone, because only a human knows which copy is current."""
+    if not gobj.exists():
+        return
+    try:
+        roster = json.load(open(gobj))
+    except Exception as e:
+        print(f"warn: could not read {gobj}: {e}", flush=True)
+        return
+    ws, moved, kept = gobj.parent, 0, []
+    for k, o in roster.items():
+        state = o.get("state")
+        oid = o.get("id") or k.split("__")[0]
+        if state not in CFG["states"]:
+            continue
+        src = ws / f"{oid}__{state}"
+        if not src.is_dir():
+            continue
+        dst = Path(cap) / "depth" / "sessions" / CFG["states"][state]["session"] / oid
+        if dst.exists():
+            kept.append(f"{src.name} -> {dst} already exists")
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(dst))
+        meta = {a: b for a, b in o.items() if a != "state"}
+        meta.pop("change_type", None)
+        meta["id"] = oid
+        json.dump(meta, open(dst / "object.json", "w"), indent=1)
+        moved += 1
+    if moved:
+        os.replace(gobj, gobj.with_name(gobj.name + ".premigration"))
+        print(f"DEPTH MODE — moved {moved} object(s) into depth/sessions/; "
+              f"{gobj.name} kept as {gobj.name}.premigration", flush=True)
+    for msg in kept:
+        print(f"DEPTH MODE — NOT migrated, resolve by hand: {msg}", flush=True)
 
 
 def _change_type(in_pre, in_post):
@@ -173,7 +310,7 @@ def frame():
 
 @app.route("/results/<obj>/<path:fn>")
 def results(obj, fn):
-    return send_file(G.out_dir(CFG["capture"], obj) / fn)
+    return send_file(_obj_dir(obj) / fn)
 
 
 # ───────────────────────────── click preview ─────────────────────────────
@@ -219,7 +356,7 @@ def api_add_object():
     if not mask.any():
         return jsonify(error="mask is empty"), 400
     key = f"{oid}__{state}"  # same id in pre + post = a moved object (linked at export)
-    od = G.out_dir(CFG["capture"], key)
+    od = _obj_dir(key)
     cv2.imwrite(str(od / "src_mask.png"), (mask * 255).astype(np.uint8))  # first seed (viz)
     _add_seed_mask(od, frame, mask, reset=True)                          # multi-seed store
     if CFG.get("depth"):        # depth objects have no liftable geometry (glass) — the
@@ -261,7 +398,7 @@ def api_add_seed():
         return jsonify(error="no mask — click or draw the object first"), 400
     if not mask.any():
         return jsonify(error="mask is empty"), 400
-    od = G.out_dir(CFG["capture"], oid)
+    od = _obj_dir(oid)
     n = _add_seed_mask(od, frame, mask)
     sf = OBJECTS[oid].setdefault("seed_frames", [OBJECTS[oid].get("frame")])
     if frame not in sf:
@@ -426,7 +563,7 @@ def api_remask():
         return jsonify(error="object is marked done — uncheck done to remask"), 400
     if not label:
         return jsonify(error="type a label first (e.g. chair, table)"), 400
-    if not (G.out_dir(CFG["capture"], oid) / "seeds.json").exists():
+    if not (_obj_dir(oid) / "seeds.json").exists():
         return jsonify(error="no seeds for this object — propagate/detect it first"), 400
     OBJECTS[oid]["label"] = label
     _save_working()
@@ -439,7 +576,7 @@ def api_remask():
 def _remask_job(job_id, oid, label):
     try:
         cap = Path(CFG["capture"])
-        od = G.out_dir(CFG["capture"], oid)
+        od = _obj_dir(oid)
         seeds = json.load(open(od / "seeds.json"))
         mi_path = od / "masks_index.json"
         mi = json.load(open(mi_path)) if mi_path.exists() else {}
@@ -504,7 +641,7 @@ def api_depth_propagate():
     oid = d["id"]
     if oid not in OBJECTS:
         return jsonify(error="unknown object"), 404
-    od = G.out_dir(CFG["capture"], oid)
+    od = _obj_dir(oid)
     sid = CFG["states"][OBJECTS[oid]["state"]]["session"]
     mi_path = od / "masks_index.json"
     mi = json.load(open(mi_path)) if mi_path.exists() else {}
@@ -549,7 +686,7 @@ def api_propagate_fix():
         return jsonify(error="unknown object"), 404
     if OBJECTS[oid].get("done"):
         return jsonify(error="object is marked done — uncheck done to propagate"), 400
-    mi_path = G.out_dir(CFG["capture"], oid) / "masks_index.json"
+    mi_path = _obj_dir(oid) / "masks_index.json"
     mi = json.load(open(mi_path)) if mi_path.exists() else {}
     if frame not in mi:
         return jsonify(error="this frame has no saved mask — fix & save it first"), 400
@@ -612,7 +749,7 @@ def _preview_grid(od, results, flags, sid_for, job_id):
 
 def _propagate_fix_job(job_id, oid, frame, mode):
     try:
-        od = G.out_dir(CFG["capture"], oid)
+        od = _obj_dir(oid)
         cb = lambda s: JOBS[job_id].update(msg=s)
         cb("loading video tracker (first use takes ~1 min) …")
         pe = od / "masks" / ".preedit" / frame.replace("/", "_")
@@ -632,10 +769,13 @@ def _propagate_fix_job(job_id, oid, frame, mode):
             t_old = [w for w in PF._window_components(old) if (w & xor).any()]
             cb(f"surgical fix: {len(t_new)} edited region(s)")
             fr = OBJECTS[oid].get("verified_until")
+            # honour the caller's mode: hardcoding "forward" here made the
+            # "whole span" checkbox dead exactly when a .preedit exists, i.e.
+            # whenever the annotator had fixed an EXISTING mask.
             res_new, flags, meta = PF.propagate(
-                CFG["capture"], od, frame, mode="forward", seed_components=t_new,
+                CFG["capture"], od, frame, mode=mode, seed_components=t_new,
                 frontier_name=fr, progress=cb) if t_new else ({}, {}, {"anchors": 1, "span": 0, "stops": []})
-            res_old = (PF.propagate(CFG["capture"], od, frame, mode="forward",
+            res_old = (PF.propagate(CFG["capture"], od, frame, mode=mode,
                        seed_components=t_old, frontier_name=fr)[0]) if t_old else {}
             results = {}
             for n in set(res_new) | set(res_old):
@@ -748,7 +888,7 @@ def api_propagate_apply():
         return jsonify(error="object was marked done after this preview — uncheck done to apply"), 400
     f_ts = G.frontier_ts(OBJECTS.get(oid, {}).get("verified_until"))
     exclude = set(d.get("exclude") or [])            # per-frame vetoes from pending review
-    od = G.out_dir(CFG["capture"], oid)
+    od = _obj_dir(oid)
     mi_path = od / "masks_index.json"
     mi = json.load(open(mi_path)) if mi_path.exists() else {}
     bak = od / "masks" / f".bak_{job_id}"
@@ -884,7 +1024,7 @@ def _object_mask_paths(oid):
     anything that reads just masks_index treats it as unannotated: it stayed
     invisible in the scene view and missing from the export. masks_index wins
     where both exist (that is the reviewed/applied version)."""
-    od = G.out_dir(CFG["capture"], oid)
+    od = _obj_dir(oid)
     out = {}
     idx = od / "src_index.json"
     if idx.exists():
@@ -1176,7 +1316,7 @@ def _rebuild_one(oid, threshold, cb, refine=True):
     fdir = G.out_dir(CFG["capture"]) / "fields"
     if not (fdir / f"static_{state}.npy").exists():
         raise ValueError("fields not computed (run detect / compute fields)")
-    od = G.out_dir(CFG["capture"], oid)
+    od = _obj_dir(oid)
     mi_path = od / "masks_index.json"
     mi = json.load(open(mi_path)) if mi_path.exists() else {}
     # evidence = per-frame masks PLUS the seed store (src_masks/ + src_index.json,
@@ -1335,7 +1475,7 @@ def _rebuild_job(job_id, oid, threshold):
                                 msg=f"nothing rendered ({stats['kept']} pts kept "
                                     f"of {stats['cand']} candidates — lower the vote?)")
             return
-        od = G.out_dir(CFG["capture"], oid)
+        od = _obj_dir(oid)
         mi_path = od / "masks_index.json"            # absent on a seeds-only object
         mi = json.load(open(mi_path)) if mi_path.exists() else {}
         flags = {}
@@ -1380,7 +1520,7 @@ def _rebuild_batch_job(job_id, threshold):
                 continue
             if not results:
                 continue
-            od = G.out_dir(CFG["capture"], oid)
+            od = _obj_dir(oid)
             mi_path = od / "masks_index.json"
             mi = json.load(open(mi_path)) if mi_path.exists() else {}
             f_ts = G.frontier_ts(OBJECTS.get(oid, {}).get("verified_until"))
@@ -1466,7 +1606,7 @@ def api_claim_purple():
         return jsonify(error="no unclaimed purple at this pixel"), 400
     ncomp, lab = cv2.connectedComponents(free.astype(np.uint8))
     comp = lab == lab[y, x]
-    od = G.out_dir(CFG["capture"], oid)
+    od = _obj_dir(oid)
     mi_path = od / "masks_index.json"
     mi = json.load(open(mi_path)) if mi_path.exists() else {}
     e = mi.get(frame)
@@ -1523,7 +1663,7 @@ def api_dismiss_object():
     if OBJECTS[oid].get("done"):
         return jsonify(error="object is done — uncheck to dismiss"), 400
     state = OBJECTS[oid]["state"]
-    od = G.out_dir(CFG["capture"], oid)
+    od = _obj_dir(oid)
     greened = False
     for cn in ("cluster.npy", "cluster_enriched.npy"):
         cp = od / cn
@@ -1539,8 +1679,8 @@ def api_dismiss_object():
             break
     OBJECTS.pop(oid)
     _save_working()
-    if od.exists():
-        trash = Path(CFG["capture"]) / G.OUT / ".trash"
+    if od.exists() and any(od.iterdir()):     # _obj_dir creates the dir on demand;
+        trash = od.parent / ".trash"          # an empty one is not worth trashing
         trash.mkdir(exist_ok=True)
         dest = trash / oid
         if dest.exists():
@@ -1575,7 +1715,7 @@ def api_purple_blobs():
             if o.get("state") != state or o.get("ghost"):
                 continue
             for cn in ("cluster.npy", "cluster_enriched.npy"):
-                cp = G.out_dir(CFG["capture"], key) / cn
+                cp = _obj_dir(key) / cn
                 if cp.exists():
                     explained.append(np.load(cp).astype(np.float64))
                     break
@@ -1654,7 +1794,7 @@ def api_resolve_blob():
         target = d.get("target") or ""
         if target not in OBJECTS:
             return jsonify(error=f"unknown target object '{target}'"), 404
-        od = G.out_dir(CFG["capture"], target)
+        od = _obj_dir(target)
         cp = od / "cluster.npy"
         P = np.vstack([np.load(cp), pts]) if cp.exists() else pts
         np.save(cp, P.astype(np.float32))
@@ -1669,7 +1809,7 @@ def api_resolve_blob():
         if not cand.get("seeds"):
             return jsonify(error="blob not visible in the walk (occlusion) — dismiss instead?"), 400
         key = f"{bid}__{state}"
-        od = G.out_dir(CFG["capture"], key)
+        od = _obj_dir(key)
         json.dump(cand["seeds"], open(od / "seeds.json", "w"), indent=1)
         np.save(od / "cluster.npy", pts.astype(np.float32))
         OBJECTS[key] = {"id": bid, "label": "", "deformability": "rigid",
@@ -1700,7 +1840,7 @@ def api_who_is_here():
     for key, o in OBJECTS.items():
         if o.get("state") != state or o.get("ghost"):
             continue
-        od = G.out_dir(CFG["capture"], key)
+        od = _obj_dir(key)
         p = _object_mask_paths(key).get(frame)
         if p is not None:
             m = cv2.imread(str(p), 0)
@@ -1766,7 +1906,7 @@ def _project_silhouette(oid, name, cur_px=0, pure_only=False):
     guard failures retry with the union. pure_only skips that fallback (the
     lift-enriched shell must never SHAPE masks — geom-snap). Returns
     (sil, n_points, error_msg)."""
-    od = G.out_dir(CFG["capture"], oid)
+    od = _obj_dir(oid)
     cpath = od / "cluster.npy"
     epath = od / "cluster_enriched.npy"
     if pure_only:
@@ -1883,19 +2023,26 @@ def _propagate_job(job_id, oid):
         # cmd_seeds unions: explicit src_masks + ALL hand masks + cluster.npy if the
         # object came from cloud diff — the completed geometry covers the holes the
         # cluster alone missed. Cluster objects use the strict occlusion defaults.
-        env = dict(os.environ, PYTHONPATH=LAMARIA_PYTHONPATH, GEOM_OUT=G.OUT)  # match in-proc root
+        # The subprocess writes to <capture>/<GEOM_OUT>/<--obj>, so in DEPTH mode
+        # both have to be re-pointed at the per-session store or the seeds land
+        # in the pair folder while every other reader looks in the store.
+        g_out, g_obj = G.OUT, objdir
+        if CFG.get("depth"):
+            d = _obj_dir(objdir)                     # .../depth/sessions/<sid>/<id>
+            g_out, g_obj = str(d.parent.relative_to(CFG["capture"])), d.name
+        env = dict(os.environ, PYTHONPATH=LAMARIA_PYTHONPATH, GEOM_OUT=g_out)  # match in-proc root
         seed_cmd = [str(ANNOTATOR_PY), str(G.__file__), "seeds",
                     "--capture", CFG["capture"], "--session", st["session"],
-                    "--ref", st["ref"], "--src-name", o["frame"], "--obj", objdir,
+                    "--ref", st["ref"], "--src-name", o["frame"], "--obj", g_obj,
                     "--n", str(CFG["seed"]["n"]), "--min-vis", str(CFG["seed"]["min_vis"]),
                     "--no-cross"]
-        if (G.out_dir(CFG["capture"], objdir) / "cluster.npy").exists():
+        if (_obj_dir(objdir) / "cluster.npy").exists():
             seed_cmd += ["--occ-scale", "0.5", "--occ-tol", "0.05", "--min-frac", "0.3"]
         subprocess.run(seed_cmd, check=True, env=env)
         # 2) per-frame SAM masks (in-process, shared model)
         n = _perframe_inproc(objdir, st["session"])
         # 3) collect viz for review (under the workspace, no external dir)
-        od = G.out_dir(CFG["capture"], objdir)
+        od = _obj_dir(objdir)
         viz = G.out_dir(CFG["capture"]) / "_review" / objdir
         viz.mkdir(parents=True, exist_ok=True)
         if (od / "result_contact.png").exists():
@@ -1911,7 +2058,7 @@ def _propagate_job(job_id, oid):
 
 
 def _perframe_inproc(objdir, default_session):
-    od = G.out_dir(CFG["capture"], objdir)
+    od = _obj_dir(objdir)
     seeds = json.load(open(od / "seeds.json"))
     masks_dir = od / "masks"
     masks_dir.mkdir(exist_ok=True)
@@ -1989,14 +2136,14 @@ def api_objects():
         states_by_id.setdefault(o.get("instance", o["id"]), set()).add(o["state"])
     out = {}
     for key, o in OBJECTS.items():
-        mi = G.out_dir(CFG["capture"], key) / "masks_index.json"
+        mi = _obj_dir(key) / "masks_index.json"
         n = 0
         if mi.exists():
             try:
                 n = len(json.load(open(mi)))
             except Exception:
                 n = 0
-        idxp = G.out_dir(CFG["capture"], key) / "src_index.json"
+        idxp = _obj_dir(key) / "src_index.json"
         try:
             n_seeds = len(json.load(open(idxp))) if idxp.exists() else 1
         except Exception:
@@ -2019,7 +2166,7 @@ def api_object_frames():
     fdir = Path(CFG["capture"]) / "sessions" / sid / "raw_data" / "images" / "cam0"
     names = sorted((f"images/cam0/{p.name}" for p in fdir.glob("*.jpg")),
                    key=lambda n: int(Path(n).stem))     # timestamp order, matches propagation
-    mi_path = G.out_dir(CFG["capture"], _objdir(oid)) / "masks_index.json"
+    mi_path = _obj_dir(_objdir(oid)) / "masks_index.json"
     mi = json.load(open(mi_path)) if mi_path.exists() else {}
     frames = [{"name": n, "session": mi[n]["session"] if n in mi else sid,
                "has_mask": n in mi, "px": mi[n].get("px") if n in mi else None}
@@ -2029,7 +2176,7 @@ def api_object_frames():
 
 
 def _mask_entry(oid, name):
-    od = G.out_dir(CFG["capture"], _objdir(oid))
+    od = _obj_dir(_objdir(oid))
     mi_path = od / "masks_index.json"
     mi = json.load(open(mi_path)) if mi_path.exists() else {}
     return od, mi_path, mi, mi.get(name)
@@ -2210,15 +2357,20 @@ def api_delete_mask():
 def api_delete_object():
     """Remove an erroneous object: drop it from the working set and move its
     on-disk workspace (seeds + masks) to a .trash folder so it stays recoverable
-    rather than being permanently deleted."""
+    rather than being permanently deleted.
+
+    DEPTH mode: the object belongs to the WALK, so this removes it for every
+    pair that walk appears in — which is the point of one store, but it is a
+    wider action than it looks. The move to .trash (beside the walk's objects,
+    at depth/sessions/<sid>/.trash) keeps it recoverable."""
     oid = request.get_json()["id"]
     if oid not in OBJECTS:
         return jsonify(error="unknown object"), 404
+    od = _obj_dir(oid)                        # resolve BEFORE dropping the entry
     OBJECTS.pop(oid)
     _save_working()
-    od = Path(CFG["capture"]) / G.OUT / oid
-    if od.exists():
-        trash = Path(CFG["capture"]) / G.OUT / ".trash"
+    if od.exists() and any(od.iterdir()):
+        trash = od.parent / ".trash"
         trash.mkdir(exist_ok=True)
         dest = trash / oid
         if dest.exists():
@@ -2334,33 +2486,42 @@ def _composite_group_mask(iid, state, frame, paths):
 
 def _export_depth():
     """DEPTH-mode export: OR every non-ghost object's masks per frame into one
-    depth mask per state -> capture/depth/masks/<state>/<frame>.png +
-    depth_index.json. The object is only a tool; the deliverable is the union."""
-    base = Path(CFG["capture"]) / "depth" / "masks"
-    unions = {}                                      # (state, frame) -> bool mask
+    depth mask per state. The object is only a tool; the deliverable is the union.
+
+    The deliverable belongs to the WALK, not to the pair you happened to have
+    open, so it is written beside that walk's objects:
+        <capture>/depth/sessions/<session>/_export/<frame>.jpg
+        <capture>/depth/sessions/<session>/_export/depth_index.json
+    'pre'/'post' never appear in the path — they are roles in one pair, and the
+    same walk swaps roles between pairs (no_sofa_2_rgb is the 'post' of 1<->2
+    and the 'pre' of 2<->3). Keyed per walk there is exactly one answer for a
+    walk's depth masks, and a consumer needs no knowledge of pairs to find it."""
+    unions = {}                                   # (session, frame) -> bool mask
     for key, o in OBJECTS.items():
         if o.get("ghost"):
             continue
-        state = o["state"]
+        sid = CFG["states"][o["state"]]["session"]
         for name, mpath in _object_mask_paths(key).items():
             m = cv2.imread(str(mpath), 0)
             if m is None:
                 continue
             mb = m > 127
-            u = unions.get((state, name))
-            unions[(state, name)] = mb if u is None else (u | mb)
-    idx, n = {}, 0
-    for (state, name), mb in unions.items():
-        d = base / state
+            u = unions.get((sid, name))
+            unions[(sid, name)] = mb if u is None else (u | mb)
+    base = Path(CFG["capture"]) / "depth" / "sessions"
+    per, n = {}, 0
+    for (sid, name), mb in sorted(unions.items()):
+        d = base / sid / "_export"
         d.mkdir(parents=True, exist_ok=True)
         flat = name.replace("/", "_")
-        cv2.imwrite(str(d / flat), (mb.astype(np.uint8) * 255))
-        idx.setdefault(state, {})[name] = f"masks/{state}/{flat}"
+        if not cv2.imwrite(str(d / flat), (mb.astype(np.uint8) * 255)):
+            raise OSError(f"could not write {d / flat}")
+        per.setdefault(sid, {})[name] = flat
         n += 1
-    ddir = Path(CFG["capture"]) / "depth"
-    ddir.mkdir(parents=True, exist_ok=True)
-    json.dump(idx, open(ddir / "depth_index.json", "w"), indent=1)
-    return n, base
+    for sid, frames in per.items():
+        json.dump({"session": sid, "frames": frames},
+                  open(base / sid / "_export" / "depth_index.json", "w"), indent=1)
+    return n, ", ".join(f"{s}/_export ({len(f)})" for s, f in sorted(per.items())) or base
 
 
 @app.route("/api/export", methods=["POST"])
@@ -2386,7 +2547,7 @@ def _api_export_change():
     for key, o in OBJECTS.items():
         if o.get("ghost"):
             continue
-        od = G.out_dir(CFG["capture"], key)
+        od = _obj_dir(key)
         mi = _object_mask_paths(key)           # incl. seed-born masks (src_masks/)
         iid = o.get("instance") or o["id"]     # group / moved pair = shared instance id
         e = by_id.setdefault(iid, {"label": o["label"],
@@ -2505,7 +2666,16 @@ def main():
     legacy = Path(args.capture) / "changes" / "gui_objects.json"
     if not gobj.exists() and G.OUT == "changes/geom_sam_out" and legacy.exists():
         gobj = legacy                                             # migrate the default workspace
-    if gobj.exists():
+    if args.depth:
+        # DEPTH mode reads the per-session store, not the pair roster: an object
+        # annotated as the 'post' of an earlier pair is already there and simply
+        # reappears as the 'pre' of this one, with its frontier and label intact.
+        _migrate_pair_to_store(args.capture, gobj)
+        n = _load_depth_objects(args.capture)
+        print(f"DEPTH MODE — {n} object(s) from depth/sessions/ "
+              f"({', '.join(sorted({CFG['states'][s]['session'] for s in ('pre', 'post')}))})",
+              flush=True)
+    elif gobj.exists():
         try:
             for k, o in json.load(open(gobj)).items():
                 o.pop("change_type", None)        # derived now, not stored (spec §4a)
