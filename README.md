@@ -185,8 +185,10 @@ PYTHONPATH=~/repos/lamaria-indoor ~/annotator_env/bin/python gui.py \
   --depth
 ```
 
-The workspace is created for you at `<capture>/depth/<pre-session>__<post-session>/`
-— one per walk pair, nothing to name. `GEOM_OUT` is ignored in depth mode (a note is printed),
+The pair workspace is created for you at `<capture>/depth/<pre-session>__<post-session>/`
+— nothing to name. It holds no masks: those live per walk in
+`<capture>/depth/sessions/<walk>/` (see *Where things live* below), so the pair only decides
+which two walks you see. `GEOM_OUT` is ignored in depth mode (a note is printed),
 so a stale variable in a saved command can never redirect writes into a change workspace.
 A purple **DEPTH MODE** badge at the top of the page confirms which mode you are in.
 
@@ -222,8 +224,11 @@ frontiers intact, and there is nothing to import. Annotate only the walk that is
 Edits from either pair land on the same files, so the two can never disagree.
 
 Panels that only make sense for change annotation — detect changes, change fields, purple
-blobs, rebuild-from-3D, propagate in 3D — are hidden in depth mode. Glass has no lidar
-points to lift onto, so the 3D tools have nothing to work with here.
+blobs, rebuild-from-3D, propagate in 3D — are hidden in depth mode. Not for want of points:
+the lidar returns plenty inside a window mask (measured on dlab, ~2x the ambient density).
+It returns them at the *wrong depth* — the courtyard behind the glass, not the glass — so
+lifting a mask to 3D and re-rendering it from another viewpoint scatters it. The substrate
+is there but poisoned, which is why the 3D tools cannot help here.
 
 ### What to expect, honestly
 
@@ -477,7 +482,50 @@ objects that grow hugely as you approach, scenes needing heavy hand annotation.
 
 ## Appendix — depth mode commands
 
-Run from `~/repos/change_annotator-sangwoo`. Each writes to `<capture>/depth/<pre>__<post>/`. Add `--port 5001` if 5000 is taken.
+Run from `~/repos/change_annotator-sangwoo`. Masks land per walk in
+`<capture>/depth/sessions/<walk>/`, and the export in `.../_export/` — the pair you launch
+with only decides which two walks you see. Add `--port 5001` if 5000 is taken (and open a
+second SSH tunnel for it).
+
+**Because storage is per walk, a walk annotated in one pair reappears already done in the
+next.** So after the first pair of a chain, only the post side is new work. Pair an
+unexported walk with an unannotated one and a single export at the end covers both.
+
+### Every walk, and its reference scan
+
+The ref is a property of the walk, not the capture — `hg_lobby` alone holds four families
+with three different refs. Check this table rather than copying a ref across.
+
+| capture | walks | ref |
+|---|---|---|
+| `billiards` | `billiards_1_1_rgb` `_2_1_rgb` `_3_1_rgb` | `navvis_1` / `_2` / `_3` |
+| `cab_kitchen` | `cab_kitchen_1_rgb` `_2_rgb` | `navvis_1` / `_2` |
+| `climate_day` | `climate_day_1_1..1_3_rgb` | `navvis_2` |
+| | `climate_day_2_1..2_3_rgb` | `navvis_3` |
+| `cnb_e100` | `aria_a_rgb` / `aria_b_rgb` | `navvis_1` / `_2` |
+| `cvg_kitchen` | `cvg_kitchen_1_rgb` `_2_rgb` | `navvis_1` / `_2` |
+| `dlab_open_space` | `dlab_open_space_1..3_rgb` | `navvis_1` / `_2` / `_3` |
+| `g66` | `g66_1_rgb` `_2_rgb` | `navvis_1` / `_2` |
+| `hg_lobby` | `construction_e_1..4_rgb` | `construction` |
+| | `hg_empty_1..5_rgb` | `hg_empty` |
+| | `hg_phd_2_1..2_5_rgb` | `learning_fair` |
+| | `nexus_1..3_rgb` | `nexus` |
+| `no_sofa_area` | `no_sofa_1..4_rgb` | `navvis_1`…`navvis_4` |
+| `polymesse` | `hg_poly1_1..1_4_rgb` | `navvis_1` |
+| | `hg_poly2_1..2_9_rgb` | `navvis_2` |
+| `sud_hg` | `nexus_4..6_rgb` | `nexus` |
+| | `sud_e_empty_1..3_rgb` | `sud_empty` |
+
+Two traps worth naming. **`nexus` is split across two captures** — walks 1–3 are in
+`hg_lobby`, walks 4–6 in `sud_hg`; you cannot pair across captures, so they are annotated
+as two separate groups. And **`cnb_e100`'s walks are called `aria_a` / `aria_b`**, not
+`cnb_e100_1` / `_2`, whatever a naming sheet may say.
+
+To see what is still outstanding at any time:
+
+```bash
+ls -d /media/lamaria_indoor/captures/changes/*/depth/sessions/*/_export
+```
 
 **climate_day — walk 1**
 ```bash
@@ -574,6 +622,96 @@ PYTHONPATH=~/repos/lamaria-indoor ~/annotator_env/bin/python gui.py \
   --pre-session no_sofa_3_rgb --pre-ref navvis_3 \
   --post-session no_sofa_4_rgb --post-ref navvis_4 --depth
 ```
+
+**billiards — 2↔3**
+```bash
+PYTHONPATH=~/repos/lamaria-indoor ~/annotator_env/bin/python gui.py \
+  --capture /media/lamaria_indoor/captures/changes/billiards \
+  --pre-session billiards_2_1_rgb --pre-ref navvis_2 \
+  --post-session billiards_3_1_rgb --post-ref navvis_3 --depth
+```
+
+**cnb_e100** — note the `aria_a` / `aria_b` walk names
+```bash
+PYTHONPATH=~/repos/lamaria-indoor ~/annotator_env/bin/python gui.py \
+  --capture /media/lamaria_indoor/captures/changes/cnb_e100 \
+  --pre-session aria_a_rgb --pre-ref navvis_1 \
+  --post-session aria_b_rgb --post-ref navvis_2 --depth
+```
+
+**polymesse — poly1** (4 walks, all `navvis_1`)
+```bash
+PYTHONPATH=~/repos/lamaria-indoor ~/annotator_env/bin/python gui.py \
+  --capture /media/lamaria_indoor/captures/changes/polymesse \
+  --pre-session hg_poly1_3_rgb --pre-ref navvis_1 \
+  --post-session hg_poly1_4_rgb --post-ref navvis_1 --depth
+```
+Other poly1 pairings: `1_1↔1_2`, `1_2↔1_3`.
+
+**polymesse — poly2** (9 walks, all `navvis_2`)
+```bash
+PYTHONPATH=~/repos/lamaria-indoor ~/annotator_env/bin/python gui.py \
+  --capture /media/lamaria_indoor/captures/changes/polymesse \
+  --pre-session hg_poly2_3_rgb --pre-ref navvis_2 \
+  --post-session hg_poly2_7_rgb --post-ref navvis_2 --depth
+```
+Swap the two session names to walk the rest: `2_4↔2_8`, `2_5↔2_9`, `2_6↔2_1`, `2_1↔2_2`.
+Pairing an already-annotated walk with a fresh one flushes the older one's export in the
+same sitting.
+
+**hg_lobby — construction_e** (4 walks, ref `construction`)
+```bash
+PYTHONPATH=~/repos/lamaria-indoor ~/annotator_env/bin/python gui.py \
+  --capture /media/lamaria_indoor/captures/changes/hg_lobby \
+  --pre-session construction_e_1_rgb --pre-ref construction \
+  --post-session construction_e_2_rgb --post-ref construction --depth
+```
+Then `3↔4`.
+
+**hg_lobby — hg_empty** (5 walks, ref `hg_empty`)
+```bash
+PYTHONPATH=~/repos/lamaria-indoor ~/annotator_env/bin/python gui.py \
+  --capture /media/lamaria_indoor/captures/changes/hg_lobby \
+  --pre-session hg_empty_1_rgb --pre-ref hg_empty \
+  --post-session hg_empty_2_rgb --post-ref hg_empty --depth
+```
+Then `2↔3`, `3↔4`, `4↔5`.
+
+**hg_lobby — hg_phd** (5 walks, ref `learning_fair`)
+```bash
+PYTHONPATH=~/repos/lamaria-indoor ~/annotator_env/bin/python gui.py \
+  --capture /media/lamaria_indoor/captures/changes/hg_lobby \
+  --pre-session hg_phd_2_1_rgb --pre-ref learning_fair \
+  --post-session hg_phd_2_2_rgb --post-ref learning_fair --depth
+```
+Then `2_2↔2_3`, `2_3↔2_4`, `2_4↔2_5`.
+
+**hg_lobby — nexus 1–3** (ref `nexus`)
+```bash
+PYTHONPATH=~/repos/lamaria-indoor ~/annotator_env/bin/python gui.py \
+  --capture /media/lamaria_indoor/captures/changes/hg_lobby \
+  --pre-session nexus_1_rgb --pre-ref nexus \
+  --post-session nexus_2_rgb --post-ref nexus --depth
+```
+Then `2↔3`.
+
+**sud_hg — nexus 4–6** (ref `nexus`, a *different capture* from nexus 1–3)
+```bash
+PYTHONPATH=~/repos/lamaria-indoor ~/annotator_env/bin/python gui.py \
+  --capture /media/lamaria_indoor/captures/changes/sud_hg \
+  --pre-session nexus_4_rgb --pre-ref nexus \
+  --post-session nexus_5_rgb --post-ref nexus --depth
+```
+Then `5↔6`.
+
+**sud_hg — sud_e_empty** (3 walks, ref `sud_empty`)
+```bash
+PYTHONPATH=~/repos/lamaria-indoor ~/annotator_env/bin/python gui.py \
+  --capture /media/lamaria_indoor/captures/changes/sud_hg \
+  --pre-session sud_e_empty_1_rgb --pre-ref sud_empty \
+  --post-session sud_e_empty_2_rgb --post-ref sud_empty --depth
+```
+Then `2↔3`.
 
 Not sure of a scene's names? `ls /media/lamaria_indoor/captures/changes/<scene>/sessions/`
 
