@@ -1,4 +1,9 @@
-"""Minimal click-to-propagate annotation GUI (RGB, single-camera).
+"""Click-to-propagate RGB annotation and rectified-left depth-mask review.
+
+Grayscale review: --grayscale-sequence <depth_gt/v3/sequences/sequence> loads
+one invalid-depth object and saves drafts. Export writes a complete mask set to
+<sequence>/grayscale_mask_export/ while the projection masks remain read-only.
+Add --no-sam for manual brushes without a GPU. See grayscale_depth.py.
 
 A thin Flask front-end on top of the geometry-assisted propagation pipeline
 (`geom_sam_prototype.py`). Runs in the single env (setup.sh) and holds one SAM3
@@ -40,6 +45,8 @@ import change_mask as CM
 import cloud_diff_prototype as CD
 import geom_sam_prototype as G
 import propagate_fix as PF
+from grayscale_depth import GrayscaleDepth
+from multi_smart_brush import refine_blob
 
 # One interpreter for every stage (defaults to the one running the GUI, i.e. the
 # single env from setup.sh). The seeds stage is shelled out only to keep its
@@ -73,6 +80,8 @@ def _png_b64(bgr):
 
 
 def _frame_path(state, name):
+    if CFG.get("grayscale"):
+        return CFG["grayscale"].frame_path(name)
     s = CFG["states"][state]["session"]
     return Path(CFG["capture"]) / "sessions" / s / "raw_data" / name
 
@@ -287,9 +296,16 @@ def _add_seed_mask(od, frame, mask, reset=False):
 
 
 # ───────────────────────────── pages / static ─────────────────────────────
+@app.before_request
+def grayscale_routes():
+    if CFG.get("grayscale"):
+        return CFG["grayscale"].dispatch(sam_enabled=not CFG.get("no_sam"))
+
+
 @app.route("/")
 def index():
     return render_template("gui.html", scene=CFG["scene"], depth=CFG.get("depth", False),
+                           grayscale=bool(CFG.get("grayscale")), sam_enabled=not CFG.get("no_sam"),
                            seed_n=CFG["seed"]["n"], seed_min_vis=CFG["seed"]["min_vis"])
 
 
@@ -2213,9 +2229,11 @@ def api_edit_click():
     neg = np.array(d.get("neg", []), np.float32).reshape(-1, 2)
     if len(pos) == 0:
         return jsonify(error="click a positive point first"), 400
-    _, _, _, m = _mask_entry(oid, name)
+    m = None if CFG.get("grayscale") else _mask_entry(oid, name)[3]
     sid = m["session"] if m else CFG["states"][OBJECTS[oid]["state"]]["session"]
-    bgr = cv2.imread(str(Path(CFG["capture"]) / "sessions" / sid / "raw_data" / name))
+    path = (_frame_path(OBJECTS[oid]["state"], name) if CFG.get("grayscale") else
+            Path(CFG["capture"]) / "sessions" / sid / "raw_data" / name)
+    bgr = cv2.imread(str(path))
     img = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     pts = np.concatenate([pos, neg], 0)
     labels = np.array([1] * len(pos) + [0] * len(neg), np.int32)
@@ -2242,8 +2260,7 @@ def api_refine():
     neg = np.array(d.get("neg", []), np.float32).reshape(-1, 2)
     if len(pos) + len(neg) == 0:
         return jsonify(error="scribble something first"), 400
-    sid = CFG["states"][state]["session"]
-    bgr = cv2.imread(str(Path(CFG["capture"]) / "sessions" / sid / "raw_data" / name))
+    bgr = cv2.imread(str(_frame_path(state, name)))
     if bgr is None:
         return jsonify(error="frame not found"), 404
     H, W = bgr.shape[:2]
@@ -2263,6 +2280,32 @@ def api_refine():
     with LOCK:
         refined = G._segment_refine(MODEL, PROC, img, pts, labels, box, prior)
     return jsonify(mask=_mask_png_b64(refined), px=int(refined.sum()))
+
+
+@app.route("/api/multi_smart", methods=["POST"])
+def api_multi_smart():
+    workspace = CFG.get("grayscale")
+    if not workspace:
+        return jsonify(error="Multi smart brush requires grayscale mode"), 400
+    data = request.get_json()
+    try:
+        name = data["frame"]
+        mask = workspace.decode_canvas(name, data["mask"])
+        image = cv2.imread(str(workspace.frame_path(name)), cv2.IMREAD_GRAYSCALE)
+        if image is None:
+            raise ValueError("Cannot read grayscale frame")
+        def refine(rgb, points, labels, box, prior):
+            with LOCK:
+                return G._segment_refine(MODEL, PROC, rgb, points, labels, box, prior)
+        result = refine_blob(image, mask, data["point"], bool(data.get("shift")), refine,
+                             excluded=workspace.is_excluded(name))
+    except (ValueError, KeyError, TypeError) as e:
+        return jsonify(error=str(e)), 400
+    return jsonify(mask=_mask_png_b64(result["mask"]), px=int(result["mask"].sum()),
+                   added=int(result["added"].sum()), removed=int(result["removed"].sum()),
+                   added_mask=_mask_png_b64(result["added"]), removed_mask=_mask_png_b64(result["removed"]),
+                   holes_filled=result["holes_filled"], nothing_near_click=result["nothing_near_click"],
+                   sam_rejected=result["sam_rejected"], excluded=result["excluded"])
 
 
 @app.route("/api/save_edit", methods=["POST"])
@@ -2587,9 +2630,27 @@ def _api_export_change():
     return jsonify(ok=True, path=str(out), n=len(objects_out), change_frames=n_cf)
 
 
+def configure_grayscale(sequence, no_sam=False):
+    workspace = GrayscaleDepth(sequence)
+    CFG.clear()
+    CFG.update(grayscale=workspace, depth=True, no_sam=no_sam, scene=workspace.sequence.name,
+               states={"pre": {"session": workspace.sequence.name}}, seed={"n": 0, "min_vis": 0})
+    OBJECTS.clear()
+    OBJECTS[workspace.object_id] = workspace.object
+    return workspace
+
+
 def main():
+    global MODEL, PROC
     ap = argparse.ArgumentParser()
-    ap.add_argument("--capture", required=True)
+    source = ap.add_mutually_exclusive_group(required=True)
+    source.add_argument("--capture")
+    source.add_argument("--grayscale-sequence", metavar="PATH",
+                        help="Review stereo/left PNGs and stereo/masks/*.masked.png in a "
+                             "depth_gt/v3/sequences/<sequence> folder. "
+                             "Export writes a complete set to <sequence>/grayscale_mask_export/.")
+    ap.add_argument("--no-sam", action="store_true",
+                    help="Grayscale mode only: manual brushes without loading SAM or requiring a GPU.")
     ap.add_argument("--scene", default=None)
     ap.add_argument("--tier", default="instance")
     ap.add_argument("--pre-session", default="aria_a_rgb")
@@ -2609,6 +2670,23 @@ def main():
                          "Export = per-frame depth masks there, never segments.json/"
                          "change_mask. Default is change mode.")
     args = ap.parse_args()
+
+    if args.grayscale_sequence:
+        try:
+            workspace = configure_grayscale(args.grayscale_sequence, args.no_sam)
+        except (ValueError, OSError) as e:
+            ap.error(str(e))
+        if not args.no_sam:
+            print("loading SAM3 image model ...", flush=True)
+            MODEL, PROC = G._load_sam_image()
+        print(f"GRAYSCALE DEPTH — {len(workspace.images)} keyframes, one invalid-depth object\n"
+              f"Drafts: {workspace.draft_dir}\n"
+              f"Export folder: {workspace.export_dir} (original masks are read-only)\n"
+              f"ready: http://{args.host}:{args.port}", flush=True)
+        app.run(host=args.host, port=args.port, threaded=True)
+        return
+    if args.no_sam:
+        ap.error("--no-sam requires --grayscale-sequence")
 
     CFG.update(capture=args.capture, tier=args.tier, depth=args.depth,
                scene=args.scene or Path(args.capture).name,
@@ -2686,7 +2764,6 @@ def main():
         except Exception as e:
             print(f"warn: could not load {gobj}: {e}", flush=True)
 
-    global MODEL, PROC
     print("loading SAM3 image model ...", flush=True)
     MODEL, PROC = G._load_sam_image()
     print(f"ready: scene={CFG['scene']}  ->  http://{args.host}:{args.port}", flush=True)

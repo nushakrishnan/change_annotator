@@ -105,6 +105,129 @@ Then open `http://127.0.0.1:5000`.
 state-pair (and each annotator) its own: `geom_sam_out_1_2_sangwoo`, `geom_sam_out_2_3_...`.
 Workspaces are independent and disposable; the raw capture is never touched.
 
+**Grayscale depth review** — correct projected masks directly on the rectified-left
+keyframes of one depth GT sequence:
+
+```bash
+cd ~/repos/change_annotator
+~/annotator_env/bin/python gui.py \
+  --grayscale-sequence /media/lamaria_indoor/depth_gt/v3/sequences/cnb_e100_1
+# open http://127.0.0.1:5000
+```
+
+Replace `cnb_e100_1` with the sequence to review. This mode needs no capture,
+pre/post session, reference scan, `GEOM_OUT`, or `PYTHONPATH`. Add `--no-sam` to
+use manual brushes without loading SAM or requiring a GPU; omit it to retain
+point, multi-SAM, smart brush and Multi smart brush. `--host` and `--port` work as before.
+
+- Loads `stereo/left/<timestamp>.png` in numeric timestamp order, at native resolution.
+  Each corresponding `stereo/masks/<timestamp>.masked.png` becomes the mask of
+  **one Invalid depth object**, including disconnected regions and empty masks.
+  Missing masks start blank and are identified in the editor; dimension mismatches
+  stop loading instead of silently resizing annotations.
+- Paint immediately with the existing brush, eraser, line, line-fill, erase-line,
+  erase-fill, undo, zoom and pan tools. Hold **q** to see the image without its mask.
+  **z** saves a draft; moving to another frame also saves the current draft.
+  **Undo unsaved edits** reloads the last saved draft, exported mask, or projected
+  mask, in that order.
+- Drafts persist across restarts under `stereo/.grayscale_annotator/`. Loading,
+  brushing, saving and navigating never change the pipeline's source masks.
+- **Export corrected masks** first saves the current canvas, then publishes a
+  **complete set for every keyframe** under `<sequence>/grayscale_mask_export/`.
+  Each frame gets lossless, binary (0/255) `<timestamp>.masked.png` and
+  `<timestamp>.invalid.png` files containing identical pixels, plus
+  `<timestamp>.invalid_strict.png` (a superset of the corrected mask).
+  `<timestamp>.delta.npz` stores boolean `added` and `removed` arrays relative
+  to the projected mask, for reapplying corrections after reprojection. Export uses drafts
+  first, previous exports second, and original projected masks otherwise. Thus
+  unedited frames are included and earlier corrections survive later exports.
+  Missing masks without edits export as all-zero masks and are listed in
+  `manifest.json`; the manifest also maps keyframes to their exported mask files.
+- Completely erased masks export as all-zero PNGs. Loading the editor again
+  prefers exported masks over projections, including empty masks. Export builds
+  the full set before replacing the previous export folder; a failed write keeps
+  that previous export and the drafts. Drafts are removed after publication.
+- **Original `stereo/masks/` files are never modified**, even on Export. The new
+  folder is created only on Export. Re-running projection preserves human deltas
+  and refreshes the exports against the new projection; the editor continues to
+  prefer them. Export refuses a draft if its
+  underlying saved mask was changed externally; reconcile that draft first.
+- Evaluations/viewers must explicitly read `grayscale_mask_export/*.masked.png`
+  to use the corrections. Existing consumers of `stereo/masks/` still see the
+  automated projection. Depth arrays, projection diagnostics and cached previews
+  are unchanged; the export folder contains exclusion masks, deltas and its own manifest.
+
+**Multi smart brush (grayscale only)**
+
+Select **Multi smart brush**, then click a mask blob, an enclosed hole, or within
+15 px of its edge. Each click independently cleans that blob: it fills small holes
+and asks the existing SAM interactive-refine model to snap the edge. Closing with
+a 3 px radius ellipse joins nearby fragments for selection, but does not paint
+the connecting bridges. Hole detection retains the original blob's holes too,
+because closing can already have hidden its pinholes.
+
+SAM receives only the selected blob as its prior, a padded box, and positive
+interior points. Implausible SAM results fall back to hole filling and report
+**sam rejected**. Accepted results can grow inside the padded box; other blobs
+and their enclosed holes stay untouched. Trimming reaches at most 2 px inward
+and never removes a filled small hole. **Shift-click** disables trimming.
+**Ctrl-z** undoes one click, including hole filling and edge refinement.
+The status reports added/removed pixels and small holes filled.
+
+The clarified isolation rule allows outward growth inside the padded box while
+preserving other blobs. Strict confinement to the original closed component
+would prohibit the requested outward edge snapping.
+
+Defaults in `multi_smart_brush.BrushConstants`, on a 512×512 image:
+
+| Constant | Default |
+|---|---:|
+| MERGE_PX | 3 |
+| SNAP_PX | 15 |
+| HOLE_ABS_PX | 400 |
+| HOLE_REL | 0.01 |
+| BOX_PAD_PX | 8 |
+| N_POS | 4 extra interior points |
+| SAM_MIN_IOU | 0.5 |
+| SAM_MAX_GROW | 1.5 |
+| TRIM_PX | 2 |
+
+Distances scale by `sqrt(width * height) / 512`, and absolute hole area by image
+area. Small holes have area ≤ `max(HOLE_ABS_PX, HOLE_REL * blob area)`. Large
+holes fill only where SAM covers them. `_segment_refine` is unchanged: ±12 prior
+logits at its existing `mask_res`, no negative prompts, `multimask_output=False`.
+
+**Scene changes and pipeline overrides**
+
+For each contiguous excluded RGB run, the grayscale exclusion includes every
+keyframe between its first/last RGB timestamps and the immediately preceding and
+following grayscale keyframes. Existing stereo exclusions are retained. The
+editor derives this from `changes/changes.json` and RGB trajectory metadata.
+Excluded frames display full masks, reject edits, and export full `masked`,
+`invalid`, and `invalid_strict` masks. Multi smart brush is also a no-op on an
+already-full-image mask.
+
+The matching `lamaria_indoor/depth_gt` changes use the same exclusion rule when
+generating masks. After reprojection, the masks stage reapplies exported v2
+deltas to `grayscale_mask_export/`; scene exclusion takes priority over erasure.
+To reapply corrections without recomputing projection:
+
+```bash
+cd ~/repos/lamaria-indoor
+~/lamar_env/bin/python -m lamaria_indoor.depth_gt.grayscale_overrides --sequence cnb_e100_1
+```
+
+This writes only the export folder. The main depth-GT command's `--refresh-masks`
+regenerates projected masks with the corrected exclusions and reapplies these
+deltas. Legacy exports must be exported once in this editor to produce deltas.
+Drafts never enter the pipeline until Export is clicked.
+
+Regression checks (no SAM/GPU needed):
+
+```bash
+python -m unittest discover -s tests -p 'test_*.py' -v
+```
+
 **Depth mode** — add `--depth` and drop `GEOM_OUT`; the workspace is derived from the
 sessions automatically. See §5.
 

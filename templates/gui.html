@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>change annotator — {{ scene }}</title>
+<title>{{ 'grayscale depth annotator' if grayscale else 'change annotator' }} — {{ scene }}</title>
 <style>
   body { font-family: system-ui, sans-serif; margin: 0; display: flex; height: 100vh; }
   /* left is a flex column: controls take their natural height, the viewport fills
@@ -64,14 +64,26 @@
   button.del { color:#b00; border-color:#e3b3b3; }
   .reviewbar { background:#eaf7f0; border:1px solid #b9e4cf; border-radius:6px; padding:6px 8px; }
   code { background: #eee; padding: 1px 4px; border-radius: 3px; }
+  {% if grayscale %}
+  #maskmap { height:8px; flex:0 0 8px; }
+  #annotateBar, #objectCreation, #nukeControls, #reviewControls,
+  #reviewBar > button, #editControls > .status,
+  #editControls button[onclick="geomMask()"], [data-tool="geombrush"] { display:none !important; }
+  {% if not sam_enabled %}
+  [data-tool="point"], [data-tool="msam"], [data-tool="smart"], [data-tool="msmart"] { display:none !important; }
+  {% endif %}
+  .obj h4 { padding-right:0; }
+  {% endif %}
 </style>
 </head>
 <body>
 <div id="left">
-  {% if depth %}<div style="background:#7a1fa2;color:#fff;padding:6px 10px;border-radius:6px;
+  {% if grayscale %}<div style="background:#7a1fa2;color:#fff;padding:6px 10px;border-radius:6px;margin-bottom:6px">
+    GRAYSCALE DEPTH — edits are drafts until you click Export</div>
+  {% elif depth %}<div style="background:#7a1fa2;color:#fff;padding:6px 10px;border-radius:6px;
     font-weight:700;letter-spacing:.5px;margin-bottom:6px">🩻 DEPTH MODE — depth masks →
     <capture>/depth/ (NOT change GT)</div>{% endif %}
-  <h2>{{ scene }} · rgb</h2>
+  <h2>{{ scene }} · {{ 'rectified left grayscale' if grayscale else 'rgb' }}</h2>
 
   <!-- annotate toolbar -->
   <div class="row" id="annotateBar">
@@ -88,9 +100,9 @@
     <span id="editControls" style="display:none">
       &nbsp;|&nbsp; <span class="status">click the object to re-segment this frame</span>
       <button onclick="geomMask()" title="geom+SAM: project the object's lidar cluster, then SAM snaps it to the image edge — recovers legs/parts RGB drops (shadows/exposure). Refuses when the geometry is too sparse in this view.">geom mask</button>
-      <button onclick="saveEdit()" title="shortcut: z">save mask (z)</button>
+      <button onclick="saveEdit()" title="shortcut: z">{{ 'save draft (z)' if grayscale else 'save mask (z)' }}</button>
       {% if not depth %}<button onclick="lift3d()" title="edit once in 2D, propagate in 3D: lifts the CURRENT canvas mask onto the state's point cloud (in-stroke + line-of-sight points, bounded 3D grow), press m to confirm the orange preview — the label then renders in EVERY frame and walk">propagate in 3D</button>{% endif %}
-      <button onclick="cancelEdit()">cancel</button>
+      <button onclick="cancelEdit()">{{ 'undo unsaved edits' if grayscale else 'cancel' }}</button>
     </span>
     <span id="reviewControls">
       &nbsp;|&nbsp; <span class="status" id="coverInfo"></span>
@@ -129,6 +141,8 @@
     <button class="toolbtn" data-tool="brush" onclick="setTool('brush')" title="brush: drag to paint; when a stroke closes off an area (against the existing mask or by looping on itself) the enclosed area fills automatically; ctrl-z reverts stroke+fill together">brush</button>
     <button class="toolbtn" data-tool="erase" onclick="setTool('erase')">erase</button>
     <button class="toolbtn" data-tool="smart" onclick="setTool('smart')" title="smart brush: rough scribble to INCLUDE (shift-drag to EXCLUDE); SAM refines the mask to the object edge on release">smart brush</button>
+    {% if grayscale %}<button class="toolbtn" data-tool="msmart" onclick="setTool('msmart')"
+      title="Click a mask blob (or a hole / nearby edge): fill small holes and refine just that blob with SAM. Shift-click grows and fills without trimming. Each click is independent; ctrl-z undoes it.">Multi smart brush</button>{% endif %}
     <button class="toolbtn" data-tool="line" onclick="setTool('line')" title="line: click the start then end of a thin part (leg/cable) to fill a straight stroke at brush width; keep clicking to chain a polyline; Esc/Enter finishes">line</button>
     <button class="toolbtn" data-tool="linefill" onclick="setTool('linefill')" title="line fill: same as line, but when a chained segment closes a loop (on itself or against the existing mask) the enclosed area fills automatically; ctrl-z reverts segment+fill; Esc/Enter finishes">line fill</button>
     <button class="toolbtn" data-tool="eline" onclick="setTool('eline')" title="erase line: click start then end to erase a straight stroke at brush width; keep clicking to chain; Esc/Enter finishes">erase line</button>
@@ -142,6 +156,7 @@
 </div>
 
 <div id="right">
+  <div id="objectCreation">
   <h2>add object</h2>
   <div class="row"><label>id</label><br><input id="oid" placeholder="bag" style="width:95%"></div>
   <div class="row"><label>label</label><br><input id="olabel" placeholder="bag_1" style="width:95%"></div>
@@ -150,6 +165,16 @@
     <div class="hint">change type is derived from pre/post presence (removed / added / moved)</div>
   </div>
   <div class="row"><button onclick="addObject()" title="shortcut: a">add object (a)</button></div>
+  </div>
+  {% if grayscale %}
+  <p class="hint">All invalid-depth regions belong to one object. Paint or erase directly.
+    Navigation and <b>save draft (z)</b> keep your edits for later.
+    <b>Export corrected masks</b> writes all keyframe masks to this sequence's
+    <code>grayscale_mask_export/</code> folder, including this frame's edits.
+    Original projected masks are kept unchanged.</p>
+  <p class="hint">← / → frames · ctrl-z undo · hold q to hide mask · scroll to zoom · middle-drag to pan</p>
+  <div id="draftStatus" role="status"></div>
+  {% endif %}
   <hr>
   {% if not depth %}
   <div class="row">
@@ -200,15 +225,16 @@
   <div id="blobs"></div>
   {% endif %}
   <hr>
-  <div class="row"><button onclick="exportSegments()">{% if depth %}export depth masks{% else %}export segments.json{% endif %}</button> <span class="status" id="exportStatus"></span></div>
+  <div class="row"><button id="exportBtn" onclick="exportSegments()">{% if grayscale %}Export corrected masks{% elif depth %}export depth masks{% else %}export segments.json{% endif %}</button> <span class="status" id="exportStatus"></span></div>
   <hr>
-  <div class="row"><button onclick="nukeWorkspace()" style="background:#b30000;color:#fff;border-color:#7a0000"
+  <div class="row" id="nukeControls"><button onclick="nukeWorkspace()" style="background:#b30000;color:#fff;border-color:#7a0000"
     title="start this workspace over: every object, mask, seed, frontier and snapshot is moved aside on disk (recoverable by hand) and the object list goes blank">☢ nuke workspace</button>
     <span class="status" id="nukeStatus"></span></div>
 </div>
 
 <script>
 const DEPTH_MODE = {{ 'true' if depth else 'false' }};
+const GRAYSCALE_MODE = {{ 'true' if grayscale else 'false' }};
 const seedN = {{ seed_n }}, seedMinVis = {{ seed_min_vis }};
 let mode = 'annotate';     // 'annotate' | 'review'
 let frames = [];           // annotate: ['images/cam0/..jpg', ...]  review: [{name,session,px}, ...]
@@ -940,7 +966,7 @@ function setTool(t){
   document.querySelectorAll('.toolbtn').forEach(b => b.classList.toggle('active', b.dataset.tool === t));
   if(t !== 'point'){ pos = []; neg = []; }                  // brushing starts a fresh SAM interaction
   endLine();                                                // switching tools finishes any open line
-  view.style.cursor = (t === 'point' || t === 'msam') ? 'crosshair' : 'cell';
+  view.style.cursor = (t === 'point' || t === 'msam' || t === 'msmart') ? 'crosshair' : 'cell';
 }
 function ensureMaskSize(){
   if(view.naturalWidth && (maskCanvas.width !== view.naturalWidth || maskCanvas.height !== view.naturalHeight)){
@@ -1044,7 +1070,7 @@ viewport.addEventListener('mousedown', (e) => {
   } else if(e.button === 0 && (tool === 'brush' || tool === 'erase') && maskEditable()){
     gesture = 'paint'; down = true; lastPt = null; ensureMaskSize(); pushUndo(); paintAt(e);
   } else {                                                            // middle, or point/pan
-    gesture = (e.button === 0 && (tool === 'point' || tool === 'msam') && maskEditable()) ? 'point' : 'pan';
+    gesture = (e.button === 0 && (tool === 'point' || tool === 'msam' || tool === 'msmart') && maskEditable()) ? 'point' : 'pan';
     down = true; moved = false; sx = e.clientX; sy = e.clientY; spx = panX; spy = panY;
     if(e.button === 1) e.preventDefault();
   }
@@ -1858,8 +1884,11 @@ async function exportSegments(){
 }
 
 document.querySelectorAll('input[name=state]').forEach(el => el.addEventListener('change', loadAnnotateFrames));
+{% if not grayscale %}
 loadAnnotateFrames();
 refreshObjects();
+{% endif %}
 </script>
+{% if grayscale %}<script src="{{ url_for('static', filename='grayscale.js') }}"></script>{% endif %}
 </body>
 </html>
