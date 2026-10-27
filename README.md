@@ -8,6 +8,9 @@ each mask belongs to.
 
 🔗 [Project page](https://yuqunw.github.io/SceneDiff)
 
+**Grayscale depth masks:** see the [cnb_e100_1 quickstart](README_GRAYSCALE.md)
+for the launch command, brush controls, and export location.
+
 ---
 
 ## 1. The idea in plain English
