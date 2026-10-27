@@ -286,6 +286,29 @@ def _add_seed_mask(od, frame, mask, reset=False):
     return len(items)
 
 
+def _drop_seed(od, frame):
+    """Remove `frame` from the seed store (src_index.json), moving its PNG to
+    src_masks/.ditched/ (recoverable). A deleted/erased frame must take its seed
+    with it: _object_mask_paths falls back to src_masks/ wherever masks_index has
+    no entry, so a seed left behind resurfaces in the export and the scene view
+    while the object's review shows nothing. Returns True if a seed was dropped."""
+    idxp = od / "src_index.json"
+    if not idxp.exists():
+        return False
+    items = json.load(open(idxp))
+    gone = [it for it in items if it["src_name"] == frame]
+    if not gone:
+        return False
+    trash = od / "src_masks" / ".ditched"
+    trash.mkdir(parents=True, exist_ok=True)
+    for it in gone:
+        f = od / it["mask_file"]
+        if f.exists():
+            shutil.move(str(f), str(trash / f"{f.name}.{int(time.time())}"))
+    json.dump([it for it in items if it["src_name"] != frame], open(idxp, "w"), indent=1)
+    return True
+
+
 # ───────────────────────────── pages / static ─────────────────────────────
 @app.route("/")
 def index():
@@ -2297,6 +2320,7 @@ def api_save_edit():
         if f.exists():
             f.unlink()
         mi.pop(name, None)
+        _drop_seed(od, name)                             # else the seed resurfaces in export
     json.dump(mi, open(mi_path, "w"), indent=1)
     EDIT.clear()
     return jsonify(ok=True, px=int(mask.sum()))
@@ -2337,19 +2361,24 @@ def api_delete_mask():
     if oid not in OBJECTS:
         return jsonify(error="unknown object"), 404
     od, mi_path, mi, m = _mask_entry(oid, name)
-    if m:
+    seeded = any(it["src_name"] == name for it in
+                 (json.load(open(od / "src_index.json")) if (od / "src_index.json").exists() else []))
+    if m or seeded:
         f_ts = G.frontier_ts(OBJECTS[oid].get("verified_until"))
-        protected = m.get("src") == "hand" or int(Path(name).stem) <= f_ts
+        # a seed is hand-drawn too, so a seed-only frame is protected like src=hand
+        protected = (not m) or m.get("src") == "hand" or int(Path(name).stem) <= f_ts
         if protected and not d.get("force"):
             return jsonify(error="this frame is human-verified (hand/confirmed) — "
                                  "confirm to delete it", protected=True), 400
-        f = od / m["mask_file"]
-        if f.exists():                               # backup, never hard-delete
-            trash = od / "masks" / ".deleted"
-            trash.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(f), str(trash / f"{f.name}.{int(time.time())}"))
-        mi.pop(name, None)
-        json.dump(mi, open(mi_path, "w"), indent=1)
+        if m:
+            f = od / m["mask_file"]
+            if f.exists():                           # backup, never hard-delete
+                trash = od / "masks" / ".deleted"
+                trash.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(f), str(trash / f"{f.name}.{int(time.time())}"))
+            mi.pop(name, None)
+            json.dump(mi, open(mi_path, "w"), indent=1)
+        _drop_seed(od, name)                         # else the seed resurfaces in export
     return jsonify(ok=True, count=len(mi))
 
 
